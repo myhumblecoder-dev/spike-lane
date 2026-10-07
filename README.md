@@ -17,6 +17,7 @@ OpenClaw's `dag-coder` does exactly that, so neither side imports the other.
 |---|---|---|
 | Coder grind | `dag-coder run` (OpenClaw) | waits 30 min, then reports `lane-busy` |
 | Video | `spike-video` | refuses right away (exit 75) unless `SPIKE_LANE_WAIT` is set |
+| Image | `spike-image` | same as video |
 | Anything new | `spike-lane run NAME -- CMD` | `--wait SECONDS` or `--wait forever` |
 
 ## Getting Started
@@ -28,7 +29,9 @@ spike-lane status                                   # free | held by <name> ...
 spike-video "a red fox trotting through fresh snow" # 14B, 480p, ~10 min
 spike-video "..." --fast                            # ~3.5 min, RIFE interpolation
 SPIKE_LANE_WAIT=forever spike-video "..."           # queue behind a grind
+spike-image "a puffin on a sea cliff at dawn"       # Z-Image Turbo, 1024², 9 steps, 8-bit
 python3 -m pytest -q tests
 ```
 Video needs `~/FastVideo` (with its `.venv`) and `~/wan-models/FastMetal-14B-QAD`.
 Clips land in `~/Movies/spike-video/`.
+Image needs `mflux` (`uv tool install mflux`); images land in `~/Pictures/spike-image/`.

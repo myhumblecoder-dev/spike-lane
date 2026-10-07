@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# spike-image — Z-Image Turbo text-to-image on this Mac, one heavy workload at a time.
+#
+#   spike-image "PROMPT" [extra mflux-generate-z-image-turbo flags]
+#
+# Useful extras:  --seed N   --width 1280 --height 768   --image-path in.png --image-strength 0.4
+# Env:  SPIKE_LANE_WAIT  seconds to wait for a busy lane, or "forever" (default 0: refuse)
+#       IMAGE_OUT        output dir (default ~/Pictures/spike-image)
+#
+# Defaults are the model card's: 9 steps (8 DiT forwards), 8-bit quantization.
+# Z-Image Turbo is Apache 2.0, so output and the model itself are fine to
+# use commercially.
+set -euo pipefail
+
+if [ $# -lt 1 ] || [ -z "$1" ]; then
+  echo "usage: spike-image \"PROMPT\" [extra flags]" >&2
+  exit 2
+fi
+prompt=$1; shift
+
+here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+outdir=${IMAGE_OUT:-$HOME/Pictures/spike-image}
+mkdir -p "$outdir"
+out="$outdir/$(date +%Y%m%d-%H%M%S).png"
+echo "→ $out" >&2
+
+exec "$here/spike-lane" run --wait "${SPIKE_LANE_WAIT:-0}" --evict-ollama image -- \
+  mflux-generate-z-image-turbo --prompt "$prompt" --output "$out" \
+  --steps 9 -q 8 "$@"
