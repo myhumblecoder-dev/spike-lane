@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+"""spike-lane — run a heavy workload only when nothing else heavy is running.
+
+  spike-lane status
+  spike-lane run [--wait SECONDS|--wait forever] [--evict-ollama] NAME -- CMD...
+"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import spike_lane  # noqa: E402
+
+if __name__ == "__main__":
+    raise SystemExit(spike_lane.main(sys.argv[1:]))

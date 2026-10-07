@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# spike-video — Wan2.1 text-to-video on this Mac, one heavy workload at a time.
+#
+#   spike-video "PROMPT" [extra mlx_wan_prompt_to_video.py flags]
+#
+# Useful extras:  --fast (≈3x faster, RIFE frame interpolation)
+#                 --height 720 --width 1280   --num-frames 81   --seed N
+# Env:  SPIKE_LANE_WAIT  seconds to wait for a busy lane, or "forever" (default 0: refuse)
+#       WAN_MODEL        model dir    (default ~/wan-models/FastMetal-14B-QAD)
+#       WAN_OUT          output dir   (default ~/Movies/spike-video)
+#       FASTVIDEO_HOME   FastVideo checkout with its .venv (default ~/FastVideo)
+#
+# Runs under `spike-lane run video --evict-ollama`: a coder grind and a video
+# job never share the 36 GB, and any Ollama weights a finished grind left
+# resident are unloaded before the 14B model loads (~22 GB peak).
+set -euo pipefail
+
+if [ $# -lt 1 ] || [ -z "$1" ]; then
+  echo "usage: spike-video \"PROMPT\" [extra flags]" >&2
+  exit 2
+fi
+prompt=$1; shift
+
+here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+fv=${FASTVIDEO_HOME:-$HOME/FastVideo}
+model=${WAN_MODEL:-$HOME/wan-models/FastMetal-14B-QAD}
+outdir=${WAN_OUT:-$HOME/Movies/spike-video}
+mkdir -p "$outdir"
+out="$outdir/$(date +%Y%m%d-%H%M%S).mp4"
+echo "→ $out" >&2
+
+exec "$here/spike-lane" run --wait "${SPIKE_LANE_WAIT:-0}" --evict-ollama video -- \
+  "$fv/.venv/bin/python" "$fv/examples/inference/basic/mlx_wan_prompt_to_video.py" \
+  --model-root "$model" --mlx-checkpoint "$model" \
+  --prompt "$prompt" --output-path "$out" "$@"
