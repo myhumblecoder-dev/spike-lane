@@ -30,7 +30,7 @@ def env(tmp_path, monkeypatch):
     gen.chmod(0o755)
     monkeypatch.setenv("SPIKE_LANE_DIR", str(tmp_path / "lane"))
     e = os.environ.copy()
-    e.update(IMAGE_OUT=str(tmp_path / "out"), FAKE_ARGS=str(tmp_path / "args"),
+    e.update(IMAGE_OUT=str(tmp_path / "out"), IMAGE_MODEL=str(tmp_path / "zi-q8"), FAKE_ARGS=str(tmp_path / "args"),
              FAKE_HOLDER=str(tmp_path / "holder"),
              PATH=f"{gen.parent}:/usr/bin:/bin")  # no ollama: eviction no-ops
     return tmp_path, e
@@ -50,7 +50,10 @@ def test_runs_z_image_turbo_with_prompt_output_and_defaults(env):
     out = Path(_flag(args, "--output"))
     assert out.parent == tmp / "out" and out.suffix == ".png"
     assert _flag(args, "--steps") == "9"
-    assert _flag(args, "-q") == "8"
+    # The local mflux-community q8 build is already quantized: point at it,
+    # never re-quantize (the official repo is a 33 GB download).
+    assert _flag(args, "--model") == str(tmp / "zi-q8")
+    assert "-q" not in args and "--quantize" not in args
     assert _flag(args, "--seed") == "7"  # extra flags pass through
     assert (tmp / "holder").read_text().strip() == "image"
 

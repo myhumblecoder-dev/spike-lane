@@ -6,8 +6,11 @@
 # Useful extras:  --seed N   --width 1280 --height 768   --image-path in.png --image-strength 0.4
 # Env:  SPIKE_LANE_WAIT  seconds to wait for a busy lane, or "forever" (default 0: refuse)
 #       IMAGE_OUT        output dir (default ~/Pictures/spike-image)
+#       IMAGE_MODEL      model dir  (default ~/image-models/z-image-turbo-mflux-q8)
 #
-# Defaults are the model card's: 9 steps (8 DiT forwards), 8-bit quantization.
+# The model is mflux-community's pre-quantized 8-bit build (11 GB), not the
+# official repo (33 GB of full-precision weights re-quantized on every load).
+# 9 steps is the model card's default (8 DiT forwards).
 # Z-Image Turbo is Apache 2.0, so output and the model itself are fine to
 # use commercially.
 set -euo pipefail
@@ -19,11 +22,12 @@ fi
 prompt=$1; shift
 
 here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+model=${IMAGE_MODEL:-$HOME/image-models/z-image-turbo-mflux-q8}
 outdir=${IMAGE_OUT:-$HOME/Pictures/spike-image}
 mkdir -p "$outdir"
 out="$outdir/$(date +%Y%m%d-%H%M%S).png"
 echo "→ $out" >&2
 
 exec "$here/spike-lane" run --wait "${SPIKE_LANE_WAIT:-0}" --evict-ollama image -- \
-  mflux-generate-z-image-turbo --prompt "$prompt" --output "$out" \
-  --steps 9 -q 8 "$@"
+  mflux-generate-z-image-turbo --model "$model" \
+  --prompt "$prompt" --output "$out" --steps 9 "$@"

@@ -29,9 +29,9 @@ spike-lane status                                   # free | held by <name> ...
 spike-video "a red fox trotting through fresh snow" # 14B, 480p, ~10 min
 spike-video "..." --fast                            # ~3.5 min, RIFE interpolation
 SPIKE_LANE_WAIT=forever spike-video "..."           # queue behind a grind
-spike-image "a puffin on a sea cliff at dawn"       # Z-Image Turbo, 1024², 9 steps, 8-bit
+spike-image "a puffin on a sea cliff at dawn"       # Z-Image Turbo q8, 1024², 9 steps
 python3 -m pytest -q tests
 ```
 Video needs `~/FastVideo` (with its `.venv`) and `~/wan-models/FastMetal-14B-QAD`.
 Clips land in `~/Movies/spike-video/`.
-Image needs `mflux` (`uv tool install mflux`); images land in `~/Pictures/spike-image/`.
+Image needs `mflux` (`uv tool install mflux`) and `~/image-models/z-image-turbo-mflux-q8`; images land in `~/Pictures/spike-image/`.
