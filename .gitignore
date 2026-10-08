@@ -1,2 +1,51 @@
+# Python
 __pycache__/
+*.py[cod]
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Secrets and local config
+.env
+.env.*
+*.pem
+*.key
+*.p12
+credentials*.json
+secrets*.json
+.netrc
+
+# Model weights and caches (downloaded, never committed)
+*.safetensors
+*.gguf
+*.ckpt
+*.pt
+*.pth
+*.bin
+.cache/
+hf_cache/
+
+# Generated media and run state
+.spike-animate/
+*.mp4
+*.mov
+*.wav
+*.mp3
+*.m4a
+*.png
+*.jpg
+*.jpeg
+*.log
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
+*.swp
