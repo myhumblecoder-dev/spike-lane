@@ -44,9 +44,12 @@ if me.startswith("mflux"):
 elif me == "python" and args and args[0].endswith("colormatch.py"):
     ff("-i", args[-2], "-c", "copy", args[-1])
 elif me == "python" and args and args[0].endswith("wan22_i2v.py"):
-    import hashlib  # like the real model, a different prompt gives a different picture
-    c = hashlib.sha256(flag("--prompt").encode()).hexdigest()[:6]
-    ff("-f", "lavfi", "-i", f"color=c=0x{c}:size=832x448:rate=24", "-frames:v", "121", "-pix_fmt", "yuv420p", flag("--output-path"))
+    import hashlib  # like the real model, a different prompt or seed gives a different picture
+    c = hashlib.sha256((flag("--prompt") + flag("--seed", "")).encode()).hexdigest()[:6]
+    y, u, v = 16 + int(c[:2], 16) // 2, int(c[2:4], 16), int(c[4:6], 16)
+    box = f"geq=lum='if(between(X\\,T*120\\,T*120+60)*between(Y\\,40\\,100)\\,235\\,{y})':cb={u}:cr={v}"
+    ff("-f", "lavfi", "-i", "color=c=black:size=832x448:rate=24", "-vf", box,   # a box moves across, so frames differ
+       "-frames:v", "121", "-pix_fmt", "yuv420p", flag("--output-path"))
 elif me == "python" and args and args[0] == "demo.py":
     out = Path(flag("--output")); out.mkdir(parents=True, exist_ok=True)
     tone(out / (Path(flag("--video")).stem + ".flac"), float(flag("--duration")) - 0.03)  # MMAudio runs short
@@ -560,3 +563,80 @@ def test_scene_preview_is_one_shot_with_its_own_sound(env):
 def test_unknown_scene_is_refused(env):
     r = run(env, "video", "story.toml", "--shot", "99-nope")
     assert r.returncode == 2 and "no shot '99-nope'" in r.stderr
+
+
+# --- trimming a shot, and new takes of its motion ------------------------------------------
+
+def frames(path):
+    out = subprocess.run([str(Path(FFMPEG).with_name("ffprobe")), "-v", "error", "-count_frames", "-select_streams", "v",
+                          "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", str(path)],
+                         capture_output=True, text=True, check=True).stdout
+    return int(out)
+
+
+def distinct_frames(path, first, last):
+    """How many different pictures frames first..last of a clip show."""
+    out = subprocess.run([FFMPEG, "-v", "error", "-i", str(path), "-vf", f"select=between(n\\,{first}\\,{last})",
+                          "-fps_mode", "passthrough", "-f", "framemd5", "-"], capture_output=True, text=True, check=True).stdout
+    return len({l.rsplit(",", 1)[1].strip() for l in out.splitlines() if l and not l.startswith("#")})
+
+
+def set_shot(film, sid, extra):
+    """Add lines to one [[shot]] table of the story."""
+    text = (film / "story.toml").read_text()
+    head = f'id = "{sid}"\n'
+    (film / "story.toml").write_text(text.replace(head, head + extra + "\n", 1))
+
+
+def wan(log):
+    return [c for c in calls(log, "python") if c["args"][0].endswith("wan22_i2v.py")]
+
+
+def test_a_shot_can_end_early_and_still_fill_its_five_seconds(env):
+    film, _, log = env
+    assert run(env, "board", "story.toml", "--shot", "01-walk").returncode == 0
+    assert run(env, "video", "story.toml", "--shot", "01-walk").returncode == 0
+    log.unlink()
+    for fill in ("slow", "hold"):
+        (film / "story.toml").write_text(STORY)
+        set_shot(film, "01-walk", f'end = 3.0\nfill = "{fill}"')
+        r = run(env, "video", "story.toml", "--shot", "01-walk")
+        assert r.returncode == 0, r.stdout + r.stderr
+        clip = film / "shots" / "01-walk.mp4"
+        assert frames(clip) == 121, fill                         # still exactly one shot long
+        tail = distinct_frames(clip, 80, 120)
+        assert tail == 1 if fill == "hold" else tail > 20, (fill, tail)   # frozen, or still moving (slowed down)
+    assert not wan(log)                                           # trimming never animates again
+
+
+def test_a_new_motion_seed_makes_a_new_take_and_keeps_the_old_one(env):
+    film, _, log = env
+    assert run(env, "board", "story.toml", "--shot", "01-walk").returncode == 0
+    assert run(env, "video", "story.toml", "--shot", "01-walk").returncode == 0
+    first = (film / "shots" / "01-walk.mp4").read_bytes()
+    log.unlink()
+    set_shot(film, "01-walk", "motion_seed = 99")
+    r = run(env, "video", "story.toml", "--shot", "01-walk")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert [flag(c["args"], "--seed") for c in wan(log)] == ["99"]
+    assert (film / "shots" / "01-walk.mp4").read_bytes() != first
+    takes = sorted(p.name for p in (film / "shots" / "takes").glob("01-walk-m*.mp4"))
+    assert takes == ["01-walk-m1024.mp4", "01-walk-m99.mp4"]
+
+
+def test_shots_made_before_takes_existed_are_not_animated_again(env):
+    film, _, log = env
+    assert run(env, "board", "story.toml", "--shot", "01-walk").returncode == 0
+    assert run(env, "video", "story.toml", "--shot", "01-walk").returncode == 0
+    # as an older spike-animate left it: only the shot itself, keyed by what it was made from
+    shutil.rmtree(film / "shots" / "takes")
+    (film / "shots" / "01-walk-full.mp4").unlink()
+    keys = json.loads((film / ".spike-animate" / "keys.json").read_text())
+    keys = {k: v for k, v in keys.items() if "-full" not in k and "takes/" not in k}
+    import spike_animate as sa
+    story = sa.load_story(film / "story.toml")
+    keys["shots/01-walk.mp4"] = sa.shot_key(story, story.shots[0])
+    (film / ".spike-animate" / "keys.json").write_text(json.dumps(keys))
+    log.unlink()
+    assert run(env, "video", "story.toml", "--shot", "01-walk").returncode == 0
+    assert not wan(log)

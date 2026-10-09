@@ -730,7 +730,7 @@ function partCard(s, idx, part, name, k) {
   el.addEventListener("toggle", () => { if (el.open) S.openPart = `${s.id}:${part}`; });
   const body = h("div", { class: "body" });
   if (!st.unlocked) body.append(h("p", { class: "small dim" }, `Approve the ${PARTS[k - 1][1].toLowerCase()} first.`));
-  else body.append(...{ picture: picturePart, video: motionPart, sound: soundPart, voices: linesPart, preview: previewPart }[part](s, st), partGate(s, part, st));
+  else body.append(...{ picture: picturePart, video: motionPart, sound: soundPart, voices: linesPart, preview: previewPart }[part](s, st).filter((x) => x != null), partGate(s, part, st));
   el.append(body);
   return el;
 }
@@ -764,17 +764,57 @@ function picturePart(s, st) {
 function motionPart(s, st) {
   const doc = S.film.doc.shot.find((x) => x.id === s.id) || {};
   const setAnchor = (a) => saveShot(s.id, (x) => { if (a === 0) x.anchor = 0; else delete x.anchor; }, a === 0 ? "Action: more movement" : "Calm: stays close to the picture").catch((e) => toast(e.message, true));
+  const fresh = s.clip && st.done;
   return [
     s.clip ? h("div", { class: st.done ? "" : "stale" }, h("video", { src: media(s.clip), poster: s.still ? media(s.still) : null, controls: true, playsinline: true, muted: true, loop: true, preload: "metadata" }))
       : h("div", { class: "empty-media" }, "Not animated yet"),
-    inlineEdit("Motion: what moves in the 5 seconds", s.motion, (v) => saveShot(s.id, (x) => { x.motion = v; }, "Saved; animate again to see it")),
-    h("p", { class: "small faint" }, "Only describe what's in the picture. Words like “reads” or “talks” make the model draw a book or move lips; add “mouth closed” when no one speaks."),
-    h("div", { class: "row" }, runBtn(s.clip ? "Animate again" : "Animate", "video", { shot: s.id }, !st.done), h("span", { class: "spacer" }),
+    h("div", { class: "row" },
+      fresh ? runBtn("Animate again (new take)", "video", { shot: s.id, new_take: true }, false) : runBtn("Animate", "video", { shot: s.id }, true),
+      h("span", { class: "small faint" }, "About 1.5 minutes; every take is kept."), h("span", { class: "spacer" }),
       h("span", { class: "small dim" }, "Movement"), h("div", { class: "seg", role: "group", "aria-label": "Movement" },
         h("button", { "aria-pressed": (doc.anchor ?? 1) !== 0, onclick: () => setAnchor(1) }, "Calm"),
         h("button", { "aria-pressed": doc.anchor === 0, onclick: () => setAnchor(0) }, "Action"))),
-    h("p", { class: "small faint" }, "About 1.5 minutes."),
+    s.takes.length > 1 ? h("div", {}, h("h3", { style: "margin:4px 0 6px" }, `Takes (${s.takes.length})`), h("div", { class: "retakes" }, s.takes.slice().reverse().map((tk) =>
+      h("figure", {}, h("video", { src: media(tk.url), poster: s.still ? media(s.still) : null, controls: true, playsinline: true, muted: true, preload: "none" }),
+        h("figcaption", {}, tk.seed, tk.seed === s.video_seed ? h("span", { class: "chip acc" }, "in use")
+          : h("button", { class: "btn small ghost", disabled: busy(), onclick: () => useTake(s.id, tk.seed) }, "Use")))))) : null,
+    s.clip ? trimEditor(s, doc) : null,
+    inlineEdit("Motion: what moves in the 5 seconds", s.motion, (v) => saveShot(s.id, (x) => { x.motion = v; }, "Saved; animate again to see it")),
+    h("p", { class: "small faint" }, "Only describe what's in the picture. Words like “reads” or “talks” make the model draw a book or move lips; add “mouth closed” when no one speaks."),
   ];
+}
+
+// End the motion early (before something odd appears) and fill the 5 seconds back: slowed down, or held.
+function trimEditor(s, doc) {
+  const L = 121 / 24;
+  let end = doc.end ?? L, fill = doc.fill || "slow";
+  const vid = h("video", { src: media(s.full), poster: s.still ? media(s.still) : null, playsinline: true, muted: true, preload: "auto" });
+  const val = h("span", { class: "mono small" });
+  const show = () => { val.textContent = end >= L - 0.01 ? "the whole clip" : `${end.toFixed(1)} s`; };
+  const range = h("input", { type: "range", min: 1, max: L.toFixed(2), step: 0.1, value: end, "aria-label": "End the motion at",
+    oninput: () => { end = Number(range.value); show(); try { vid.currentTime = Math.min(end, L - 0.05); } catch (e) {} } });
+  show();
+  const seg = h("div", { class: "seg", role: "group", "aria-label": "Fill the rest" },
+    h("button", { "aria-pressed": fill === "slow", onclick: (e) => { fill = "slow"; setSeg(e); } }, "Slow down"),
+    h("button", { "aria-pressed": fill === "hold", onclick: (e) => { fill = "hold"; setSeg(e); } }, "Hold last frame"));
+  const apply = async () => {
+    try {
+      await saveShot(s.id, (x) => { if (end >= L - 0.01) { delete x.end; delete x.fill; } else { x.end = Math.round(end * 10) / 10; x.fill = fill; } },
+        end >= L - 0.01 ? "Using the whole clip" : `Ending at ${end.toFixed(1)} s`);
+      run("video", { shot: s.id });
+    } catch (e) { toast(e.message, true); }
+  };
+  return h("details", { class: "sec", open: doc.end != null || null }, h("summary", {}, h("span", { class: "sum-title" }, "Trim the end"),
+      h("span", { class: "sum-sub" }, doc.end != null ? `ends at ${doc.end} s, ${doc.fill === "hold" ? "last frame held" : "slowed down"}` : "whole clip")),
+    h("div", { class: "body" },
+      h("p", { class: "small dim" }, "Drag to the last good moment; the picture shows that frame of the whole take. The shot stays 5 seconds: the part you keep is slowed down to fill it, or its last frame is held."),
+      vid, h("div", { class: "row" }, h("span", { class: "small" }, "End at"), h("div", { style: "flex:1;min-width:0" }, range), val),
+      h("div", { class: "row" }, seg, h("span", { class: "spacer" }), h("button", { class: "btn primary", disabled: busy() || S.dirty, onclick: apply }, "Apply"))));
+}
+async function useTake(shot, seed) {
+  if (S.dirty) return toast("Save or undo your Story edits first", true);
+  try { S.film = await api("POST", `/api/films/${S.name}/use`, { shot, seed, kind: "motion" }); S.doc = clone(S.film.doc); S.rawText = S.film.toml; toast(`${shot}: using take ${seed}`); renderFilm(true); }
+  catch (e) { toast(e.message, true); }
 }
 
 function soundPart(s, st) {

@@ -616,3 +616,77 @@ def test_a_new_film_can_leave_out_the_narrator_dialogue_and_music(tmp_path):
     argv = st.step_argv(folder, "new", {"idea": "Pip paints.", "shots": 4, "narrator": False, "dialogue": False, "music": False})
     assert argv[-3:] == ["--no-narrator", "--no-dialogue", "--no-music"]
     assert "--no-narrator" not in st.step_argv(folder, "new", {"idea": "Pip paints.", "shots": 4})
+
+
+# --- new takes of a scene's motion, and trimming it -----------------------------------------
+
+def take(folder: Path, sid: str, seed: int, body: bytes) -> Path:
+    """A take of a shot's motion as spike-animate keeps it."""
+    story = sa.load_story(folder / "story.toml")
+    shot = next(s for s in story.shots if s.id == sid)
+    p = sa.take_path(story, shot, seed)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(body)
+    sa.Keys(folder).record(p, sa.shot_key(story, shot, seed))
+    return p
+
+
+def test_animate_again_asks_for_a_new_take(tmp_path):
+    folder = write_story(tmp_path / "bolt").parent
+    render_board(folder)
+    seeds = set()
+    for _ in range(3):
+        assert st.new_take(folder, "01-heap") == []
+        seeds.add(st._doc(folder)["shot"][0]["motion_seed"])
+    assert len(seeds) == 3 and 1024 not in seeds
+    assert st.new_take(folder, "99-x") != []
+
+
+def test_an_earlier_take_can_be_used_again_at_once(tmp_path):
+    folder = write_story(tmp_path / "bolt").parent
+    st.approve(folder, "story")
+    make(folder, "01-heap", "picture")
+    take(folder, "01-heap", 1024, b"first take")
+    take(folder, "01-heap", 555, b"second take")
+    state = st.film_state(folder)["shots"][0]
+    assert [t["seed"] for t in state["takes"]] == [555, 1024]
+    assert st.use_take(folder, "01-heap", 555) == []
+    assert st._doc(folder)["shot"][0]["motion_seed"] == 555
+    assert (folder / "shots" / "01-heap.mp4").read_bytes() == b"second take"
+    assert stages(folder)["scene:01-heap:video"]["done"]
+    assert st.use_take(folder, "01-heap", 1024) == []           # back to the first one
+    assert "motion_seed" not in st._doc(folder)["shot"][0]
+    assert (folder / "shots" / "01-heap.mp4").read_bytes() == b"first take"
+    assert st.use_take(folder, "01-heap", 9) != []
+
+
+def test_takes_of_an_old_picture_are_not_offered(tmp_path):
+    folder = write_story(tmp_path / "bolt").parent
+    make(folder, "01-heap", "picture")
+    take(folder, "01-heap", 1024, b"made from the first picture")
+    doc = st._doc(folder)
+    doc["shot"][0]["still"] = "close-up of JUNK at night"
+    st.save_story(folder, doc=doc)
+    make(folder, "01-heap", "picture")
+    assert st.film_state(folder)["shots"][0]["takes"] == []
+
+
+def test_the_api_starts_a_new_take(server):
+    srv, films = server
+    folder = films / "bolt"
+    st.approve(folder, "story")
+    make(folder, "01-heap", "picture")
+    st.approve(folder, "scene:01-heap:picture")
+    status, _, _ = call(srv, "POST", "/api/films/bolt/run", {"step": "video", "shot": "01-heap", "new_take": True})
+    assert status == 202 and "motion_seed" in st._doc(folder)["shot"][0]
+
+
+def test_a_shot_made_before_takes_existed_is_kept_when_animating_again(tmp_path):
+    folder = write_story(tmp_path / "bolt").parent
+    make(folder, "01-heap", "picture")
+    make(folder, "01-heap", "video")                       # the shot alone, as older films have it
+    (folder / "shots" / "01-heap.mp4").write_bytes(b"the old shot")
+    story = sa.load_story(folder / "story.toml")
+    sa.Keys(folder).record(folder / "shots" / "01-heap.mp4", sa.shot_key(story, story.shots[0]))
+    assert st.new_take(folder, "01-heap") == []
+    assert (folder / "shots" / "takes" / "01-heap-m1024.mp4").read_bytes() == b"the old shot"

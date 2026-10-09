@@ -59,6 +59,7 @@ spike-animate film story.toml                     # whatever is left, then mix �
 spike-animate status story.toml
 # or one scene at a time: board|video|sound|voices --shot 03-reveal, then
 spike-animate scene story.toml 03-reveal          # preview: that clip + its own sound and lines → scenes/03-reveal.mp4
+# per shot: motion_seed = N (a new take; all takes kept in shots/takes/), end = 4.2 + fill = "slow"|"hold" (trim)
 ```
 
 | Step | Engine | Per 8-shot film | Peak memory |
@@ -106,7 +107,9 @@ dialogue kept word for word), optional reference notes and an optional style pic
 and each step must be approved before the next one unlocks:
 1. **Story:** edit it as a form or as raw TOML. A new film can leave out the narrator, dialogue or music.
 2. **Scenes, one at a time and in order.** Each scene has five parts, each approved before the next opens:
-   **Picture** (draw, redraw, three more versions, Use) → **Motion** (animate; edit the motion, Calm/Action) →
+   **Picture** (draw, redraw, three more versions, Use) → **Motion** (animate; "Animate again" makes a new take with a
+   new seed and every take is kept with **Use**; **Trim the end** cuts before a glitch and fills the 5 s back by
+   slowing the rest down or holding its last frame, without animating again; edit the motion, Calm/Action) →
    **Sound** (effects against the clip) → **Lines** (narration and dialogue for this scene only, with what
    speech-to-text heard; add, edit, remove, record) → **Preview** (the clip with its own sound and lines at the
    film's loudness). Parts with nothing to make are skipped. Changing a scene reopens that scene from the

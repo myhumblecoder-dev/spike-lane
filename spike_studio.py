@@ -161,6 +161,64 @@ def use_retake(folder: Path, shot_id: str, seed: int) -> list[str]:
     return []
 
 
+def _takes(folder: Path, story, shot) -> list[tuple[int, Path]]:
+    """This shot's motion takes made from its current picture and motion (older ones would differ)."""
+    keys, found = sa.Keys(folder), []
+    for p in (Path(folder) / "shots" / "takes").glob(f"{shot.id}-m*.mp4"):
+        m = re.fullmatch(rf"{re.escape(shot.id)}-m(\d+)\.mp4", p.name)
+        if m and keys.keys.get(keys._rel(p)) == sa.shot_key(story, shot, int(m.group(1))):
+            found.append((int(m.group(1)), p))
+    return sorted(found)
+
+
+def new_take(folder: Path, shot_id: str) -> list[str]:
+    """Give a shot's motion a seed it hasn't had, so animating again makes a different take."""
+    doc = _doc(folder)
+    shot = next((s for s in doc.get("shot", []) if s.get("id") == shot_id), None)
+    if shot is None:
+        return [f"no shot '{shot_id}' in the story"]
+    try:   # keep the current take before the seed moves on (older films never saved it as one)
+        story = sa.load_story(Path(folder) / "story.toml")
+        sa.adopt_old_shot(story, next(x for x in story.shots if x.id == shot_id), sa.Keys(folder))
+    except sa.StoryError:
+        pass
+    used = {shot.get("seed", doc.get("seed", 1024)), shot.get("motion_seed")}
+    used |= {int(m.group(1)) for p in (Path(folder) / "shots" / "takes").glob(f"{shot_id}-m*.mp4")
+             if (m := re.search(r"-m(\d+)\.mp4$", p.name))}
+    seed = next(s for s in iter(lambda: secrets.randbelow(90000) + 100, None) if s not in used)
+    shot["motion_seed"] = seed
+    return save_story(folder, doc=doc)
+
+
+def use_take(folder: Path, shot_id: str, seed: int) -> list[str]:
+    """Go back to an earlier take of a shot's motion: no animating, only its trim is redone."""
+    folder = Path(folder)
+    story = sa.load_story(folder / "story.toml")
+    shot = next((x for x in story.shots if x.id == shot_id), None)
+    if shot is None:
+        return [f"no shot '{shot_id}' in the story"]
+    src = dict(_takes(folder, story, shot)).get(int(seed))
+    if src is None:
+        return [f"no take {seed} of {shot_id} for its current picture and motion"]
+    doc = _doc(folder)
+    d = next(s for s in doc["shot"] if s.get("id") == shot_id)
+    if int(seed) == shot.seed:
+        d.pop("motion_seed", None)
+    else:
+        d["motion_seed"] = int(seed)
+    errors = save_story(folder, doc=doc)
+    if errors:
+        return errors
+    story = sa.load_story(folder / "story.toml")
+    shot = next(x for x in story.shots if x.id == shot_id)
+    keys = sa.Keys(folder)
+    full = sa.full_path(story, shot)
+    shutil.copyfile(src, full)
+    keys.record(full, sa.shot_key(story, shot))
+    sa.trim_clip(story, shot, keys)
+    return []
+
+
 # --- one step at a time ------------------------------------------------------------
 # The story, then each scene in order (picture → motion → sound → lines → preview), then the music
 # and the final film. Each part is approved before the next one opens; an approval is a fingerprint
@@ -181,7 +239,7 @@ def _scene_outputs(folder: Path, story, shot, keys) -> dict[str, list[Path] | No
     still = sa.still_path(story, shot)
     out["picture"] = [still] if fresh(still, sa.still_key(story, shot)) else None
     clip = sa.shot_path(story, shot)
-    out["video"] = [clip] if out["picture"] and fresh(clip, sa.shot_key(story, shot)) else None
+    out["video"] = [clip] if out["picture"] and sa.clip_fresh(story, shot, keys) else None
     sfx = sa.sfx_path(story, shot)
     out["sound"] = [] if not shot.sfx.strip() else [sfx] if out["video"] and fresh(sfx, sa.sfx_key(story, shot)) else None
     lines: list[Path] | None = []
@@ -416,6 +474,11 @@ def film_state(folder: Path) -> dict:
             "narration_heard": _heard(folder / "voice" / f"{sid}.wav"),
             "dialogue_heard": [_heard(p) for p in lines],
             "preview": _url(folder, f"scenes/{sid}.mp4"), "sfx_text": s.get("sfx", ""),
+            "takes": [{"seed": seed, "url": _url(folder, str(p.relative_to(folder)))}
+                      for seed, p in (_takes(folder, story, shot_obj) if shot_obj else [])],
+            "video_seed": shot_obj.video_seed if shot_obj else None,
+            "end": s.get("end"), "fill": s.get("fill", "slow"),
+            "full": _url(folder, f"shots/{sid}-full.mp4") or _url(folder, f"shots/{sid}.mp4"),
         })
     voices = {"narrator": _url(folder, "voice/card.wav")} if "narrator" in doc else {}
     for name, c in doc.get("characters", {}).items():
@@ -734,6 +797,12 @@ class Handler(BaseHTTPRequestHandler):
                 why = gate(folder, p.get("step", ""), p)
                 if why:
                     raise Busy(why)
+                if p.get("step") == "video" and p.get("new_take"):
+                    if (jobs.status(folder) or {}).get("running"):
+                        raise Busy("a step is already running for this film")
+                    errors = new_take(folder, str(p.get("shot", "")))
+                    if errors:
+                        raise ValueError("; ".join(errors))
                 jobs.start(folder, argv)
             except ValueError as e:
                 return self._json(400, {"errors": [str(e)]})
@@ -747,7 +816,8 @@ class Handler(BaseHTTPRequestHandler):
         if method == "POST" and action == "use":
             p = json.loads(self._body() or b"{}")
             try:
-                errors = use_retake(folder, str(p["shot"]), int(p["seed"]))
+                use = use_take if p.get("kind") == "motion" else use_retake
+                errors = use(folder, str(p["shot"]), int(p["seed"]))
             except (KeyError, ValueError, TypeError, sa.StoryError) as e:
                 errors = [f"bad request: {e}"]
             return self._json(400, {"errors": errors}) if errors else self._json(200, self._state(folder))

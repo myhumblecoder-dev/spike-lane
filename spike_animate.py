@@ -55,6 +55,13 @@ class Shot:
     reference: Reference | None = None
     still_style: str = ""        # overrides the film's still style for this shot
     dialogue: list["Line"] = field(default_factory=list)
+    motion_seed: int | None = None   # the video's seed when it differs from the still's (a new take)
+    end: float | None = None         # use the motion only up to here (seconds) ...
+    fill: str = "slow"               # ... then "slow" it down to fill the shot, or "hold" its last frame
+
+    @property
+    def video_seed(self) -> int:
+        return self.seed if self.motion_seed is None else self.motion_seed
 
 
 @dataclass
@@ -174,11 +181,18 @@ def load_story(path: Path) -> Story:
             ref = Reference(clip=(path.parent / _need(r, "clip", f"shot {sid} reference")).resolve(),
                             start=float(r.get("start", 0.0)), sigma=float(r.get("sigma", 0.88)),
                             first_strength=float(r.get("first_strength", 0.4)))
+        end = float(s["end"]) if "end" in s else None
+        if end is not None and not 1.0 <= end < shot_seconds():
+            raise StoryError(f"shot {sid}: end must be between 1 and {shot_seconds():.2f} seconds")
+        if s.get("fill", "slow") not in ("slow", "hold"):
+            raise StoryError(f"shot {sid}: fill must be \"slow\" or \"hold\"")
         shots.append(Shot(id=sid, still=_need(s, "still", f"shot {sid}"), motion=_need(s, "motion", f"shot {sid}"),
                           seed=int(s.get("seed", seed)), anchor=int(s.get("anchor", 1)), sfx=s.get("sfx", ""),
                           narration=s.get("narration", ""), intensity=float(s.get("intensity", 0.5)),
                           colormatch=bool(s.get("colormatch", ref is None)), reference=ref,
-                          still_style=s.get("still_style", ""), dialogue=_lines(s, sid, characters, voices)))
+                          still_style=s.get("still_style", ""), dialogue=_lines(s, sid, characters, voices),
+                          motion_seed=int(s["motion_seed"]) if "motion_seed" in s else None, end=end,
+                          fill=s.get("fill", "slow")))
     narrator = None
     if "narrator" in d:
         n = d["narrator"]
@@ -527,29 +541,86 @@ def shot_path(story: Story, shot: Shot, suffix: str = "") -> Path:
     return story.root / "shots" / f"{shot.id}{suffix}.mp4"
 
 
-def shot_key(story: Story, shot: Shot) -> str | None:
-    """What a shot's clip is made from (None while its still is missing)."""
+def full_path(story: Story, shot: Shot) -> Path:
+    """The whole 5 seconds as the video model made it; shot_path is this, trimmed."""
+    return story.root / "shots" / f"{shot.id}-full.mp4"
+
+
+def take_path(story: Story, shot: Shot, seed: int) -> Path:
+    return story.root / "shots" / "takes" / f"{shot.id}-m{seed}.mp4"
+
+
+def shot_key(story: Story, shot: Shot, seed: int | None = None) -> str | None:
+    """What a shot's motion is made from (None while its still is missing); `seed` asks about another take."""
     still, ref = still_path(story, shot), shot.reference
     if not still.exists() or (ref and not Path(ref.clip).exists()):
         return None
-    parts = ["shot", file_digest(still), motion_prompt(story, shot), shot.anchor, shot.seed, shot.colormatch]
+    parts = ["shot", file_digest(still), motion_prompt(story, shot), shot.anchor,
+             shot.video_seed if seed is None else seed, shot.colormatch]
     if ref:
         parts += [file_digest(ref.clip), ref.start, ref.sigma, ref.first_strength]
     return key_for(*parts)
 
 
+def clip_key(story: Story, shot: Shot) -> str | None:
+    full = full_path(story, shot)
+    return key_for("clip", file_digest(full), shot.end, shot.fill if shot.end else None) if full.exists() else None
+
+
+def adopt_old_shot(story: Story, shot: Shot, keys: Keys) -> None:
+    """Shots made before takes existed: the shot itself is the whole take."""
+    out, full = shot_path(story, shot), full_path(story, shot)
+    k = shot_key(story, shot)
+    if not full.exists() and out.exists() and k and keys.keys.get(keys._rel(out)) == k:
+        for dest in (full, take_path(story, shot, shot.video_seed)):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(out, dest)
+            keys.record(dest, k)
+        keys.record(out, clip_key(story, shot)) if shot.end is None else None
+
+
+def clip_fresh(story: Story, shot: Shot, keys: Keys) -> bool:
+    """The shot's clip matches its picture, motion, seed and trim (also for shots made before takes existed)."""
+    out, full, k = shot_path(story, shot), full_path(story, shot), shot_key(story, shot)
+    if k is None:
+        return False
+    if not full.exists():
+        return shot.end is None and out.exists() and keys.keys.get(keys._rel(out)) == k
+    return not keys.stale(full, k) and not keys.stale(out, clip_key(story, shot))
+
+
+def trim_clip(story: Story, shot: Shot, keys: Keys) -> None:
+    """The shot from its whole take: as is, or ended early and filled back to 5 s (slowed down or held)."""
+    full, out = full_path(story, shot), shot_path(story, shot)
+    k = clip_key(story, shot)
+    if not keys.stale(out, k):
+        return
+    if shot.end is None:
+        shutil.copyfile(full, out)
+    else:
+        E, L = shot.end, shot_seconds()
+        vf = (f"trim=end={E},setpts=(PTS-STARTPTS)*{L / E:.6f},minterpolate=fps={FPS}:mi_mode=mci:mc_mode=aobmc:vsbmc=1,"
+              f"tpad=stop_mode=clone:stop=12" if shot.fill == "slow" else
+              f"trim=end={E},setpts=PTS-STARTPTS,tpad=stop_mode=clone:stop={SHOT_FRAMES}")
+        _say(f"trim {shot.id} at {E:g} s ({'slowed down' if shot.fill == 'slow' else 'last frame held'}) …")
+        ffmpeg("-i", full, "-vf", vf, "-frames:v", SHOT_FRAMES, "-c:v", "libx264", "-crf", 16, "-pix_fmt", "yuv420p", "-an", out)
+    keys.record(out, k)
+
+
 def animate_shot(story: Story, shot: Shot, keys: Keys) -> bool:
-    """Render one shot if its inputs changed. Returns True when it re-rendered."""
-    still, out, raw = still_path(story, shot), shot_path(story, shot), shot_path(story, shot, "-raw")
+    """Render one shot if its inputs changed, then trim it. Returns True when the video model ran."""
+    still, out, raw = still_path(story, shot), full_path(story, shot), shot_path(story, shot, "-raw")
     ref = shot.reference
+    adopt_old_shot(story, shot, keys)
     k = shot_key(story, shot)
     if not keys.stale(out, k):
+        trim_clip(story, shot, keys)
         return False
     _say(f"shot {shot.id} …")
     model = _home("WAN5B_MODEL", "wan-models/FastMetal-5B-QAD")
     cmd = [_venv("FASTVIDEO_HOME", "FastVideo"), ENGINES / "wan22_i2v.py", "--mlx-checkpoint", model,
            "--text-encoder-root", model, "--vae-root", model / "vae", "--prompt", motion_prompt(story, shot),
-           "--seed", shot.seed, "--output-path", raw]
+           "--seed", shot.video_seed, "--output-path", raw]
     if ref:
         # Motion from the real clip; look from a cartoon version of the clip's first frame.
         real, first = shot_path(story, shot, "-first-real").with_suffix(".png"), shot_path(story, shot, "-first").with_suffix(".png")
@@ -577,6 +648,11 @@ def animate_shot(story: Story, shot: Shot, keys: Keys) -> bool:
     if abs(secs - shot_seconds()) > 0.06:
         raise StageError(f"shot {shot.id} is {secs:.2f} s, expected {shot_seconds():.2f} s")
     keys.record(out, k)
+    take = take_path(story, shot, shot.video_seed)   # every take is kept, to go back to
+    take.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(out, take)
+    keys.record(take, k)
+    trim_clip(story, shot, keys)
     return True
 
 
