@@ -90,3 +90,7 @@ mode = "clone"   # default: one designed voice per character, every line cloned 
 A shot may have narration then dialogue; keep all its speech to 12 words so it fits 5 s. Mouths are
 not lip-synced: stage talking shots medium/over-the-shoulder and cut to listeners' reactions.
 Every line is checked with speech-to-text (`film/checks.json` → `dialogue`).
+
+## License
+
+MIT — see [LICENSE](LICENSE). This covers the code here only: the models it runs are downloaded separately under their own licenses (MMAudio's weights are non-commercial, CC-BY-NC).
