@@ -194,3 +194,27 @@ def test_new_never_overwrites_an_existing_story(ollama, tmp_path):
     assert r.returncode == 2
     assert (tmp_path / "gull" / "story.toml").read_text() == "mine"
     assert FakeOllama.requests == []
+
+
+# --- reference notes: what the author already knows about the film ---------------------------
+
+def test_reference_notes_go_to_the_writer():
+    p = sa.writer_prompt("a robot learns to paint", shots=6, notes="The robot is named PIP. Set in a rainy Paris attic.")
+    assert "REFERENCE NOTES" in p and "named PIP" in p
+    assert "REFERENCE NOTES" not in sa.writer_prompt("a robot learns to paint", shots=6)
+
+
+def test_the_story_keeps_its_idea_and_notes(tmp_path):
+    p = tmp_path / "story.toml"
+    p.write_text(sa.draft_to_toml(draft(), idea='a "lonely" keeper', notes="stormy\nnorth coast"))
+    import tomllib
+    d = tomllib.loads(p.read_text())
+    assert d["idea"] == 'a "lonely" keeper' and d["notes"] == "stormy\nnorth coast"
+    sa.load_story(p)
+
+
+def test_new_passes_notes_to_the_writer(ollama, tmp_path):
+    FakeOllama.replies = [draft()]
+    r = new(ollama, "gull", "a keeper and a gull", "--shots", "3", "--notes", "the gull is called PIP", cwd=tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert "the gull is called PIP" in FakeOllama.requests[0]["prompt"]

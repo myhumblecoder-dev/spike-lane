@@ -920,11 +920,13 @@ WRITER_EXAMPLE = {
 }
 
 
-def writer_prompt(idea: str, shots: int, problems: list[str] | None = None, previous: dict | None = None) -> str:
+def writer_prompt(idea: str, shots: int, problems: list[str] | None = None, previous: dict | None = None,
+                  notes: str = "") -> str:
+    ref = f"\nREFERENCE NOTES from the author (follow them: names, looks, setting, tone, events):\n{notes.strip()}\n" if notes.strip() else ""
     p = f"""You are the story artist for a short 2D cartoon. Turn the idea below into a shot list of exactly {shots} shots.
 
 IDEA: {idea}
-
+{ref}
 How the film is made, so write for it:
 - Every shot is a single 5 seconds clip animated from one storyboard still. One clear action per shot.
 - Stills are rendered by an image model, so each still is a concrete visual description: framing (wide shot,
@@ -1018,10 +1020,11 @@ def _toml_str(v: str) -> str:
     return json.dumps(v, ensure_ascii=False)   # a JSON string is a valid TOML basic string
 
 
-def draft_to_toml(d: dict, idea: str) -> str:
+def draft_to_toml(d: dict, idea: str, notes: str = "") -> str:
     q = _toml_str
     out = [f"# {d['title']}: drafted by spike-animate new from the idea:", f"#   {idea}",
            "# Edit freely, then: spike-animate board story.toml", "",
+           f"idea = {q(idea)}", *([f"notes = {q(notes)}"] if notes else []),
            f"title = {q(d['title'])}", "seed = 1024", f"look = {q(d['look'])}", f"still_style = {q(d['still_style'])}",
            "", "[characters]"]
     out += [f"{c['name']} = {q(c['description'])}" for c in d["characters"] if not c.get("voice")]
@@ -1067,7 +1070,7 @@ def ollama_generate(prompt: str, model: str) -> dict:
         raise StageError("the writer model did not return a JSON story") from None
 
 
-def cmd_new(folder: Path, idea: str, shots: int, model: str, attempts: int = 3) -> int:
+def cmd_new(folder: Path, idea: str, shots: int, model: str, attempts: int = 3, notes: str = "") -> int:
     import spike_lane
     story_file = folder / "story.toml"
     if story_file.exists():
@@ -1078,7 +1081,7 @@ def cmd_new(folder: Path, idea: str, shots: int, model: str, attempts: int = 3) 
     try:
         problems, d = None, None
         for attempt in range(1, attempts + 1):
-            d = ollama_generate(writer_prompt(idea, shots, problems, previous=d if problems else None), model)
+            d = ollama_generate(writer_prompt(idea, shots, problems, previous=d if problems else None, notes=notes), model)
             problems = lint_draft(d, shots)
             if not problems:
                 break
@@ -1089,7 +1092,7 @@ def cmd_new(folder: Path, idea: str, shots: int, model: str, attempts: int = 3) 
         print("the writer couldn't produce a valid story:\n  " + "\n  ".join(problems), file=sys.stderr)
         return 1
     folder.mkdir(parents=True, exist_ok=True)
-    story_file.write_text(draft_to_toml(d, idea))
+    story_file.write_text(draft_to_toml(d, idea, notes))
     load_story(story_file)   # must load cleanly
     _say(f"Story drafted: {story_file} ({d['title']}, {len(d['shots'])} shots)\n"
          f"Read and edit it, then run `spike-animate board {story_file}`.")
@@ -1107,6 +1110,7 @@ def main(argv: list[str]) -> int:
     nw.add_argument("folder", type=Path)
     nw.add_argument("idea")
     nw.add_argument("--shots", type=int, default=8)
+    nw.add_argument("--notes", default="", help="reference material for the writer: names, looks, setting, tone")
     nw.add_argument("--model", default=os.environ.get("SPIKE_WRITER_MODEL", "gemma4:26b"))
     rt = sub.add_parser("retake", help="render alternate seeds for one shot's still")
     rt.add_argument("story", type=Path)
@@ -1115,7 +1119,7 @@ def main(argv: list[str]) -> int:
     a = ap.parse_args(argv)
     try:
         if a.cmd == "new":
-            return cmd_new(a.folder, a.idea, a.shots, a.model)
+            return cmd_new(a.folder, a.idea, a.shots, a.model, notes=a.notes)
         story = load_story(a.story)
         if a.cmd == "board":
             return cmd_board(story)

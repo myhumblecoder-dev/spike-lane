@@ -1,0 +1,673 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Spike Studio">
+<title>Spike Studio</title>
+<style>
+/* A screening-room studio: warm dark by default, a paper light theme when the phone asks for it.
+   One column on a phone, the same column centered on a desktop. */
+:root {
+  --bg: #16120f; --panel: #221c17; --panel-2: #2c241e; --line: #3a3029; --fg: #f3ebe0; --dim: #b4a593;
+  --faint: #7d6f61; --accent: #f0b54a; --accent-ink: #1d1508; --ok: #8fcf8a; --bad: #ef8a78; --run: #7fb8e8;
+  --radius: 10px; --gap: 14px;
+  --display: ui-serif, "New York", Georgia, serif;
+  --body: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, monospace;
+  color-scheme: dark;
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --bg: #f6f0e6; --panel: #fffaf2; --panel-2: #f0e7d9; --line: #e2d5c2; --fg: #2a211a; --dim: #6d5f50;
+    --faint: #9a8b79; --accent: #c7851a; --accent-ink: #fffaf2; --ok: #2f7d35; --bad: #b73e2b; --run: #2b6ea8;
+    color-scheme: light;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--fg); }
+body { font: 16px/1.5 var(--body); -webkit-text-size-adjust: 100%; padding-bottom: calc(40px + env(safe-area-inset-bottom)); }
+button, input, select, textarea { font: inherit; color: inherit; }
+a { color: var(--accent); }
+.wrap { max-width: 860px; margin: 0 auto; padding: 0 16px; }
+
+/* top bar */
+header.top { position: sticky; top: 0; z-index: 20; background: color-mix(in srgb, var(--bg) 88%, transparent);
+  backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); border-bottom: 1px solid var(--line);
+  padding-top: env(safe-area-inset-top); }
+.top .wrap { display: flex; align-items: center; gap: 10px; min-height: 52px; }
+.brand { font: 700 1.15rem/1 var(--display); letter-spacing: .01em; white-space: nowrap; }
+.brand b { color: var(--accent); }
+.crumb { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1; }
+.back { background: none; border: 0; padding: 8px 6px 8px 0; color: var(--accent); cursor: pointer; font-size: 1rem; }
+
+/* tabs */
+nav.tabs { display: flex; gap: 6px; overflow-x: auto; padding: 10px 0; scrollbar-width: none; }
+nav.tabs::-webkit-scrollbar { display: none; }
+nav.tabs button { flex: none; border: 1px solid var(--line); background: var(--panel); color: var(--dim);
+  padding: 7px 14px; border-radius: 999px; cursor: pointer; font-size: .92rem; }
+nav.tabs button[aria-current="true"] { background: var(--fg); color: var(--bg); border-color: var(--fg); }
+nav.tabs button .n { color: var(--faint); margin-right: 4px; font-variant-numeric: tabular-nums; }
+nav.tabs button[aria-current="true"] .n { color: inherit; opacity: .6; }
+
+/* basics */
+h1 { font: 700 clamp(1.8rem, 6vw, 2.6rem)/1.05 var(--display); margin: 18px 0 4px; text-wrap: balance; }
+h2 { font: 600 1.2rem/1.2 var(--display); margin: 26px 0 10px; }
+h3 { font-size: .78rem; letter-spacing: .12em; text-transform: uppercase; color: var(--dim); margin: 18px 0 8px; font-weight: 600; }
+p { margin: 0 0 10px; }
+.dim { color: var(--dim); } .faint { color: var(--faint); } .small { font-size: .88rem; }
+.mono { font-family: var(--mono); font-size: .85rem; }
+.stack { display: grid; gap: var(--gap); }
+.row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.spacer { flex: 1; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px; min-width: 0; }
+.hint { background: var(--panel-2); border-radius: var(--radius); padding: 12px 14px; color: var(--dim); font-size: .93rem; }
+
+/* controls */
+.btn { border: 1px solid var(--line); background: var(--panel-2); padding: 10px 16px; border-radius: 999px;
+  cursor: pointer; font-weight: 600; font-size: .95rem; display: inline-flex; gap: 8px; align-items: center; min-height: 42px; }
+.btn.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+.btn.ghost { background: transparent; }
+.btn.small { padding: 6px 12px; min-height: 34px; font-size: .86rem; }
+.btn.danger { color: var(--bad); }
+.btn:disabled { opacity: .45; cursor: default; }
+label.f { display: grid; gap: 5px; font-size: .86rem; color: var(--dim); min-width: 0; }
+label.f > span { display: flex; justify-content: space-between; gap: 8px; }
+input[type=text], input[type=number], textarea, select {
+  width: 100%; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
+  color: var(--fg); font-size: 16px; /* 16px stops iOS zooming on focus */ }
+textarea { resize: vertical; min-height: 64px; line-height: 1.45; }
+textarea.code { font-family: var(--mono); font-size: 13px; min-height: 60vh; white-space: pre; }
+input:focus, textarea:focus, select:focus { outline: 2px solid color-mix(in srgb, var(--accent) 60%, transparent); outline-offset: 1px; }
+input[type=range] { width: 100%; accent-color: var(--accent); }
+.grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.grid3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+@media (max-width: 520px) { .grid2.collapse, .grid3.collapse { grid-template-columns: 1fr; } }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+.seg button { border: 0; background: transparent; padding: 7px 14px; cursor: pointer; color: var(--dim); font-size: .9rem; }
+.seg button[aria-pressed="true"] { background: var(--fg); color: var(--bg); }
+
+/* media */
+img, video { display: block; width: 100%; border-radius: 8px; background: #000; }
+video.film { aspect-ratio: 832 / 448; }
+audio { width: 100%; height: 40px; }
+.thumb { aspect-ratio: 1248 / 720; object-fit: cover; }
+.empty-media { aspect-ratio: 1248 / 720; border-radius: 8px; border: 1px dashed var(--line); display: grid; place-items: center;
+  color: var(--faint); font-size: .88rem; background: var(--panel-2); }
+
+/* films list */
+.films { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(240px, 100%), 1fr)); gap: var(--gap); }
+.film-card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden;
+  cursor: pointer; text-align: left; padding: 0; display: grid; }
+.film-card img, .film-card .empty-media { border-radius: 0; }
+.film-card .meta { padding: 10px 12px 12px; display: grid; gap: 2px; }
+.film-card b { font: 600 1.05rem/1.2 var(--display); }
+
+/* chips */
+.chip { display: inline-flex; align-items: center; gap: 5px; font-size: .78rem; padding: 2px 9px; border-radius: 999px;
+  background: var(--panel-2); color: var(--dim); white-space: nowrap; }
+.chip.ok { color: var(--ok); } .chip.bad { color: var(--bad); } .chip.run { color: var(--run); }
+.chip.acc { background: var(--accent); color: var(--accent-ink); }
+
+/* job bar */
+.job { position: sticky; top: calc(53px + env(safe-area-inset-top)); z-index: 15; margin: 10px 0 0; }
+.job .card { display: grid; gap: 6px; padding: 10px 14px; border-color: color-mix(in srgb, var(--run) 50%, var(--line)); }
+.job.done .card { border-color: color-mix(in srgb, var(--ok) 50%, var(--line)); }
+.job.failed .card { border-color: color-mix(in srgb, var(--bad) 60%, var(--line)); }
+.job .last { font-family: var(--mono); font-size: .8rem; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.job pre { margin: 0; max-height: 40vh; overflow: auto; font: .78rem/1.4 var(--mono); color: var(--dim); white-space: pre-wrap; word-break: break-word; }
+.pulse { width: 9px; height: 9px; border-radius: 50%; background: var(--run); animation: pulse 1.4s ease-in-out infinite; flex: none; }
+@keyframes pulse { 50% { opacity: .25; } }
+@media (prefers-reduced-motion: reduce) { .pulse { animation: none; } }
+
+/* board */
+.board { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(250px, 100%), 1fr)); gap: var(--gap); align-items: start; }
+.board > *, .films > * { min-width: 0; }
+.shot-card { display: grid; gap: 8px; }
+.shot-card .id { font: 600 .82rem/1 var(--mono); color: var(--accent); }
+.retakes { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+.retakes figure { margin: 0; display: grid; gap: 4px; }
+.retakes figcaption { display: flex; justify-content: space-between; align-items: center; gap: 4px; flex-wrap: wrap; font-size: .78rem; color: var(--dim); }
+.retakes figcaption .btn { padding: 4px 10px; min-height: 30px; }
+.stale { position: relative; }
+.stale::after { content: "out of date"; position: absolute; top: 6px; left: 6px; font-size: .72rem; padding: 2px 7px;
+  border-radius: 999px; background: var(--bad); color: #fff; }
+
+/* story editor */
+details.sec { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); }
+details.sec > summary { list-style: none; cursor: pointer; padding: 13px 14px; display: flex; gap: 10px; align-items: center; }
+details.sec > summary::-webkit-details-marker { display: none; }
+details.sec > summary::after { content: "›"; margin-left: auto; color: var(--faint); font-size: 1.3rem; line-height: 1; transition: transform .15s; }
+details.sec[open] > summary::after { transform: rotate(90deg); }
+details.sec > .body { padding: 0 14px 14px; display: grid; gap: 12px; }
+.sum-title { font-weight: 600; } .sum-sub { color: var(--dim); font-size: .88rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.line-row { display: grid; grid-template-columns: 7.5rem minmax(0, 1fr) auto; gap: 8px; align-items: start; }
+@media (max-width: 520px) { .line-row { grid-template-columns: 1fr auto; } .line-row .line-text { grid-column: 1 / -1; grid-row: 2; } }
+.savebar { position: sticky; bottom: 0; z-index: 10; padding: 12px 0 calc(12px + env(safe-area-inset-bottom));
+  background: linear-gradient(to top, var(--bg) 70%, transparent); }
+.errors { color: var(--bad); font-size: .92rem; white-space: pre-wrap; }
+
+/* lists */
+.lines { display: grid; gap: 10px; }
+.line { display: grid; gap: 6px; padding: 12px 0; border-top: 1px solid var(--line); }
+.who { font-size: .76rem; letter-spacing: .1em; text-transform: uppercase; font-weight: 700; color: var(--accent); }
+.said { font: italic 1.02rem/1.4 var(--display); }
+.take { display: grid; gap: 8px; }
+.toast { position: fixed; left: 50%; bottom: calc(20px + env(safe-area-inset-bottom)); transform: translateX(-50%); z-index: 50;
+  background: var(--fg); color: var(--bg); padding: 10px 16px; border-radius: 999px; font-size: .92rem; max-width: calc(100vw - 32px);
+  box-shadow: 0 8px 30px rgba(0,0,0,.35); }
+.toast.bad { background: var(--bad); color: #fff; }
+.center { text-align: center; padding: 40px 0; }
+</style>
+</head>
+<body>
+<header class="top"><div class="wrap" id="topbar"></div></header>
+<main class="wrap" id="app"></main>
+<script>
+"use strict";
+// ---- tiny helpers ---------------------------------------------------------------------------------
+const $app = document.getElementById("app"), $top = document.getElementById("topbar");
+function h(tag, attrs, ...kids) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v == null || v === false) continue;
+    if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
+    else if (k === "class") el.className = v;
+    else if (k === "value") el.value = v;
+    else el.setAttribute(k, v === true ? "" : v);
+  }
+  for (const kid of kids.flat(Infinity)) if (kid != null && kid !== false) el.append(kid instanceof Node ? kid : document.createTextNode(String(kid)));
+  return el;
+}
+async function api(method, path, body) {
+  const r = await fetch(path, { method, headers: body ? { "Content-Type": "application/json" } : {}, body: body ? JSON.stringify(body) : undefined });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw Object.assign(new Error((data.errors || [r.statusText]).join("\n")), { data, status: r.status });
+  return data;
+}
+let toastTimer;
+function toast(msg, bad) {
+  document.querySelector(".toast")?.remove();
+  const t = h("div", { class: "toast" + (bad ? " bad" : ""), role: "status" }, msg);
+  document.body.append(t); clearTimeout(toastTimer); toastTimer = setTimeout(() => t.remove(), bad ? 6000 : 2600);
+}
+const media = (url) => url ? `/media/${S.name}/${url}` : null;
+const clone = (x) => JSON.parse(JSON.stringify(x));
+const fmtSecs = (s) => s >= 60 ? `${Math.floor(s / 60)} min ${String(s % 60).padStart(2, "0")} s` : `${s} s`;
+const STEP_NAMES = { new: "Writing the story", board: "Drawing the storyboard", retake: "Drawing retakes", film: "Making the film", status: "Status" };
+
+// ---- state ----------------------------------------------------------------------------------------
+const S = { name: null, film: null, doc: null, dirty: false, tab: "story", raw: false, rawText: "", errors: [], poll: null, openShot: null, logOpen: false };
+
+function route() {
+  const m = location.hash.match(/^#\/film\/([a-z0-9-]+)(?:\/(\w+))?/);
+  clearTimeout(S.poll);
+  if (m) {
+    if (S.name !== m[1]) Object.assign(S, { name: m[1], film: null, doc: null, dirty: false, raw: false, errors: [], openShot: null });
+    S.tab = m[2] || S.tab || "story";
+    loadFilm();
+  } else { S.name = null; home(); }
+}
+window.addEventListener("hashchange", route);
+window.addEventListener("beforeunload", (e) => { if (S.dirty) { e.preventDefault(); e.returnValue = ""; } });
+
+// ---- home -----------------------------------------------------------------------------------------
+async function home() {
+  $top.replaceChildren(h("div", { class: "brand" }, "Spike ", h("b", {}, "Studio")));
+  $app.replaceChildren(h("p", { class: "center dim" }, "Loading…"));
+  let films = [];
+  try { films = await api("GET", "/api/films"); } catch (e) { toast(e.message, true); }
+  const shots = h("input", { type: "number", min: 3, max: 16, value: 8, inputmode: "numeric" });
+  const title = h("input", { type: "text", placeholder: "e.g. Penguin Ice Cream", autocomplete: "off" });
+  const idea = h("textarea", { rows: 3, placeholder: "One line is enough: a shy penguin opens a tiny ice-cream shop in Antarctica and nobody comes, until a blizzard…" });
+  const notes = h("textarea", { rows: 3, placeholder: "Optional: names, looks, setting, tone, who talks, how it ends. The writer follows these." });
+  const go = h("button", { class: "btn primary", onclick: async () => {
+    if (!idea.value.trim()) return toast("Write the idea first", true);
+    go.disabled = true;
+    try {
+      const r = await api("POST", "/api/films", { title: title.value.trim() || idea.value.trim().slice(0, 40), idea: idea.value, notes: notes.value, shots: +shots.value || 8 });
+      location.hash = `#/film/${r.name}/story`;
+    } catch (e) { toast(e.message, true); go.disabled = false; }
+  } }, "Write the story");
+  $app.replaceChildren(
+    h("h1", {}, "New film"),
+    h("p", { class: "dim" }, "Spike writes the story on this Mac with the local model, then you edit it, approve the storyboard, and make the film."),
+    h("div", { class: "card stack" },
+      h("label", { class: "f" }, h("span", {}, "Idea"), idea),
+      h("label", { class: "f" }, h("span", {}, "Reference notes"), notes),
+      h("div", { class: "grid2" }, h("label", { class: "f" }, h("span", {}, "Title (optional)"), title),
+        h("label", { class: "f" }, h("span", {}, "Shots", h("span", { class: "faint" }, "5 s each")), shots)),
+      h("div", { class: "row" }, go, h("span", { class: "small faint" }, "About a minute"))),
+    h("h2", {}, "Films"),
+    films.length ? h("div", { class: "films" }, films.map((f) =>
+      h("button", { class: "film-card", onclick: () => { location.hash = `#/film/${f.name}/${f.film ? "film" : "story"}`; } },
+        f.poster ? h("img", { class: "thumb", src: `/media/${f.name}/${f.poster}`, alt: "", loading: "lazy" }) : h("div", { class: "empty-media" }, "No storyboard yet"),
+        h("div", { class: "meta" }, h("b", {}, f.title), h("span", { class: "small dim" }, f.film ? "Film ready" : "In progress", " · ", new Date(f.updated * 1000).toLocaleDateString())))))
+      : h("p", { class: "dim" }, "No films yet."));
+}
+
+// ---- film -----------------------------------------------------------------------------------------
+async function loadFilm(quiet) {
+  try {
+    const f = await api("GET", `/api/films/${S.name}`);
+    const wasRunning = S.film?.job?.running;
+    const sig = JSON.stringify({ ...f, job: f.job && { step: f.job.step, running: f.job.running, rc: f.job.rc } });
+    // A poll that changed nothing on disk, or arrives while something is playing, only refreshes the job bar.
+    const playing = [...document.querySelectorAll("audio,video")].some((m) => !m.paused);
+    if (quiet && S.film && (sig === S.sig || playing)) {
+      S.film.job = f.job; if (sig !== S.sig) S.pending = true;
+      document.getElementById("jobbar")?.replaceWith(jobBar());
+      clearTimeout(S.poll); S.poll = setTimeout(() => loadFilm(true), f.job?.running ? 2500 : 15000);
+      return;
+    }
+    S.sig = sig; S.pending = false;
+    S.film = f;
+    if (!S.dirty) { S.doc = f.doc ? clone(f.doc) : null; S.rawText = f.toml; }
+    if (wasRunning && f.job && !f.job.running) {
+      toast(f.job.rc === 0 ? `${STEP_NAMES[f.job.step] || f.job.step}: done` : `${STEP_NAMES[f.job.step] || f.job.step} failed; see the log`, f.job.rc !== 0);
+      if (f.job.rc !== 0) S.logOpen = true;
+    }
+    renderFilm(quiet);
+  } catch (e) {
+    if (e.status === 404) { toast("No such film", true); location.hash = ""; return; }
+    toast(e.message, true);
+  }
+  clearTimeout(S.poll);
+  S.poll = setTimeout(() => loadFilm(true), S.film?.job?.running ? 2500 : 15000);
+}
+
+const TABS = [["story", "Story"], ["board", "Storyboard"], ["shots", "Video"], ["voices", "Voices"], ["music", "Music"], ["film", "Film"]];
+
+function renderFilm(quiet) {
+  const f = S.film;
+  $top.replaceChildren(
+    h("button", { class: "back", onclick: () => { if (!S.dirty || confirm("Discard unsaved story edits?")) { S.dirty = false; location.hash = ""; } } }, "‹ Films"),
+    h("div", { class: "crumb" }, f.title));
+  // When polling, keep whatever the person is typing: only refresh the job bar and the non-editor tabs.
+  const active = document.activeElement;
+  if (quiet && S.tab === "story" && $app.contains(active) && active.matches("input,textarea,select")) {
+    document.getElementById("jobbar")?.replaceWith(jobBar());
+    return;
+  }
+  const y = window.scrollY;
+  const tabs = h("nav", { class: "tabs", "aria-label": "Steps" }, TABS.map(([k, label], i) =>
+    h("button", { "aria-current": S.tab === k ? "true" : "false", onclick: () => { location.hash = `#/film/${S.name}/${k}`; } },
+      h("span", { class: "n" }, i + 1), label)));
+  const body = { story: storyTab, board: boardTab, shots: shotsTab, voices: voicesTab, music: musicTab, film: filmTab }[S.tab] || storyTab;
+  $app.replaceChildren(jobBar(), tabs, body());
+  if (quiet) window.scrollTo(0, y);
+}
+
+function jobBar() {
+  const j = S.film.job;
+  if (!j) return h("div", { id: "jobbar" });
+  const name = STEP_NAMES[j.step] || j.step;
+  const lines = j.log.trim().split("\n").filter(Boolean);
+  const cls = j.running ? "" : j.rc === 0 ? " done" : " failed";
+  const pre = h("pre", { hidden: !S.logOpen }, j.log.trim() || "(no output yet)");
+  const toggle = h("button", { class: "btn ghost small", onclick: () => { S.logOpen = !S.logOpen; pre.hidden = !S.logOpen; toggle.textContent = S.logOpen ? "Hide log" : "Log"; } }, S.logOpen ? "Hide log" : "Log");
+  return h("div", { class: "job" + cls, id: "jobbar" }, h("div", { class: "card" },
+    h("div", { class: "row" },
+      j.running ? h("span", { class: "pulse", "aria-hidden": "true" }) : h("span", { class: "chip " + (j.rc === 0 ? "ok" : "bad") }, j.rc === 0 ? "✓ Done" : "✗ Failed"),
+      h("b", {}, name), h("span", { class: "small dim" }, fmtSecs(j.seconds)), h("span", { class: "spacer" }),
+      j.running ? h("button", { class: "btn ghost small danger", onclick: async () => {
+        if (!confirm(`Stop ${name.toLowerCase()}?`)) return;
+        await api("POST", `/api/films/${S.name}/stop`).catch((e) => toast(e.message, true)); loadFilm(true);
+      } }, "Stop") : null, toggle),
+    j.running && lines.length ? h("div", { class: "last" }, lines[lines.length - 1]) : null, pre));
+}
+
+async function run(step, extra) {
+  if (S.dirty) return toast("Save the story first", true);
+  try { S.film = await api("POST", `/api/films/${S.name}/run`, { step, ...extra }); S.logOpen = false; renderFilm(); loadFilm(true); }
+  catch (e) { toast(e.message, true); }
+}
+const busy = () => S.film?.job?.running;
+const runBtn = (label, step, extra, primary = true) =>
+  h("button", { class: "btn" + (primary ? " primary" : ""), disabled: busy() || !!S.film.errors.length, onclick: () => run(step, extra) }, label);
+
+// ---- story tab ------------------------------------------------------------------------------------
+function markDirty() { if (!S.dirty) { S.dirty = true; document.getElementById("savebtn")?.removeAttribute("disabled"); } }
+function field(label, obj, key, opts = {}) {
+  const multi = opts.rows && opts.rows > 1;
+  const el = multi ? h("textarea", { rows: opts.rows, placeholder: opts.placeholder || "" }) :
+    h("input", { type: opts.type || "text", placeholder: opts.placeholder || "", step: opts.step, min: opts.min, max: opts.max, inputmode: opts.type === "number" ? "decimal" : null });
+  el.value = obj[key] ?? "";
+  el.addEventListener("input", () => {
+    if (opts.type === "number") { if (el.value === "") delete obj[key]; else obj[key] = Number(el.value); }
+    else if (el.value === "" && opts.dropEmpty) delete obj[key];
+    else obj[key] = el.value;
+    opts.onchange?.(); markDirty();
+  });
+  return h("label", { class: "f" }, h("span", {}, label, opts.note ? h("span", { class: "faint" }, opts.note) : null), el);
+}
+function sec(title, sub, open, ...body) {
+  return h("details", { class: "sec", open: open || null }, h("summary", {}, h("span", { class: "sum-title" }, title), sub ? h("span", { class: "sum-sub" }, sub) : null), h("div", { class: "body" }, body));
+}
+
+function storyTab() {
+  const f = S.film;
+  if (!f.doc && !S.raw) {
+    const writing = f.job?.running && f.job.step === "new";
+    return h("div", { class: "stack" }, h("h1", {}, f.title),
+      writing ? h("div", { class: "hint" }, "The local model is writing the story. It usually takes about a minute; this page fills in when it's done.")
+        : f.job?.step === "new" && f.job.rc ? h("div", { class: "hint" }, "The writer couldn't produce a valid story. Open the log above for the reasons, then start a new film with a clearer idea.")
+        : h("div", { class: "errors" }, f.errors.join("\n")),
+      f.toml ? h("button", { class: "btn", onclick: () => { S.raw = true; renderFilm(); } }, "Edit story.toml") : null);
+  }
+  const top = h("div", { class: "row" }, h("h1", { style: "flex:1" }, f.title),
+    h("div", { class: "seg", role: "group", "aria-label": "Editor" },
+      h("button", { "aria-pressed": !S.raw, onclick: () => switchRaw(false) }, "Form"),
+      h("button", { "aria-pressed": S.raw, onclick: () => switchRaw(true) }, "TOML")));
+  const errs = h("div", { class: "errors", id: "errs" }, (S.errors.length ? S.errors : f.errors).join("\n"));
+  const save = h("button", { class: "btn primary", id: "savebtn", disabled: !S.dirty, onclick: saveStory }, "Save story");
+  const next = runBtn(f.shots.some((s) => s.still) ? "Redraw storyboard" : "Draw storyboard", "board", {}, false);
+  const bar = h("div", { class: "savebar row" }, save, next, h("span", { class: "spacer" }),
+    S.dirty ? h("button", { class: "btn ghost small", onclick: () => { S.dirty = false; S.errors = []; S.doc = clone(f.doc); S.rawText = f.toml; renderFilm(); } }, "Undo edits") : null);
+  if (S.raw) {
+    const ta = h("textarea", { class: "code", spellcheck: "false", autocapitalize: "off", autocorrect: "off" });
+    ta.value = S.rawText;
+    ta.addEventListener("input", () => { S.rawText = ta.value; markDirty(); });
+    return h("div", { class: "stack" }, top, h("p", { class: "dim small" }, "The story file exactly as saved, comments included."), errs, ta, bar);
+  }
+  return h("div", { class: "stack" }, top, errs, storyForm(S.doc), bar);
+}
+function switchRaw(raw) {
+  if (raw === S.raw) return;
+  if (S.dirty && !confirm("Switching editors drops unsaved edits. Continue?")) return;
+  S.dirty = false; S.errors = []; S.raw = raw; S.doc = S.film.doc ? clone(S.film.doc) : null; S.rawText = S.film.toml; renderFilm();
+}
+async function saveStory() {
+  const btn = document.getElementById("savebtn"); btn.disabled = true;
+  try {
+    const f = await api("PUT", `/api/films/${S.name}/story`, S.raw ? { toml: S.rawText } : { doc: S.doc });
+    S.film = { ...f, job: f.job }; S.dirty = false; S.errors = []; S.doc = clone(f.doc); S.rawText = f.toml;
+    toast("Story saved"); renderFilm(true);
+  } catch (e) {
+    S.errors = e.data?.errors || [e.message];
+    document.getElementById("errs").textContent = S.errors.join("\n"); btn.disabled = false;
+    toast("Not saved: fix the problem shown", true);
+  }
+}
+
+function storyForm(d) {
+  d.characters ||= {}; d.shot ||= [];
+  const voiced = () => Object.entries(d.characters).filter(([, c]) => typeof c === "object" && c.voice).map(([n]) => n);
+  // basics + idea
+  const basics = sec("Look and idea", d.look, false,
+    field("Title", d, "title"),
+    field("Idea", d, "idea", { rows: 2, placeholder: "the one-line idea", dropEmpty: true }),
+    field("Reference notes", d, "notes", { rows: 3, placeholder: "names, looks, setting, tone", dropEmpty: true, note: "for your records; the writer used these" }),
+    field("Look (every video shot)", d, "look", { rows: 2 }),
+    field("Still style (every storyboard still)", d, "still_style", { rows: 2 }),
+    h("div", { class: "grid2" }, field("Seed", d, "seed", { type: "number", step: 1 }),
+      h("label", { class: "f" }, h("span", {}, "Dialogue voices"), (() => {
+        const s = h("select", {}, h("option", { value: "clone" }, "Clone (fast, steady)"), h("option", { value: "scene" }, "Scene (natural, slow)"));
+        s.value = d.dialogue?.mode || "clone";
+        s.addEventListener("change", () => { d.dialogue ||= {}; d.dialogue.mode = s.value; markDirty(); });
+        return s;
+      })())));
+  // characters
+  const charList = h("div", { class: "stack" });
+  const drawChars = () => charList.replaceChildren(...Object.keys(d.characters).map((name) => charCard(d, name, drawChars)), addCharRow());
+  const addCharRow = () => {
+    const nm = h("input", { type: "text", placeholder: "NAME", autocapitalize: "characters" });
+    return h("div", { class: "row" }, h("div", { style: "flex:1;min-width:0" }, nm), h("button", { class: "btn small", onclick: () => {
+      const n = nm.value.trim().toUpperCase().replace(/[^A-Z]/g, "");
+      if (!n) return toast("Names are one UPPERCASE word, letters only", true);
+      if (d.characters[n]) return toast(`${n} already exists`, true);
+      d.characters[n] = { look: "" }; markDirty(); drawChars();
+    } }, "Add character"));
+  };
+  drawChars();
+  const chars = sec("Characters", Object.keys(d.characters).join(", "), false,
+    h("p", { class: "small dim" }, "Write a character's NAME in stills and motions; it's replaced by the look so they match in every shot. Give a voice to anyone who talks."), charList);
+  // narrator
+  const narr = d.narrator ? sec("Narrator", d.narrator.voice, false,
+      field("Voice", d.narrator, "voice", { rows: 2, note: "how the narrator sounds" }),
+      field("Sample line", d.narrator, "sample", { rows: 2, note: "used to design the voice" }),
+      h("div", { class: "row" }, h("div", { style: "width:9rem" }, field("Lead-in (s)", d.narrator, "lead", { type: "number", step: 0.1 })), h("span", { class: "spacer" }),
+        h("button", { class: "btn small danger", onclick: () => { delete d.narrator; markDirty(); renderFilm(); } }, "No narrator")))
+    : sec("Narrator", "none", false, h("button", { class: "btn small", onclick: () => { d.narrator = { voice: "A warm, gentle storyteller, slow and clear", sample: "Once upon a time, in a place not so far from here, something wonderful happened.", lead: 0.5 }; markDirty(); renderFilm(); } }, "Add a narrator"));
+  // music
+  const music = d.music ? sec("Music", d.music.caption, false,
+      field("Brief", d.music, "caption", { rows: 3 }),
+      field("Structure", d.music, "structure", { rows: 4, note: "[Section - description] tags" }),
+      h("div", { class: "grid3" }, field("Key", d.music, "key"), field("Takes", d.music, "takes", { type: "number", step: 1, min: 1, max: 12 }),
+        field("Volume (dB)", d.music, "db", { type: "number", step: 1 })),
+      h("p", { class: "small dim" }, d.music.take != null ? `Take ${d.music.take} is pinned; change it on the Music step.` : "Every take is generated and the one that best follows the story wins."))
+    : sec("Music", "none", false, h("button", { class: "btn small", onclick: () => { d.music = { caption: "gentle orchestral film score, no vocals", structure: "[Intro - calm]\n\n[Build - rising]\n\n[Outro - resolve]", key: "C major", takes: 8, db: -10 }; markDirty(); renderFilm(); } }, "Add a score"));
+  // shots
+  const shotList = h("div", { class: "stack" });
+  const drawShots = () => shotList.replaceChildren(...d.shot.map((s, i) => shotCard(d, s, i, voiced, drawShots)),
+    h("button", { class: "btn", onclick: () => {
+      const n = String(d.shot.length + 1).padStart(2, "0");
+      d.shot.push({ id: `${n}-new`, still: "", motion: "static camera, ", intensity: 0.5 }); S.openShot = `${n}-new`; markDirty(); drawShots();
+    } }, "Add shot"));
+  drawShots();
+  return h("div", { class: "stack" }, basics, chars, narr, music, h("h2", {}, `Shots (${d.shot.length} × 5 s)`), shotList);
+}
+
+function charCard(d, name, redraw) {
+  let c = d.characters[name];
+  if (typeof c === "string") c = { look: c };
+  const sync = () => {     // characters without a voice stay plain strings in the file
+    d.characters[name] = c.voice ? c : (Object.keys(c).filter((k) => k !== "voice" && k !== "sample").length > 1 ? c : c.look);
+    if (!c.voice) delete c.sample;
+  };
+  sync();
+  return sec(name, c.voice ? "speaks" : "silent", false,
+    field("Look", c, "look", { rows: 2, onchange: sync }),
+    field("Voice", c, "voice", { rows: 2, placeholder: "leave empty if they never talk; e.g. small, bright, chirpy, fast", dropEmpty: true, onchange: sync }),
+    field("Voice sample line", c, "sample", { rows: 2, placeholder: "optional: a line in character, used to design the voice", dropEmpty: true, onchange: sync }),
+    h("div", { class: "row" }, h("span", { class: "spacer" }), h("button", { class: "btn small danger", onclick: () => {
+      if (!confirm(`Remove ${name}?`)) return; delete d.characters[name]; markDirty(); redraw();
+    } }, "Remove")));
+}
+
+function shotCard(d, s, i, voiced, redraw) {
+  const words = () => (s.narration || "").split(/\s+/).filter(Boolean).length + (s.dialogue || []).reduce((n, l) => n + (l.line || "").split(/\s+/).filter(Boolean).length, 0);
+  const count = h("span", { class: "faint" });
+  const recount = () => { const w = words(); count.textContent = `${w}/12 words spoken`; count.style.color = w > 12 ? "var(--bad)" : ""; };
+  recount();
+  const state = S.film.shots.find((x) => x.id === s.id);
+  // dialogue lines
+  const lines = h("div", { class: "stack" });
+  const drawLines = () => lines.replaceChildren(...(s.dialogue || []).map((l, k) => {
+    const who = h("select", {}, voiced().map((n) => h("option", { value: n }, n)));
+    who.value = l.speaker; if (!voiced().includes(l.speaker)) who.prepend(h("option", { value: l.speaker }, l.speaker + " (no voice)")), who.value = l.speaker;
+    who.addEventListener("change", () => { l.speaker = who.value; markDirty(); });
+    const said = h("input", { type: "text", value: l.line, placeholder: "the line" });
+    said.addEventListener("input", () => { l.line = said.value; recount(); markDirty(); });
+    const emo = h("input", { type: "text", value: l.emotion || "", placeholder: "emotion (optional)" });
+    emo.addEventListener("input", () => { l.emotion = emo.value; markDirty(); });
+    return h("div", { class: "stack", style: "gap:6px" }, h("div", { class: "line-row" }, who, h("div", { class: "line-text" }, said),
+      h("button", { class: "btn small ghost danger", "aria-label": "Remove line", onclick: () => { s.dialogue.splice(k, 1); if (!s.dialogue.length) delete s.dialogue; markDirty(); drawLines(); recount(); } }, "✕")), emo);
+  }), voiced().length ? h("button", { class: "btn small", onclick: () => { (s.dialogue ||= []).push({ speaker: voiced()[0], line: "", emotion: "" }); markDirty(); drawLines(); } }, "Add a line")
+    : h("p", { class: "small faint" }, "Give a character a voice to add dialogue."));
+  drawLines();
+  // intensity + action
+  const inten = h("input", { type: "range", min: 0, max: 1, step: 0.05, value: s.intensity ?? 0.5 });
+  const intenVal = h("span", { class: "faint" }, (s.intensity ?? 0.5).toFixed(2));
+  inten.addEventListener("input", () => { s.intensity = Number(inten.value); intenVal.textContent = s.intensity.toFixed(2); markDirty(); });
+  const action = h("div", { class: "seg", role: "group", "aria-label": "Movement" },
+    h("button", { "aria-pressed": (s.anchor ?? 1) !== 0, onclick: (e) => { delete s.anchor; markDirty(); setSeg(e); } }, "Calm"),
+    h("button", { "aria-pressed": s.anchor === 0, onclick: (e) => { s.anchor = 0; markDirty(); setSeg(e); } }, "Action"));
+  // reference clip
+  const refs = S.film.references.filter((r) => /\.(mp4|mov|m4v|webm)$/i.test(r));
+  const refSel = h("select", {}, h("option", { value: "" }, "None: animate from the still"), refs.map((r) => h("option", { value: r }, r.replace(/^reference\//, ""))));
+  refSel.value = s.reference?.clip || "";
+  const refOpts = h("div", { class: "grid2", hidden: !s.reference });
+  const drawRef = () => { refOpts.hidden = !s.reference; if (s.reference) refOpts.replaceChildren(field("Start at (s)", s.reference, "start", { type: "number", step: 0.1 }), field("Realism (σ)", s.reference, "sigma", { type: "number", step: 0.01, note: "lower keeps more real motion" })); };
+  refSel.addEventListener("change", () => {
+    if (refSel.value) { s.reference = { ...(s.reference || { start: 0, sigma: 0.88 }), clip: refSel.value }; delete s.colormatch; }
+    else delete s.reference;
+    markDirty(); drawRef();
+  });
+  drawRef();
+  const upload = h("input", { type: "file", accept: "video/*", hidden: true });
+  upload.addEventListener("change", async () => {
+    const file = upload.files[0]; if (!file) return;
+    toast(`Uploading ${file.name}…`);
+    try {
+      const r = await fetch(`/api/films/${S.name}/upload?name=${encodeURIComponent(file.name)}`, { method: "POST", body: file, headers: { "Content-Type": file.type || "application/octet-stream" } });
+      const data = await r.json(); if (!r.ok) throw new Error((data.errors || []).join("\n"));
+      S.film.references.push(data.path); s.reference = { clip: data.path, start: 0, sigma: 0.88 }; delete s.colormatch; markDirty(); redraw(); toast("Clip added");
+    } catch (e) { toast(e.message, true); }
+  });
+  const move = (dir) => { const j = i + dir; if (j < 0 || j >= d.shot.length) return; [d.shot[i], d.shot[j]] = [d.shot[j], d.shot[i]]; S.openShot = s.id; markDirty(); redraw(); };
+  const el = sec(h("span", {}, h("span", { class: "mono", style: "color:var(--accent)" }, s.id), "  "), s.still || "(no still yet)", S.openShot === s.id,
+    state?.still ? h("img", { class: "thumb", src: media(state.still), alt: "", loading: "lazy" }) : null,
+    field("Shot id", s, "id", { note: "01-name" }),
+    field("Still (storyboard picture)", s, "still", { rows: 3, placeholder: "medium shot of ZAP holding a shiny bolt, talking, junkyard at sunset" }),
+    field("Motion (what moves in 5 s)", s, "motion", { rows: 2, placeholder: "static camera, a small robot talks and waves" }),
+    field("Sound effects", s, "sfx", { rows: 2, placeholder: "clanking metal, wind", dropEmpty: true }),
+    field("Narration", s, "narration", { rows: 2, placeholder: "optional, said first", dropEmpty: true, onchange: recount }),
+    h("div", {}, h("h3", { style: "margin-top:4px" }, "Dialogue"), lines),
+    h("div", { class: "small" }, count),
+    h("label", { class: "f" }, h("span", {}, "Story intensity", intenVal), inten),
+    h("div", { class: "row" }, h("span", { class: "small dim" }, "Movement"), action, h("span", { class: "spacer" }),
+      h("div", { style: "width:8rem" }, field("Seed", s, "seed", { type: "number", step: 1 }))),
+    h("label", { class: "f" }, h("span", {}, "Real-motion reference clip", h("span", { class: "faint" }, "real movement, cartoon look")),
+      h("div", { class: "row" }, h("div", { style: "flex:1;min-width:0" }, refSel), h("button", { class: "btn small", onclick: () => upload.click() }, "Upload clip"), upload)),
+    refOpts,
+    h("div", { class: "row" }, h("button", { class: "btn small ghost", disabled: i === 0, onclick: () => move(-1) }, "↑ Earlier"),
+      h("button", { class: "btn small ghost", disabled: i === d.shot.length - 1, onclick: () => move(1) }, "↓ Later"), h("span", { class: "spacer" }),
+      h("button", { class: "btn small danger", onclick: () => { if (!confirm(`Remove shot ${s.id}?`)) return; d.shot.splice(i, 1); markDirty(); redraw(); } }, "Remove")));
+  el.addEventListener("toggle", () => { if (el.open) S.openShot = s.id; });
+  return el;
+}
+function setSeg(e) { for (const b of e.currentTarget.parentNode.children) b.setAttribute("aria-pressed", b === e.currentTarget); }
+
+// ---- storyboard tab -------------------------------------------------------------------------------
+function boardTab() {
+  const f = S.film;
+  const drawn = f.shots.filter((s) => s.still).length;
+  const stale = f.shots.filter((s) => s.still && s.still_fresh === false).length;
+  return h("div", { class: "stack" },
+    h("h1", {}, "Storyboard"),
+    h("p", { class: "dim" }, drawn ? `${drawn} of ${f.shots.length} stills drawn${stale ? `; ${stale} out of date after story edits` : ""}. Retake any shot you don't like, then make the film.`
+      : "One still per shot, drawn from the story. About a minute each."),
+    h("div", { class: "row" }, runBtn(drawn ? (stale || drawn < f.shots.length ? "Draw missing and changed" : "Redraw storyboard") : "Draw storyboard", "board", {}, !drawn || stale > 0 || drawn < f.shots.length),
+      drawn === f.shots.length && !stale ? runBtn("Make the film", "film") : null),
+    h("div", { class: "board" }, f.shots.map((s) => {
+      const seeds = () => [0, 1, 2].map(() => Math.floor(Math.random() * 9000) + 100);
+      return h("div", { class: "card shot-card" },
+        h("div", { class: "row" }, h("span", { class: "id" }, s.id), h("span", { class: "spacer" }), h("span", { class: "chip" }, `seed ${s.seed}`)),
+        s.still ? h("div", { class: s.still_fresh === false ? "stale" : "" }, h("img", { class: "thumb", src: media(s.still), alt: s.still_text, loading: "lazy" }))
+          : h("div", { class: "empty-media" }, "Not drawn yet"),
+        h("p", { class: "small dim" }, s.still_text),
+        s.retakes.length ? h("div", {}, h("h3", { style: "margin:4px 0 6px" }, "Retakes"), h("div", { class: "retakes" }, s.retakes.slice(-6).map((r) =>
+          h("figure", {}, h("img", { class: "thumb", src: media(r.url), alt: `seed ${r.seed}`, loading: "lazy" }),
+            h("figcaption", {}, r.seed, r.seed === s.seed ? h("span", { class: "chip acc" }, "in use") :
+              h("button", { class: "btn small ghost", disabled: busy(), onclick: () => pickSeed(s.id, r.seed) }, "Use")))))) : null,
+        h("div", { class: "row" }, h("button", { class: "btn small", disabled: busy() || !!f.errors.length, onclick: () => run("retake", { shot: s.id, seeds: seeds() }) }, "Retake ×3")));
+    })));
+}
+async function pickSeed(shot, seed) {
+  if (S.dirty) return toast("Save the story first", true);
+  try { S.film = { ...(await api("POST", `/api/films/${S.name}/seed`, { shot, seed })) }; S.doc = clone(S.film.doc); S.rawText = S.film.toml; toast(`${shot} now uses seed ${seed}; redraw the storyboard to apply`); renderFilm(true); }
+  catch (e) { toast(e.message, true); }
+}
+
+// ---- video tab ------------------------------------------------------------------------------------
+function shotsTab() {
+  const f = S.film;
+  const done = f.shots.filter((s) => s.clip).length;
+  return h("div", { class: "stack" },
+    h("h1", {}, "Video"),
+    h("p", { class: "dim" }, done ? `${done} of ${f.shots.length} shots animated, each with its own sound effects.` : "Each still becomes a 5-second shot (Wan 2.2), then gets sound effects made from its picture (MMAudio). Making the film runs every step and skips anything already done."),
+    h("div", { class: "row" }, runBtn(f.film ? "Remake changed parts" : "Make the film", "film")),
+    h("div", { class: "board" }, f.shots.map((s) => h("div", { class: "card shot-card" },
+      h("span", { class: "id" }, s.id),
+      s.clip ? h("video", { src: media(s.clip), poster: s.still ? media(s.still) : null, controls: true, playsinline: true, muted: true, loop: true, preload: "none" })
+        : s.still ? h("img", { class: "thumb", src: media(s.still), alt: "", loading: "lazy", style: "opacity:.5" }) : h("div", { class: "empty-media" }, "No still yet"),
+      h("p", { class: "small dim" }, s.motion),
+      s.sfx ? h("div", {}, h("h3", { style: "margin:2px 0 6px" }, "Effects"), h("audio", { src: media(s.sfx), controls: true, preload: "none" })) : null))));
+}
+
+// ---- voices tab -----------------------------------------------------------------------------------
+function voicesTab() {
+  const f = S.film, chk = f.checks || {};
+  const score = (v) => v == null ? null : h("span", { class: "chip " + (v >= 0.8 ? "ok" : "bad") }, v >= 0.8 ? `heard ✓ ${v}` : `unclear ${v}`);
+  const voices = Object.entries(f.voices);
+  const spoken = [];
+  for (const s of f.shots) {
+    if (s.narration) spoken.push({ sid: s.id, who: "Narrator", line: s.narration, url: s.narration_audio, check: chk.narration?.[s.id] });
+    (s.dialogue || []).forEach((l, k) => spoken.push({ sid: s.id, who: l.speaker, line: l.line, emotion: l.emotion, url: s.dialogue_audio[k], check: chk.dialogue?.[`${s.id}-${k + 1}`], over: k === s.dialogue.length - 1 ? chk.dialogue_overflow?.[s.id] : null }));
+  }
+  return h("div", { class: "stack" },
+    h("h1", {}, "Voices"),
+    h("p", { class: "dim" }, "Each voice is designed once from its description, then every line is cloned from it, so a character always sounds the same. Every line is checked by speech-to-text."),
+    voices.length ? h("div", { class: "board" }, voices.map(([name, url]) => {
+      const c = name === "narrator" ? f.doc?.narrator : f.doc?.characters?.[name];
+      return h("div", { class: "card stack", style: "gap:8px" }, h("b", { style: "font-family:var(--display);font-size:1.1rem" }, name === "narrator" ? "Narrator" : name),
+        h("span", { class: "small dim" }, c?.voice || ""), url ? h("audio", { src: media(url), controls: true, preload: "none" }) : h("span", { class: "small faint" }, "Designed when the film is made"));
+    })) : h("p", { class: "dim" }, "No one speaks in this story yet. Add a narrator or give a character a voice on the Story step."),
+    spoken.length ? h("h2", {}, "Lines") : null,
+    h("div", { class: "lines" }, spoken.map((x) => h("div", { class: "line" },
+      h("div", { class: "row" }, h("span", { class: "mono faint" }, x.sid), h("span", { class: "who" }, x.who), x.emotion ? h("span", { class: "small faint" }, x.emotion) : null, h("span", { class: "spacer" }), score(x.check),
+        x.over ? h("span", { class: "chip bad" }, `runs ${x.over}s past the cut`) : null),
+      h("div", { class: "said" }, `“${x.line}”`),
+      x.url ? h("audio", { src: media(x.url), controls: true, preload: "none" }) : null))),
+    spoken.length ? h("div", { class: "row" }, runBtn(f.film ? "Remake changed parts" : "Make the film", "film", {}, false)) : null);
+}
+
+// ---- music tab ------------------------------------------------------------------------------------
+function musicTab() {
+  const f = S.film, sc = f.score;
+  if (!f.doc?.music) return h("div", { class: "stack" }, h("h1", {}, "Music"), h("p", { class: "dim" }, "This story has no score. Add one under Music on the Story step."));
+  const pin = async (take) => {
+    if (S.dirty) return toast("Save the story first", true);
+    try { S.film = await api("POST", `/api/films/${S.name}/take`, { take }); S.doc = clone(S.film.doc); S.rawText = S.film.toml;
+      toast(take == null ? "Back to picking the best take automatically" : `Take ${take} pinned; remake the film to use it`); renderFilm(true); }
+    catch (e) { toast(e.message, true); }
+  };
+  return h("div", { class: "stack" },
+    h("h1", {}, "Music"),
+    h("p", { class: "dim" }, `${f.doc.music.caption}`),
+    h("div", { class: "hint" }, sc.pinned != null ? `Take ${sc.pinned} is pinned.` : `Spike makes ${f.doc.music.takes || 8} takes at a tempo locked to the cuts and keeps the one that best follows the story's intensity.`,
+      sc.pinned != null ? h("button", { class: "btn small ghost", style: "margin-left:8px", onclick: () => pin(null) }, "Pick automatically") : null),
+    sc.takes.length ? h("div", { class: "stack" }, sc.takes.map((t) => h("div", { class: "card take" },
+      h("div", { class: "row" }, h("b", {}, `Take ${t.seed}`), t.score != null ? h("span", { class: "small dim" }, `fit ${Number(t.score).toFixed(2)}`) : null,
+        t.seed === sc.chosen ? h("span", { class: "chip ok" }, "in the film") : null, t.seed === sc.pinned ? h("span", { class: "chip acc" }, "pinned") : null,
+        h("span", { class: "spacer" }), t.seed !== sc.pinned ? h("button", { class: "btn small", onclick: () => pin(t.seed) }, "Use this take") : null),
+      h("audio", { src: media(t.url), controls: true, preload: "none" }))))
+      : h("p", { class: "dim" }, "The takes appear here once the film is made."),
+    h("div", { class: "row" }, runBtn(f.film ? "Remake changed parts" : "Make the film", "film", {}, false)));
+}
+
+// ---- film tab -------------------------------------------------------------------------------------
+function filmTab() {
+  const f = S.film, c = f.checks || {};
+  const allLines = [...Object.values(c.narration || {}), ...Object.values(c.dialogue || {})];
+  const weak = allLines.filter((v) => v < 0.8).length;
+  const over = Object.keys(c.dialogue_overflow || {}).length;
+  const missing = f.shots.filter((s) => !s.still || s.still_fresh === false).length;
+  return h("div", { class: "stack" },
+    h("h1", {}, f.title),
+    f.idea ? h("p", { class: "dim", style: "font-family:var(--display);font-style:italic" }, `“${f.idea}”`) : null,
+    f.film ? h("video", { class: "film", src: media(f.film), poster: f.shots[0]?.still ? media(f.shots[0].still) : null, controls: true, playsinline: true, preload: "metadata" })
+      : h("div", { class: "empty-media" }, missing ? "Draw and approve the storyboard first" : "Not made yet"),
+    h("div", { class: "row" },
+      missing ? h("button", { class: "btn primary", onclick: () => { location.hash = `#/film/${S.name}/board`; } }, "Go to storyboard")
+        : runBtn(f.film ? "Remake changed parts" : "Make the film", "film"),
+      f.film ? h("a", { class: "btn ghost", href: media(f.film), download: "" }, "Download") : null,
+      h("span", { class: "small faint" }, f.film ? "Only edited parts are redone" : "About 20–30 minutes for 8 shots")),
+    f.film ? h("div", { class: "card stack", style: "gap:8px" },
+      h("h3", { style: "margin:0" }, "Checks"),
+      h("div", { class: "row" },
+        allLines.length ? h("span", { class: "chip " + (weak ? "bad" : "ok") }, weak ? `${weak} line(s) hard to hear` : `all ${allLines.length} lines heard`) : null,
+        c.final_narration != null ? h("span", { class: "chip " + (c.final_narration >= 0.8 ? "ok" : "bad") }, `speech in final mix ${c.final_narration}`) : null,
+        over ? h("span", { class: "chip bad" }, `${over} shot(s) with dialogue past the cut`) : allLines.length ? h("span", { class: "chip ok" }, "dialogue fits its shots") : null,
+        c.length ? h("span", { class: "chip" }, `${c.length.film} s`) : null,
+        f.score.chosen != null ? h("span", { class: "chip" }, `music take ${f.score.chosen}`) : null)) : null,
+    f.board ? h("div", {}, h("h2", {}, "Storyboard"), h("img", { src: media(f.board), alt: "Storyboard", loading: "lazy" })) : null);
+}
+
+route();
+</script>
+</body>
+</html>

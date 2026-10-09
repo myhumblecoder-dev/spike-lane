@@ -91,6 +91,28 @@ A shot may have narration then dialogue; keep all its speech to 12 words so it f
 not lip-synced: stage talking shots medium/over-the-shoulder and cut to listeners' reactions.
 Every line is checked with speech-to-text (`film/checks.json` → `dialogue`).
 
+## spike-studio: the same loop from a phone
+
+A web UI over spike-animate, made for an iPhone. Each film gets six steps:
+1. **Story:** start from an idea and optional reference notes; the local model writes it. Then edit it as a form or as raw TOML.
+2. **Storyboard:** draw the stills, retake any shot three ways, and pick the one to use.
+3. **Video:** each shot's clip and its sound effects.
+4. **Voices:** voice cards, then every narration and dialogue line with its speech check.
+5. **Music:** listen to the ranked takes and pin one.
+6. **Film:** the finished film and its checks.
+
+A real wildlife clip can be uploaded and attached to a shot for real motion.
+
+The studio never renders anything itself. Each step runs `spike-animate` as a background job, one per film, and spike-lane still queues the heavy work. Jobs keep running, and their results stay visible, if the studio restarts.
+
+```bash
+spike-studio                       # films in ~/Movies/spike-video, port 8765
+#   → open http://<mac-address>:8765/?t=<token>  (printed once; the browser keeps a cookie)
+```
+It runs at login as a LaunchAgent (`~/Library/LaunchAgents/ai.spike.studio.plist`, log `~/Library/Logs/spike-studio.log`).
+The token lives in `~/.config/spike-studio/token`; delete it and restart to issue a new one.
+It is reachable on the home network only.
+
 ## License
 
 MIT — see [LICENSE](LICENSE). This covers the code here only: the models it runs are downloaded separately under their own licenses (MMAudio's weights are non-commercial, CC-BY-NC).

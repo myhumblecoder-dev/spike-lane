@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+"""spike-studio — the web UI over spike-animate."""
+import os
+import sys
+from pathlib import Path
+
+# Needs Python 3.11+ (tomllib); under launchd `python3` can be macOS's 3.9.
+if sys.version_info < (3, 11):
+    for py in ("/opt/homebrew/bin/python3", "/usr/local/bin/python3"):
+        if os.path.exists(py):
+            os.execv(py, [py, *sys.argv])
+    sys.exit("spike-studio needs Python 3.11 or newer")
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import spike_studio  # noqa: E402
+
+if __name__ == "__main__":
+    raise SystemExit(spike_studio.main(sys.argv[1:]))
