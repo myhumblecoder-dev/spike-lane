@@ -158,7 +158,9 @@ def test_a_fresh_story_shows_nothing_rendered(tmp_path):
 
 def test_rendered_files_show_up_as_links(tmp_path):
     folder = write_story(tmp_path / "bolt").parent
-    touch(folder, "board/01-heap.png", "board/retakes/01-heap-s7.png", "board/contact-sheet.jpg",
+    story = sa.load_story(folder / "story.toml")
+    fake_still(folder, "board/retakes/01-heap-s7.png", sa.still_prompt(story, story.shots[0]))
+    touch(folder, "board/01-heap.png", "board/contact-sheet.jpg",
           "shots/01-heap.mp4", "sfx/01-heap.flac", "voice/card.wav", "voice/01-heap.wav",
           "voice/cards/ZAP.wav", "voice/dialogue/02-claim-1-ZAP.wav", "score/take-s2.wav",
           "film/the-last-bolt.mp4")
@@ -329,6 +331,7 @@ def test_the_api_lists_shows_and_edits_films(server):
 
 def test_the_api_runs_steps(server):
     srv, films = server
+    assert call(srv, "POST", "/api/films/bolt/approve", {"stage": "story"})[0] == 200
     status, _, body = call(srv, "POST", "/api/films/bolt/run", {"step": "board"})
     assert status == 202
     end = time.time() + 10
@@ -378,3 +381,149 @@ def test_a_film_whose_story_never_got_written_can_be_started_again(server):
     (films / "penguin-shop").mkdir()                 # a draft that failed: folder, no story
     status, _, body = call(srv, "POST", "/api/films", {"title": "Penguin Shop", "idea": "a penguin", "shots": 6})
     assert status == 202 and json.loads(body)["name"] == "penguin-shop"
+
+
+# --- one step at a time: each step is approved before the next unlocks ---------------------
+
+def fake_still(folder: Path, rel: str, prompt: str) -> Path:
+    p = folder / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(b"\x89PNG" + json.dumps({"mflux_version": "fake", "prompt": prompt}).encode())
+    return p
+
+
+def render_board(folder: Path) -> None:
+    story = sa.load_story(folder / "story.toml")
+    keys = sa.Keys(folder)
+    for shot in story.shots:
+        out = fake_still(folder, f"board/{shot.id}.png", sa.still_prompt(story, shot))
+        keys.record(out, sa.still_key(story, shot))
+
+
+def stages(folder: Path) -> dict:
+    return {s["stage"]: s for s in st.film_state(folder)["steps"]}
+
+
+def test_only_the_story_is_open_at_first(tmp_path):
+    folder = write_story(tmp_path / "bolt").parent
+    s = stages(folder)
+    assert list(s) == ["story", "board", "video", "sound", "voices", "music", "film"]
+    assert s["story"]["unlocked"] and not s["story"]["approved"]
+    assert not any(s[k]["unlocked"] for k in list(s)[1:])
+    assert st.gate(folder, "board") is not None and st.gate(folder, "film") is not None
+
+
+def test_approving_a_step_unlocks_the_next(tmp_path):
+    folder = write_story(tmp_path / "bolt").parent
+    assert st.approve(folder, "story") == []
+    assert stages(folder)["board"]["unlocked"] and st.gate(folder, "board") is None
+    assert st.gate(folder, "retake") is None and st.gate(folder, "video") is not None
+
+
+def test_a_step_cannot_be_approved_before_it_is_done(tmp_path):
+    folder = write_story(tmp_path / "bolt").parent
+    st.approve(folder, "story")
+    assert st.approve(folder, "board") != []          # no pictures yet
+    assert st.approve(folder, "video") != []          # locked
+    render_board(folder)
+    assert st.approve(folder, "board") == []
+    assert stages(folder)["video"]["unlocked"]
+
+
+def test_changing_a_picture_withdraws_its_approval_and_everything_after(tmp_path):
+    folder = write_story(tmp_path / "bolt").parent
+    st.approve(folder, "story")
+    render_board(folder)
+    st.approve(folder, "board")
+    for sid in ("01-heap", "02-claim", "03-lunge"):
+        touch(folder, f"shots/{sid}.mp4")
+    assert st.approve(folder, "video") == []
+    assert stages(folder)["sound"]["unlocked"]
+    doc = st._doc(folder)
+    doc["shot"][0]["still"] = "close-up of JUNK at night"   # the picture is now out of date
+    st.save_story(folder, doc=doc)
+    s = stages(folder)
+    assert not s["board"]["approved"] and not s["video"]["approved"] and not s["sound"]["unlocked"]
+    render_board(folder)                                     # redrawn: a new picture to look at
+    assert not stages(folder)["board"]["approved"]
+    assert st.approve(folder, "board") == []
+    assert not stages(folder)["video"]["approved"]          # that video was made from the old picture
+
+
+def test_regenerated_video_needs_a_new_look(tmp_path):
+    folder = write_story(tmp_path / "bolt").parent
+    st.approve(folder, "story")
+    render_board(folder)
+    st.approve(folder, "board")
+    for sid in ("01-heap", "02-claim", "03-lunge"):
+        touch(folder, f"shots/{sid}.mp4")
+    st.approve(folder, "video")
+    time.sleep(0.01)
+    (folder / "shots" / "02-claim.mp4").write_bytes(b"a different take")
+    s = stages(folder)
+    assert not s["video"]["approved"] and s["video"]["unlocked"] and not s["sound"]["unlocked"]
+
+
+def test_steps_with_nothing_to_make_are_done_at_once(tmp_path):
+    silent = STORY.replace('narration = "In the scrap heap, life was quiet."\n', "").replace(
+        'dialogue = [{ speaker = "ZAP", line = "I saw it first! It\'s mine!", emotion = "smug" }]\n', "")
+    folder = write_story(tmp_path / "quiet", silent).parent
+    assert stages(folder)["voices"]["done"]
+    assert not stages(write_story(tmp_path / "talky").parent)["voices"]["done"]
+
+
+# --- many rounds of pictures --------------------------------------------------------------
+
+def test_using_a_retake_takes_effect_at_once_without_redrawing(tmp_path):
+    folder = write_story(tmp_path / "bolt").parent
+    render_board(folder)
+    story = sa.load_story(folder / "story.toml")
+    shot = story.shots[1]
+    fake_still(folder, "board/retakes/02-claim-s555.png", sa.still_prompt(story, shot))
+    assert st.use_retake(folder, "02-claim", 555) == []
+    assert st._doc(folder)["shot"][1]["seed"] == 555
+    assert (folder / "board" / "02-claim.png").read_bytes() == (folder / "board/retakes/02-claim-s555.png").read_bytes()
+    s = st.film_state(folder)["shots"][1]
+    assert s["still_fresh"] is True
+
+
+def test_retakes_of_an_old_description_are_not_offered(tmp_path):
+    folder = write_story(tmp_path / "bolt").parent
+    story = sa.load_story(folder / "story.toml")
+    fake_still(folder, "board/retakes/02-claim-s1.png", "an older description, cartoon")
+    fake_still(folder, "board/retakes/02-claim-s2.png", sa.still_prompt(story, story.shots[1]))
+    assert [r["seed"] for r in st.film_state(folder)["shots"][1]["retakes"]] == [2]
+    assert st.use_retake(folder, "02-claim", 1) != []
+
+
+# --- starting a film from a story and a style picture --------------------------------------
+
+def test_new_can_read_a_style_picture(tmp_path):
+    folder = tmp_path / "pip"
+    touch(folder, "reference/style.png")
+    argv = st.step_argv(folder, "new", {"idea": "Pip paints.", "shots": 4, "style_image": "reference/style.png"})
+    assert argv[-2:] == ["--style-image", str(folder / "reference" / "style.png")]
+    for bad in ("../outside.png", "reference/missing.png", "reference/clip.mp4"):
+        touch(folder, "reference/clip.mp4")
+        with pytest.raises(ValueError):
+            st.step_argv(folder, "new", {"idea": "x", "shots": 4, "style_image": bad})
+
+
+def test_a_film_can_be_made_first_and_written_after(server):
+    srv, films = server
+    status, _, body = call(srv, "POST", "/api/films", {"title": "Pip Paints"})
+    assert status == 201 and json.loads(body)["name"] == "pip-paints"
+    assert (films / "pip-paints").is_dir() and not (films / "pip-paints" / "story.toml").exists()
+    status, _, _ = call(srv, "POST", "/api/films/pip-paints/run", {"step": "new", "idea": "Pip paints.", "shots": 4})
+    assert status == 202
+
+
+def test_the_api_approves_steps_and_refuses_locked_ones(server):
+    srv, films = server
+    status, _, body = call(srv, "POST", "/api/films/bolt/run", {"step": "video"})
+    assert status == 409 and "approve" in json.loads(body)["errors"][0].lower()
+    status, _, body = call(srv, "POST", "/api/films/bolt/approve", {"stage": "story"})
+    assert status == 200 and {s["stage"]: s for s in json.loads(body)["steps"]}["story"]["approved"]
+    assert call(srv, "POST", "/api/films/bolt/approve", {"stage": "board"})[0] == 400
+    assert call(srv, "POST", "/api/films/bolt/approve", {"stage": "story", "undo": True})[0] == 200
+    assert not stages(films / "bolt")["story"]["approved"]

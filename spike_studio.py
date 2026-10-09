@@ -15,6 +15,7 @@ import mimetypes
 import os
 import re
 import secrets
+import shutil
 import signal
 import socket
 import socketserver
@@ -127,6 +128,165 @@ def pick_take(folder: Path, take: int | None) -> list[str]:
     return save_story(folder, doc=doc)
 
 
+def _current_retakes(folder: Path, story, shot) -> list[tuple[int, Path]]:
+    """This shot's retakes drawn from its current description (older ones would redraw differently)."""
+    want = sa.still_prompt(story, shot) if story else None
+    found = []
+    for p in (Path(folder) / "board" / "retakes").glob(f"{shot.id if story else shot}-s*.png"):
+        m = re.fullmatch(rf"{re.escape(shot.id if story else shot)}-s(\d+)\.png", p.name)
+        if m and (want is None or sa.png_prompt(p) == want):
+            found.append((int(m.group(1)), p))
+    return sorted(found)
+
+
+def use_retake(folder: Path, shot_id: str, seed: int) -> list[str]:
+    """Keep a retake: its seed goes into the story and its picture becomes the shot's still, with no redraw."""
+    folder = Path(folder)
+    story = sa.load_story(folder / "story.toml")
+    shot = next((x for x in story.shots if x.id == shot_id), None)
+    if shot is None:
+        return [f"no shot '{shot_id}' in the story"]
+    pic = dict(_current_retakes(folder, story, shot)).get(int(seed))
+    if pic is None:
+        return [f"no retake with seed {seed} for the current description of {shot_id}"]
+    errors = pick_seed(folder, shot_id, int(seed))
+    if errors:
+        return errors
+    story = sa.load_story(folder / "story.toml")
+    shot = next(x for x in story.shots if x.id == shot_id)
+    out = sa.still_path(story, shot)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(pic, out)
+    sa.Keys(folder).record(out, sa.still_key(story, shot))
+    return []
+
+
+# --- one step at a time ------------------------------------------------------------
+
+STAGES = ("story", "board", "video", "sound", "voices", "music", "film")
+STEP_STAGE = {"board": "board", "retake": "board", "video": "video", "sound": "sound", "voices": "voices",
+              "music": "music", "film": "film"}
+STAGE_NAMES = {"story": "Story", "board": "Pictures", "video": "Video", "sound": "Sound effects",
+               "voices": "Voices & dialogue", "music": "Music", "film": "Final film"}
+
+
+def _outputs(folder: Path, doc: dict, story) -> dict[str, list[Path] | None]:
+    """The files each step makes; None while the step isn't finished."""
+    shots = doc.get("shot", [])
+    ids = [x.get("id", "") for x in shots]
+
+    def every(paths):
+        return paths if all(p.is_file() for p in paths) else None
+
+    out: dict[str, list[Path] | None] = {"story": [] if story else None}
+    board = [folder / "board" / f"{i}.png" for i in ids]
+    if story:
+        keys = sa.Keys(folder)
+        fresh = all(not keys.stale(sa.still_path(story, sh), sa.still_key(story, sh)) for sh in story.shots)
+        out["board"] = board if fresh else None
+    else:
+        out["board"] = None
+    out["video"] = every([folder / "shots" / f"{i}.mp4" for i in ids])
+    out["sound"] = every([folder / "sfx" / f"{i}.flac" for i in ids] + [folder / "film" / "sfx.wav"])
+    voices = [folder / "voice" / f"{x['id']}.wav" for x in shots if x.get("narration")]
+    for x in shots:
+        voices += [folder / "voice" / "dialogue" / f"{x['id']}-{n}-{l.get('speaker', '')}.wav"
+                   for n, l in enumerate(x.get("dialogue", []), 1)]
+    out["voices"] = every(voices)
+    music = doc.get("music")
+    if music is None:
+        out["music"] = []
+    elif "take" in music:
+        out["music"] = every([folder / "score" / f"take-s{int(music['take'])}.wav"])
+    else:
+        try:
+            chosen = json.loads((folder / "film" / "checks.json").read_text())["score"]["chosen"]
+            out["music"] = every([Path(chosen)])
+        except (OSError, ValueError, KeyError, TypeError):
+            out["music"] = None
+    out["film"] = every([folder / "film" / f"{_slug(doc.get('title', '')) or 'film'}.mp4"])
+    return out
+
+
+def _fingerprint(files: list[Path]) -> str:
+    rows = []
+    for p in files:
+        st_ = p.stat()
+        rows.append([str(p), st_.st_size, st_.st_mtime_ns])
+    return sa.key_for(rows)
+
+
+def _approvals_file(folder: Path) -> Path:
+    return Path(folder) / ".spike-animate" / "approved.json"
+
+
+def _steps(folder: Path, doc: dict | None, story) -> list[dict]:
+    """Each step: done (its files exist), approved (and nothing it or an earlier step made has changed since),
+    unlocked (every earlier step is approved). An approval covers the files of its step and all before it."""
+    folder = Path(folder)
+    try:
+        saved = json.loads(_approvals_file(folder).read_text())
+    except (OSError, ValueError):
+        saved = {}
+    outs = _outputs(folder, doc or {}, story) if doc is not None else {k: None for k in STAGES}
+    steps, upstream, ok = [], [], True
+    for stage in STAGES:
+        files = outs[stage]
+        done = files is not None
+        fp = _fingerprint(upstream + files) if done else None
+        approved = ok and done and saved.get(stage) == fp
+        steps.append({"stage": stage, "name": STAGE_NAMES[stage], "done": done, "approved": approved,
+                      "unlocked": ok, "fingerprint": fp})
+        ok = approved
+        upstream += files or []
+    return steps
+
+
+def _load(folder: Path):
+    doc = _doc(folder) if (Path(folder) / "story.toml").exists() else None
+    try:
+        story = sa.load_story(Path(folder) / "story.toml") if doc is not None else None
+    except sa.StoryError:
+        story = None
+    return doc, story
+
+
+def approve(folder: Path, stage: str, undo: bool = False) -> list[str]:
+    if stage not in STAGES:
+        return [f"unknown step '{stage}'"]
+    steps = {x["stage"]: x for x in _steps(folder, *_load(folder))}
+    f = _approvals_file(folder)
+    try:
+        saved = json.loads(f.read_text())
+    except (OSError, ValueError):
+        saved = {}
+    me = steps[stage]
+    if undo:
+        saved.pop(stage, None)
+    elif not me["unlocked"]:
+        before = next(x for x in steps.values() if not x["approved"])
+        return [f"approve {before['name']} first"]
+    elif not me["done"]:
+        return [f"{me['name']} isn't finished yet"]
+    else:
+        saved[stage] = me["fingerprint"]
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps(saved, indent=1))
+    return []
+
+
+def gate(folder: Path, step: str) -> str | None:
+    """Why `step` can't run yet, or None when every step before it is approved."""
+    stage = STEP_STAGE.get(step)
+    if stage is None:
+        return None
+    steps = _steps(folder, *_load(folder))
+    if next(x for x in steps if x["stage"] == stage)["unlocked"]:
+        return None
+    before = next(x for x in steps if not x["approved"])
+    return f"approve {before['name']} first"
+
+
 # --- what a film looks like on disk ----------------------------------------------
 
 def _slug(text: str) -> str:
@@ -164,12 +324,14 @@ def film_state(folder: Path) -> dict:
              "references": sorted(str(p.relative_to(folder)) for p in (folder / "reference").glob("*") if p.is_file())}
     if not sf.exists():
         state["errors"] = ["no story yet"]
+        state["steps"] = [{k: v for k, v in x.items() if k != "fingerprint"} for x in _steps(folder, None, None)]
         return state
     state["toml"] = sf.read_text()
     try:
         doc = tomllib.loads(state["toml"])
     except tomllib.TOMLDecodeError as e:
         state["errors"] = [f"story.toml: {e}"]
+        state["steps"] = [{k: v for k, v in x.items() if k != "fingerprint"} for x in _steps(folder, None, None)]
         return state
     state["doc"] = doc
     state.update(title=doc.get("title") or folder.name, idea=doc.get("idea", ""), notes=doc.get("notes", ""))
@@ -181,8 +343,8 @@ def film_state(folder: Path) -> dict:
     keys = sa.Keys(folder) if story else None
     for s in doc.get("shot", []):
         sid = s.get("id", "")
-        retakes = sorted((int(m.group(1)), p) for p in (folder / "board" / "retakes").glob(f"{sid}-s*.png")
-                         if (m := re.fullmatch(rf"{re.escape(sid)}-s(\d+)\.png", p.name)))
+        shot_obj = next((x for x in story.shots if x.id == sid), None) if story else None
+        retakes = _current_retakes(folder, story, shot_obj) if shot_obj else _current_retakes(folder, None, sid)
         lines = sorted((folder / "voice" / "dialogue").glob(f"{sid}-*-*.wav"),
                        key=lambda p: int(p.name[len(sid) + 1:].split("-")[0]) if p.name[len(sid) + 1:].split("-")[0].isdigit() else 0)
         still_fresh = None
@@ -225,6 +387,7 @@ def film_state(folder: Path) -> dict:
                       "pinned": doc.get("music", {}).get("take"),
                       "chosen": int(m.group(1)) if chosen and (m := re.search(r"take-s(\d+)", chosen)) else None}
     state["film"] = _url(folder, f"film/{_slug(doc.get('title', '')) or 'film'}.mp4")
+    state["steps"] = [{k: v for k, v in x.items() if k != "fingerprint"} for x in _steps(folder, doc, story)]
     sh = state["shots"]
     state["stage"] = ("film" if state["film"] else "shots" if any(x["clip"] for x in sh)
                       else "board" if any(x["still"] for x in sh) else "story")
@@ -253,7 +416,7 @@ def step_argv(folder: Path, step: str, params: dict) -> list[str]:
     """The spike-animate arguments for one step, checked: anything odd is a ValueError, never a command."""
     folder = Path(folder)
     story = str(folder / "story.toml")
-    if step in ("board", "film", "status"):
+    if step in ("board", "video", "sound", "voices", "music", "film", "status"):
         return [step, story]
     if step == "retake":
         ids = [s.get("id") for s in _doc(folder).get("shot", [])]
@@ -271,7 +434,13 @@ def step_argv(folder: Path, step: str, params: dict) -> list[str]:
             raise ValueError("the idea is empty")
         if not 3 <= shots <= 16:
             raise ValueError("a film has 3 to 16 shots")
-        return ["new", str(folder), idea, "--shots", str(shots)] + (["--notes", notes] if notes else [])
+        argv = ["new", str(folder), idea, "--shots", str(shots)] + (["--notes", notes] if notes else [])
+        if params.get("style_image"):
+            pic = inside(folder, str(params["style_image"]))
+            if pic is None or not pic.is_file() or pic.suffix.lower() not in IMAGE_TYPES:
+                raise ValueError("the style picture must be an uploaded image")
+            argv += ["--style-image", str(pic)]
+        return argv
     raise ValueError(f"unknown step '{step}'")
 
 
@@ -354,7 +523,8 @@ class Jobs:
 
 TYPES = {".flac": "audio/flac", ".wav": "audio/wav", ".mp3": "audio/mpeg", ".mp4": "video/mp4", ".mov": "video/quicktime",
          ".m4v": "video/mp4", ".toml": "text/plain; charset=utf-8", ".json": "application/json", ".log": "text/plain; charset=utf-8"}
-UPLOAD_TYPES = {".mp4", ".mov", ".m4v", ".webm", ".png", ".jpg", ".jpeg"}
+IMAGE_TYPES = {".png", ".jpg", ".jpeg"}
+UPLOAD_TYPES = {".mp4", ".mov", ".m4v", ".webm"} | IMAGE_TYPES
 MAX_UPLOAD = 1 << 30
 MAX_JSON = 4 << 20
 
@@ -373,7 +543,7 @@ class Studio(ThreadingHTTPServer):
         self.server_name, self.server_port = "studio", self.socket.getsockname()[1]
 
 
-def make_server(root: Path, token: str, host: str = "0.0.0.0", port: int = 8765) -> Studio:
+def make_server(root: Path, token: str, host: str = "127.0.0.1", port: int = 8765) -> Studio:
     return Studio((host, port), root, token)
 
 
@@ -472,6 +642,9 @@ class Handler(BaseHTTPRequestHandler):
                 j = jobs.status(folder) if folder.exists() else None
                 if (folder / "story.toml").exists() or (j and j["running"]):
                     return self._json(409, {"errors": [f"a film called '{name}' already exists"]})
+                if not p.get("idea"):            # make the film now; write its story after (e.g. once a style picture is in)
+                    folder.mkdir(parents=True, exist_ok=True)
+                    return self._json(201, {"name": name})
                 try:
                     argv = step_argv(folder, "new", p)
                 except ValueError as e:
@@ -494,12 +667,28 @@ class Handler(BaseHTTPRequestHandler):
             p = json.loads(self._body() or b"{}")
             try:
                 argv = step_argv(folder, p.get("step", ""), p)
+                if p.get("step") == "new" and (folder / "story.toml").exists():
+                    raise Busy("this film already has a story")
+                why = gate(folder, p.get("step", ""))
+                if why:
+                    raise Busy(why)
                 jobs.start(folder, argv)
             except ValueError as e:
                 return self._json(400, {"errors": [str(e)]})
             except (Busy, OSError) as e:
                 return self._json(409, {"errors": [str(e)]})
             return self._json(202, self._state(folder))
+        if method == "POST" and action == "approve":
+            p = json.loads(self._body() or b"{}")
+            errors = approve(folder, str(p.get("stage", "")), undo=bool(p.get("undo")))
+            return self._json(400, {"errors": errors}) if errors else self._json(200, self._state(folder))
+        if method == "POST" and action == "use":
+            p = json.loads(self._body() or b"{}")
+            try:
+                errors = use_retake(folder, str(p["shot"]), int(p["seed"]))
+            except (KeyError, ValueError, TypeError, sa.StoryError) as e:
+                errors = [f"bad request: {e}"]
+            return self._json(400, {"errors": errors}) if errors else self._json(200, self._state(folder))
         if method == "POST" and action == "stop":
             return self._json(200, {"stopped": jobs.stop(folder)})
         if method == "POST" and action in ("seed", "take"):
@@ -592,29 +781,17 @@ def _token(path: Path) -> str:
     return tok
 
 
-def _lan_address() -> str:
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("192.0.2.1", 9))   # no packet is sent; this just picks the outward interface
-        return s.getsockname()[0]
-    except OSError:
-        return "127.0.0.1"
-    finally:
-        s.close()
-
-
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="spike-studio", description=__doc__.split("\n")[0])
     ap.add_argument("--root", type=Path, default=Path.home() / "Movies" / "spike-video", help="folder holding the films")
-    ap.add_argument("--host", default="0.0.0.0")
+    ap.add_argument("--host", default="127.0.0.1", help="loopback only; share it with `tailscale serve`")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--token-file", type=Path, default=Path.home() / ".config" / "spike-studio" / "token")
     a = ap.parse_args(argv)
     a.root.mkdir(parents=True, exist_ok=True)
     token = _token(a.token_file)
     srv = make_server(a.root, token, a.host, a.port)
-    host = _lan_address() if a.host in ("0.0.0.0", "::") else a.host
-    print(f"spike-studio: films in {a.root}\n  open http://{host}:{srv.server_port}/?t={token}", flush=True)
+    print(f"spike-studio: films in {a.root}\n  open http://{a.host}:{srv.server_port}/?t={token} (or your tailscale serve address)", flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

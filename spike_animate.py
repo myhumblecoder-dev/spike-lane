@@ -413,12 +413,19 @@ def media_seconds(path: Path) -> float:
 def render_still(prompt: str, seed: int, out: Path, size=STILL_SIZE, from_image: Path | None = None,
                  strength: float | None = None) -> None:
     model = os.environ.get("IMAGE_MODEL") or str(Path.home() / "image-models" / "z-image-turbo-mflux-q8")
-    cmd = ["mflux-generate-z-image-turbo", "--model", model, "--prompt", prompt, "--output", out, "--steps", "9",
+    # mflux never overwrites: given an existing file it saves NAME_1.png beside it. Render to a fresh
+    # name, then move it into place.
+    tmp = out.with_name(f".{out.stem}-new{out.suffix}")
+    tmp.unlink(missing_ok=True)
+    cmd = ["mflux-generate-z-image-turbo", "--model", model, "--prompt", prompt, "--output", tmp, "--steps", "9",
            "--seed", seed, "--width", size[0], "--height", size[1]]
     if from_image is not None:
         cmd += ["--image-path", from_image, "--image-strength", strength]
     out.parent.mkdir(parents=True, exist_ok=True)
     heavy("image", cmd, out.with_suffix(".log"))
+    if not tmp.exists():
+        raise StageError(f"the image step wrote nothing for {out.name}; log {out.with_suffix('.log')}")
+    os.replace(tmp, out)
 
 
 def contact_sheet(images: list[Path], out: Path, cols: int = 4) -> None:
@@ -464,7 +471,7 @@ def cmd_board(story: Story) -> int:
                   f"delete board/{sid}.png and run board again", file=sys.stderr)
         return 1
     _say(f"Storyboard ready: {sheet}\nReview it. Retake a shot with `spike-animate retake story.toml SHOT --seeds 7,42`, "
-         f"then run `spike-animate film story.toml`.")
+         f"then run `spike-animate video story.toml`.")
     return 0
 
 
@@ -797,12 +804,73 @@ li b{{color:var(--dim);font-weight:600;margin-right:6px}}p{{color:var(--dim);mar
     return rdir / "index.html"
 
 
-def cmd_film(story: Story) -> int:
-    keys = Keys(story.root)
+def _stills_ready(story: Story, keys: Keys) -> bool:
     missing = [s.id for s in story.shots if keys.stale(still_path(story, s), still_key(story, s))]
     if missing:
         print(f"stills missing or out of date for {', '.join(missing)}: run `spike-animate board` first",
               file=sys.stderr)
+    return not missing
+
+
+def save_checks(story: Story, part: dict) -> None:
+    """Merge one step's checks into film/checks.json, so steps can run one at a time."""
+    f = story.root / "film" / "checks.json"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        checks = json.loads(f.read_text())
+    except (OSError, ValueError):
+        checks = {}
+    checks.update(part)
+    f.write_text(json.dumps(checks, indent=1))
+
+
+def film_seconds(story: Story) -> float:
+    """The picture's length: the shots butt-joined (what build_picture produces)."""
+    picture = story.root / "film" / "picture.mp4"
+    return media_seconds(picture) if picture.exists() else len(story.shots) * shot_seconds()
+
+
+def cmd_video(story: Story) -> int:
+    keys = Keys(story.root)
+    if not _stills_ready(story, keys):
+        return 2
+    for shot in story.shots:
+        animate_shot(story, shot, keys)
+    picture = build_picture(story, keys)
+    _say(f"Video: {picture} ({media_seconds(picture):.1f} s, no sound yet)")
+    return 0
+
+
+def cmd_sound(story: Story) -> int:
+    keys = Keys(story.root)
+    missing = [s.id for s in story.shots if not shot_path(story, s).exists()]
+    if missing:
+        print(f"no video yet for {', '.join(missing)}: run `spike-animate video` first", file=sys.stderr)
+        return 2
+    out = build_soundtrack(story, [sound_shot(story, s, keys) for s in story.shots], keys)
+    _say(f"Sound effects: {out}")
+    return 0
+
+
+def cmd_voices(story: Story) -> int:
+    keys, checks = Keys(story.root), {}
+    lines = narrate(story, keys, checks) + speak_dialogue(story, keys, checks)
+    save_checks(story, checks)
+    _say(f"Voices: {len(lines)} line(s) recorded")
+    return 0
+
+
+def cmd_music(story: Story) -> int:
+    keys, checks = Keys(story.root), {}
+    chosen = score(story, keys, checks, film_seconds(story))
+    save_checks(story, checks)
+    _say(f"Music: {chosen}" if chosen else "Music: the story has no [music]")
+    return 0
+
+
+def cmd_film(story: Story) -> int:
+    keys = Keys(story.root)
+    if not _stills_ready(story, keys):
         return 2
     checks: dict = {}
     for shot in story.shots:
@@ -921,11 +989,21 @@ WRITER_EXAMPLE = {
 
 
 def writer_prompt(idea: str, shots: int, problems: list[str] | None = None, previous: dict | None = None,
-                  notes: str = "") -> str:
+                  notes: str = "", style: str = "") -> str:
     ref = f"\nREFERENCE NOTES from the author (follow them: names, looks, setting, tone, events):\n{notes.strip()}\n" if notes.strip() else ""
+    if style.strip():
+        ref += (f"\nVISUAL STYLE, read from the author's reference picture:\n{style.strip()}\n"
+                "Write \"look\" and \"still_style\" in this style (keep its medium, palette, linework and texture words), "
+                "not the default cartoon style; end \"still_style\" with the setting.\n")
+        looks = '- "look" and "still_style" follow the VISUAL STYLE above.'
+    else:
+        looks = ('- "look" starts with "2D cartoon animation," then the palette and setting. "still_style" starts with\n'
+                 '  "2D cartoon animation still, bold black outlines, flat vibrant colors," then the setting.')
     p = f"""You are the story artist for a short 2D cartoon. Turn the idea below into a shot list of exactly {shots} shots.
 
 IDEA: {idea}
+(If the author wrote a whole story rather than an idea, follow its events in order, keep its characters and
+names, and use the author's own dialogue lines word for word where they fit; split a long line across shots.)
 {ref}
 How the film is made, so write for it:
 - Every shot is a single 5 seconds clip animated from one storyboard still. One clear action per shot.
@@ -948,8 +1026,7 @@ How the film is made, so write for it:
   together (the narrator speaks first, then the character). Frame talking shots as medium shots or over the shoulder and say "talking" in the motion.
   Reaction shots of the listener, with no dialogue, make conversations read well. Use "dialogue": [] otherwise.
 - "intensity" is the story's energy in that shot, from 0 (calm) to 1 (peak). Build to one peak near the end.
-- "look" starts with "2D cartoon animation," then the palette and setting. "still_style" starts with
-  "2D cartoon animation still, bold black outlines, flat vibrant colors," then the setting.
+{looks}
 - "music" describes an instrumental score that follows the intensity arc; "structure" is 3-6 section tags
   like "[Intro - ...]" separated by blank lines; "key" like "D minor" or "C major".
 - Shot ids look like 01-name, 02-name, ... in order.
@@ -1020,11 +1097,12 @@ def _toml_str(v: str) -> str:
     return json.dumps(v, ensure_ascii=False)   # a JSON string is a valid TOML basic string
 
 
-def draft_to_toml(d: dict, idea: str, notes: str = "") -> str:
+def draft_to_toml(d: dict, idea: str, notes: str = "", style_image: str = "", style: str = "") -> str:
     q = _toml_str
     out = [f"# {d['title']}: drafted by spike-animate new from the idea:", f"#   {idea}",
            "# Edit freely, then: spike-animate board story.toml", "",
            f"idea = {q(idea)}", *([f"notes = {q(notes)}"] if notes else []),
+           *([f"style_image = {q(style_image)}", f"style = {q(style)}"] if style_image else []),
            f"title = {q(d['title'])}", "seed = 1024", f"look = {q(d['look'])}", f"still_style = {q(d['still_style'])}",
            "", "[characters]"]
     out += [f"{c['name']} = {q(c['description'])}" for c in d["characters"] if not c.get("voice")]
@@ -1051,12 +1129,21 @@ def draft_to_toml(d: dict, idea: str, notes: str = "") -> str:
     return "\n".join(out) + "\n"
 
 
-def ollama_generate(prompt: str, model: str) -> dict:
+STYLE_SCHEMA = {"type": "object", "required": ["style"], "properties": {"style": {"type": "string"}}}
+STYLE_PROMPT = """Describe the visual style of this picture so an image model can paint new, different scenes in
+the same style. Cover the medium (watercolor, cel animation, 3D render, ink, ...), the palette, the linework,
+the shading and lighting, and the texture. Do not describe what is in the picture (no subjects, no setting).
+Reply with one line of comma-separated phrases, at most 40 words, in "style"."""
+
+
+def ollama_generate(prompt: str, model: str, schema: dict | None = None, images: list[str] | None = None) -> dict:
     host = os.environ.get("OLLAMA_HOST") or "http://127.0.0.1:11434"
     if "://" not in host:
         host = "http://" + host
-    body = {"model": model, "prompt": prompt, "stream": False, "think": False, "format": DRAFT_SCHEMA,
+    body = {"model": model, "prompt": prompt, "stream": False, "think": False, "format": schema or DRAFT_SCHEMA,
             "keep_alive": 0, "options": {"temperature": 0.7, "num_ctx": 8192}}
+    if images:
+        body["images"] = images
     req = urllib.request.Request(f"{host.rstrip('/')}/api/generate", data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
     try:
@@ -1070,7 +1157,15 @@ def ollama_generate(prompt: str, model: str) -> dict:
         raise StageError("the writer model did not return a JSON story") from None
 
 
-def cmd_new(folder: Path, idea: str, shots: int, model: str, attempts: int = 3, notes: str = "") -> int:
+def describe_style(image: Path, model: str) -> str:
+    """The style of a reference picture, in words (a local vision model; the caller holds the lane)."""
+    import base64
+    reply = ollama_generate(STYLE_PROMPT, model, STYLE_SCHEMA, [base64.b64encode(Path(image).read_bytes()).decode()])
+    return " ".join(str(reply.get("style", "")).split())
+
+
+def cmd_new(folder: Path, idea: str, shots: int, model: str, attempts: int = 3, notes: str = "",
+            style_image: Path | None = None) -> int:
     import spike_lane
     story_file = folder / "story.toml"
     if story_file.exists():
@@ -1079,9 +1174,14 @@ def cmd_new(folder: Path, idea: str, shots: int, model: str, attempts: int = 3, 
     _say(f"drafting a {shots}-shot story with {model} …")
     fd = spike_lane.acquire("writer", ["spike-animate", "new", idea], wait=None)
     try:
+        style = ""
+        if style_image is not None:
+            _say("reading the style of the reference picture …")
+            style = describe_style(style_image, model)
         problems, d = None, None
         for attempt in range(1, attempts + 1):
-            d = ollama_generate(writer_prompt(idea, shots, problems, previous=d if problems else None, notes=notes), model)
+            d = ollama_generate(writer_prompt(idea, shots, problems, previous=d if problems else None, notes=notes,
+                                              style=style), model)
             problems = lint_draft(d, shots)
             if not problems:
                 break
@@ -1092,7 +1192,14 @@ def cmd_new(folder: Path, idea: str, shots: int, model: str, attempts: int = 3, 
         print("the writer couldn't produce a valid story:\n  " + "\n  ".join(problems), file=sys.stderr)
         return 1
     folder.mkdir(parents=True, exist_ok=True)
-    story_file.write_text(draft_to_toml(d, idea, notes))
+    rel = ""
+    if style_image is not None:
+        dest = folder / "reference" / f"style{Path(style_image).suffix.lower()}"
+        if Path(style_image).resolve() != dest.resolve():
+            dest.parent.mkdir(exist_ok=True)
+            shutil.copyfile(style_image, dest)
+        rel = str(dest.relative_to(folder))
+    story_file.write_text(draft_to_toml(d, idea, notes, style_image=rel, style=style))
     load_story(story_file)   # must load cleanly
     _say(f"Story drafted: {story_file} ({d['title']}, {len(d['shots'])} shots)\n"
          f"Read and edit it, then run `spike-animate board {story_file}`.")
@@ -1103,7 +1210,11 @@ def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="spike-animate", description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name, helptext in [("board", "render the storyboard stills and a contact sheet, then stop for review"),
-                           ("film", "animate, add effects, narration and score, and mix the film"),
+                           ("video", "animate every shot from its still (no sound)"),
+                           ("sound", "add sound effects to the animated shots"),
+                           ("voices", "record the narration and dialogue"),
+                           ("music", "score the film"),
+                           ("film", "do whatever is left of the steps above, then mix the film"),
                            ("status", "show what is done")]:
         sub.add_parser(name, help=helptext).add_argument("story", type=Path)
     nw = sub.add_parser("new", help="draft story.toml for a new film from a one-line idea (local model)")
@@ -1111,6 +1222,7 @@ def main(argv: list[str]) -> int:
     nw.add_argument("idea")
     nw.add_argument("--shots", type=int, default=8)
     nw.add_argument("--notes", default="", help="reference material for the writer: names, looks, setting, tone")
+    nw.add_argument("--style-image", type=Path, help="a picture whose style the film should copy")
     nw.add_argument("--model", default=os.environ.get("SPIKE_WRITER_MODEL", "gemma4:26b"))
     rt = sub.add_parser("retake", help="render alternate seeds for one shot's still")
     rt.add_argument("story", type=Path)
@@ -1119,14 +1231,15 @@ def main(argv: list[str]) -> int:
     a = ap.parse_args(argv)
     try:
         if a.cmd == "new":
-            return cmd_new(a.folder, a.idea, a.shots, a.model, notes=a.notes)
+            return cmd_new(a.folder, a.idea, a.shots, a.model, notes=a.notes, style_image=a.style_image)
         story = load_story(a.story)
         if a.cmd == "board":
             return cmd_board(story)
         if a.cmd == "retake":
             return cmd_retake(story, a.shot, [int(s) for s in a.seeds.split(",") if s.strip()])
-        if a.cmd == "film":
-            return cmd_film(story)
+        steps = {"film": cmd_film, "video": cmd_video, "sound": cmd_sound, "voices": cmd_voices, "music": cmd_music}
+        if a.cmd in steps:
+            return steps[a.cmd](story)
         return cmd_status(story)
     except (StoryError, StageError) as e:
         print(f"spike-animate: {e}", file=sys.stderr)

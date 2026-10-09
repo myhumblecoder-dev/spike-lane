@@ -34,6 +34,8 @@ def tone(path, secs):
     ff("-f", "lavfi", "-i", f"sine=frequency=440:duration={secs}", "-ac", "1", "-ar", "24000", str(path))
 if me.startswith("mflux"):
     out = flag("--output")
+    if Path(out).exists():   # like the real mflux: never overwrite, save beside it as NAME_1.png
+        out = str(Path(out).with_name(Path(out).stem + "_1" + Path(out).suffix))
     w, h = flag("--width", "64"), flag("--height", "64")
     ff("-f", "lavfi", "-i", f"color=c=white:s={w}x{h}", "-frames:v", "1", out)
     prompt = "" if os.environ.get("FAKE_LOSE_PROMPT") and os.environ["FAKE_LOSE_PROMPT"] in out else flag("--prompt")
@@ -165,6 +167,12 @@ def flag(args, name):
     return args[args.index(name) + 1]
 
 
+def made(args):
+    """The picture an image call ends up as: it renders to .NAME-new.png, then moves it to NAME.png."""
+    out = Path(flag(args, "--output"))
+    return out.with_name(out.name.removeprefix(".").replace("-new.", "."))
+
+
 def duration(path):
     out = subprocess.run([str(Path(FFMPEG).with_name("ffprobe")), "-v", "error", "-show_entries", "format=duration",
                           "-of", "csv=p=0", str(path)], capture_output=True, text=True, check=True).stdout
@@ -178,7 +186,7 @@ def test_board_renders_every_still_in_the_lane_then_stops_for_review(env):
     r = run(env, "board", "story.toml")
     assert r.returncode == 0, r.stderr
     stills = calls(log, "mflux-generate-z-image-turbo")
-    assert [Path(flag(c["args"], "--output")).name for c in stills] == ["01-walk.png", "02-pounce.png", "03-stalk.png"]
+    assert [made(c["args"]).name for c in stills] == ["01-walk.png", "02-pounce.png", "03-stalk.png"]
     first = stills[0]["args"]
     assert flag(first, "--prompt") == "a slender red fox walking in snow, cartoon still"
     assert flag(first, "--seed") == "1024" and flag(first, "--width") == "1248" and flag(first, "--height") == "720"
@@ -197,7 +205,19 @@ def test_board_rerenders_only_what_changed(env):
     story = film / "story.toml"
     story.write_text(story.read_text().replace('still = "FOX pouncing"', 'still = "FOX pouncing high"'))
     assert run(env, "board", "story.toml").returncode == 0
-    assert [Path(flag(c["args"], "--output")).name for c in calls(log, "mflux-generate-z-image-turbo")] == ["02-pounce.png"]
+    assert [made(c["args"]).name for c in calls(log, "mflux-generate-z-image-turbo")] == ["02-pounce.png"]
+
+
+def test_a_redrawn_still_replaces_the_old_picture(env):
+    film, _, log = env
+    assert run(env, "board", "story.toml").returncode == 0
+    story = film / "story.toml"
+    story.write_text(story.read_text().replace('still = "FOX pouncing"', 'still = "FOX leaping high"'))
+    r = run(env, "board", "story.toml")
+    assert r.returncode == 0, r.stdout + r.stderr
+    import spike_animate as sa
+    assert sa.png_prompt(film / "board" / "02-pounce.png") == "FOX leaping high, cartoon still".replace("FOX", "a slender red fox")
+    assert not list((film / "board").glob("*_1.png"))
 
 
 def test_board_flags_a_still_whose_prompt_was_lost(env):
@@ -212,7 +232,7 @@ def test_retake_renders_alternates_beside_the_board(env):
     film, _, log = env
     r = run(env, "retake", "story.toml", "02-pounce", "--seeds", "7,42")
     assert r.returncode == 0, r.stderr
-    outs = [Path(flag(c["args"], "--output")) for c in calls(log, "mflux-generate-z-image-turbo")]
+    outs = [made(c["args"]) for c in calls(log, "mflux-generate-z-image-turbo")]
     assert [o.name for o in outs] == ["02-pounce-s7.png", "02-pounce-s42.png"]
     assert all(o.parent == film / "board" / "retakes" for o in outs)
     assert (film / "board" / "retakes" / "02-pounce-sheet.jpg").exists()
@@ -245,7 +265,7 @@ def test_film_animates_scores_and_mixes_the_whole_story(env):
     assert flag(stalk, "--init-start") == "0.5" and flag(stalk, "--init-sigma") == "0.88"
     first = [c for c in calls(log, "mflux-generate-z-image-turbo") if "--image-path" in c["args"]]
     assert len(first) == 1 and flag(first[0]["args"], "--image-strength") == "0.4"
-    assert flag(stalk, "--image") == flag(first[0]["args"], "--output")
+    assert flag(stalk, "--image") == str(made(first[0]["args"]))
 
     sfx = [c for c in calls(log, "python") if c["args"][0] == "demo.py"]
     assert len(sfx) == 3 and all(c["holder"] == "sfx" for c in sfx)
@@ -373,3 +393,80 @@ def test_scene_mode_performs_all_the_dialogue_in_one_pass_and_cuts_it_into_lines
 def sa_default_sample():
     import spike_animate
     return spike_animate.DEFAULT_VOICE_SAMPLE
+
+
+# --- one step at a time (the studio confirms each before the next) -------------
+
+def _tools(log):
+    out = []
+    for c in calls(log):
+        a = c["args"]
+        out.append(c["tool"] if c["tool"] != "python" else Path(a[0]).name)
+    return set(out)
+
+
+def test_video_needs_the_board_first(env):
+    r = run(env, "video", "story.toml")
+    assert r.returncode == 2 and "board" in r.stderr
+
+
+def test_video_animates_the_shots_and_nothing_else(env):
+    film, _, log = env
+    assert run(env, "board", "story.toml").returncode == 0
+    log.unlink()
+    r = run(env, "video", "story.toml")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "wan22_i2v.py" in _tools(log)
+    assert not _tools(log) & {"demo.py", "mlx_audio.tts.generate", "score_gen.py"}
+    assert duration(film / "film" / "picture.mp4") == pytest.approx(3 * 121 / 24, abs=0.06)
+
+
+def test_sound_needs_the_video_first(env):
+    assert run(env, "board", "story.toml").returncode == 0
+    r = run(env, "sound", "story.toml")
+    assert r.returncode == 2 and "video" in r.stderr
+
+
+def test_sound_adds_effects_only(env):
+    film, _, log = env
+    assert run(env, "board", "story.toml").returncode == 0
+    assert run(env, "video", "story.toml").returncode == 0
+    log.unlink()
+    r = run(env, "sound", "story.toml")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _tools(log) == {"demo.py"}
+    assert (film / "film" / "sfx.wav").exists()
+
+
+def test_voices_record_every_line_and_save_their_checks(env):
+    film, _, log = env
+    r = run(env, "voices", "story.toml")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _tools(log) <= {"mlx_audio.tts.generate", "mlx_audio.stt.generate"}
+    assert (film / "voice" / "01-walk.wav").exists()
+    checks = json.loads((film / "film" / "checks.json").read_text())
+    assert checks["narration"]["01-walk"] >= 0.8
+
+
+def test_music_scores_the_film_length_and_saves_the_choice(env):
+    film, _, log = env
+    r = run(env, "music", "story.toml")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _tools(log) == {"score_gen.py", "score_rank.py"}
+    gen = [c for c in calls(log, "python") if c["args"][0].endswith("score_gen.py")]
+    spec = json.loads(Path(gen[0]["args"][1]).read_text())
+    assert spec["duration"] == round(3 * 121 / 24 + 1.2, 2)
+    checks = json.loads((film / "film" / "checks.json").read_text())
+    assert checks["score"]["chosen"].endswith("take-s1.wav")
+
+
+def test_after_every_step_the_film_only_mixes(env):
+    film, _, log = env
+    for step in ("board", "video", "sound", "voices", "music"):
+        assert run(env, step, "story.toml").returncode == 0, step
+    log.unlink()
+    r = run(env, "film", "story.toml")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not _tools(log) & {"wan22_i2v.py", "demo.py", "mlx_audio.tts.generate", "score_gen.py",
+                              "mflux-generate-z-image-turbo"}
+    assert (film / "film" / "fox-hunt.mp4").exists()

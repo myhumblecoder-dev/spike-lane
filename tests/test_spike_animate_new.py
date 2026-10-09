@@ -218,3 +218,47 @@ def test_new_passes_notes_to_the_writer(ollama, tmp_path):
     r = new(ollama, "gull", "a keeper and a gull", "--shots", "3", "--notes", "the gull is called PIP", cwd=tmp_path)
     assert r.returncode == 0, r.stderr
     assert "the gull is called PIP" in FakeOllama.requests[0]["prompt"]
+
+
+# --- the author's own story, and a picture for the style ----------------------------------
+
+def test_the_writer_can_follow_a_whole_story_and_its_dialogue():
+    story = 'Pip the robot finds a paintbrush. "What is this?" he asks. He paints the sunrise.'
+    p = sa.writer_prompt(story, shots=6)
+    assert story in p
+    assert "whole story" in p and "word for word" in p
+
+
+def test_a_style_from_a_picture_replaces_the_default_cartoon_look():
+    style = "soft watercolor storybook illustration, muted pastels, loose ink lines, paper texture"
+    p = sa.writer_prompt("a robot learns to paint", shots=6, style=style)
+    assert style in p and "VISUAL STYLE" in p
+    assert "bold black outlines, flat vibrant colors," not in p.split("Example of the format")[0]
+    assert "bold black outlines, flat vibrant colors," in sa.writer_prompt("x", shots=6).split("Example of the format")[0]
+
+
+def test_the_story_remembers_its_style_picture(tmp_path):
+    p = tmp_path / "story.toml"
+    p.write_text(sa.draft_to_toml(draft(), idea="x", style_image="reference/style.png", style="watercolor"))
+    import tomllib
+    d = tomllib.loads(p.read_text())
+    assert d["style_image"] == "reference/style.png" and d["style"] == "watercolor"
+    sa.load_story(p)
+
+
+def test_new_reads_the_style_from_a_picture_with_the_local_model(ollama, tmp_path):
+    pic = tmp_path / "mine.png"
+    pic.write_bytes(b"\x89PNG fake picture")
+    FakeOllama.replies = [{"style": "soft watercolor, muted pastels"}, draft()]
+    r = new(ollama, "gull", "a keeper and a gull", "--shots", "3", "--style-image", str(pic), cwd=tmp_path)
+    assert r.returncode == 0, r.stderr
+    look, write = FakeOllama.requests
+    import base64
+    assert look["images"] == [base64.b64encode(pic.read_bytes()).decode()]
+    assert look["model"] == "gemma4:26b" and look["think"] is False
+    assert FakeOllama.holders == ["writer", "writer"]
+    assert "soft watercolor, muted pastels" in write["prompt"]
+    import tomllib
+    d = tomllib.loads((tmp_path / "gull" / "story.toml").read_text())
+    assert d["style"] == "soft watercolor, muted pastels"
+    assert (tmp_path / "gull" / d["style_image"]).read_bytes() == pic.read_bytes()

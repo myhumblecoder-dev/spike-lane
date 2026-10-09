@@ -46,10 +46,15 @@ music brief. Example: `~/Movies/spike-video/fox-hunt-v2/story.toml`.
 ```bash
 ln -sf ~/spike-lane/bin/spike-animate ~/.local/bin/spike-animate
 cd ~/Movies/spike-video/my-film
-spike-animate new my-film "a one-line idea"       # local gemma4 drafts my-film/story.toml (~1 min)
+spike-animate new my-film "an idea, or the whole story"   # local gemma4 drafts my-film/story.toml (~1 min)
+#   --notes "names, looks, setting"   --style-image ref.png (gemma4 reads its style into look/still_style)
 spike-animate board story.toml                    # stills + board/contact-sheet.jpg, then stop
 spike-animate retake story.toml 06-pounce --seeds 7,42,99   # alternates; keep one with `seed = N`
-spike-animate film story.toml                     # → film/<title>.mp4 + film/review/ + film/checks.json
+spike-animate video story.toml                    # one step at a time: shots (no sound) → film/picture.mp4
+spike-animate sound story.toml                    #   sound effects
+spike-animate voices story.toml                   #   narration + dialogue, checks in film/checks.json
+spike-animate music story.toml                    #   score takes, best one chosen
+spike-animate film story.toml                     # whatever is left, then mix → film/<title>.mp4 + film/review/
 spike-animate status story.toml
 ```
 
@@ -93,25 +98,32 @@ Every line is checked with speech-to-text (`film/checks.json` → `dialogue`).
 
 ## spike-studio: the same loop from a phone
 
-A web UI over spike-animate, made for an iPhone. Each film gets six steps:
-1. **Story:** start from an idea and optional reference notes; the local model writes it. Then edit it as a form or as raw TOML.
-2. **Storyboard:** draw the stills, retake any shot three ways, and pick the one to use.
-3. **Video:** each shot's clip and its sound effects.
-4. **Voices:** voice cards, then every narration and dialogue line with its speech check.
-5. **Music:** listen to the ranked takes and pin one.
-6. **Film:** the finished film and its checks.
+A web UI over spike-animate, made for an iPhone. A film starts from your story (one line or the whole thing,
+dialogue kept word for word), optional reference notes and an optional style picture. Then it goes step by step,
+and each step must be approved before the next one unlocks:
+1. **Story:** edit it as a form or as raw TOML.
+2. **Pictures:** draw the stills; edit a description and redraw it, or get three more versions of a shot as often as you like; **Use** swaps one in instantly.
+3. **Video:** each shot animated, no sound; edit a motion or switch Calm/Action and regenerate only what changed.
+4. **Sound:** each shot's effects, played against its clip; edit and regenerate.
+5. **Voices:** voice cards, then every narration and dialogue line with its speech check; edit a line and record again.
+6. **Music:** listen to the ranked takes and pick one.
+7. **Film:** the mix and its checks.
+
+An approval covers the files of its step and every step before it (`.spike-animate/approved.json`): if a
+picture is redrawn after the video was approved, the video's approval, and everything after it, lapses.
 
 A real wildlife clip can be uploaded and attached to a shot for real motion.
 
 The studio never renders anything itself. Each step runs `spike-animate` as a background job, one per film, and spike-lane still queues the heavy work. Jobs keep running, and their results stay visible, if the studio restarts.
 
 ```bash
-spike-studio                       # films in ~/Movies/spike-video, port 8765
-#   → open http://<mac-address>:8765/?t=<token>  (printed once; the browser keeps a cookie)
+spike-studio                       # films in ~/Movies/spike-video, 127.0.0.1:8765
+tailscale serve --bg --http=80 http://127.0.0.1:8765   # once: share it on your tailnet
+#   → open http://<machine>.<tailnet>.ts.net/?t=<token>  (the browser keeps a cookie)
 ```
 It runs at login as a LaunchAgent (`~/Library/LaunchAgents/ai.spike.studio.plist`, log `~/Library/Logs/spike-studio.log`).
 The token lives in `~/.config/spike-studio/token`; delete it and restart to issue a new one.
-It is reachable on the home network only.
+It listens on loopback only, so the home network can't reach it; devices on your tailnet reach it through `tailscale serve`.
 
 ## License
 

@@ -60,6 +60,7 @@ p { margin: 0 0 10px; }
 .dim { color: var(--dim); } .faint { color: var(--faint); } .small { font-size: .88rem; }
 .mono { font-family: var(--mono); font-size: .85rem; }
 .stack { display: grid; gap: var(--gap); }
+.stack > *, details.sec > .body > *, details.sec > summary > * { min-width: 0; }  /* long unbroken text must not widen the page */
 .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 .spacer { flex: 1; }
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px; min-width: 0; }
@@ -142,7 +143,7 @@ details.sec > summary::-webkit-details-marker { display: none; }
 details.sec > summary::after { content: "›"; margin-left: auto; color: var(--faint); font-size: 1.3rem; line-height: 1; transition: transform .15s; }
 details.sec[open] > summary::after { transform: rotate(90deg); }
 details.sec > .body { padding: 0 14px 14px; display: grid; gap: 12px; }
-.sum-title { font-weight: 600; } .sum-sub { color: var(--dim); font-size: .88rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.sum-title { font-weight: 600; flex: none; max-width: 45%; } .sum-sub { flex: 1; color: var(--dim); font-size: .88rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .line-row { display: grid; grid-template-columns: 7.5rem minmax(0, 1fr) auto; gap: 8px; align-items: start; }
 @media (max-width: 520px) { .line-row { grid-template-columns: 1fr auto; } .line-row .line-text { grid-column: 1 / -1; grid-row: 2; } }
 .savebar { position: sticky; bottom: 0; z-index: 10; padding: 12px 0 calc(12px + env(safe-area-inset-bottom));
@@ -160,6 +161,16 @@ details.sec > .body { padding: 0 14px 14px; display: grid; gap: 12px; }
   box-shadow: 0 8px 30px rgba(0,0,0,.35); }
 .toast.bad { background: var(--bad); color: #fff; }
 .center { text-align: center; padding: 40px 0; }
+nav.tabs button .st { margin-left: 5px; font-size: .8rem; }
+nav.tabs button.ok .st { color: var(--ok); } nav.tabs button.locked { opacity: .55; }
+.gatebar { position: sticky; bottom: 0; z-index: 10; padding: 12px 0 calc(12px + env(safe-area-inset-bottom));
+  background: linear-gradient(to top, var(--bg) 75%, transparent); }
+.gatebar .card { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+.gatebar.ok .card { border-color: color-mix(in srgb, var(--ok) 45%, var(--line)); }
+.style-pick { display: flex; gap: 12px; align-items: center; }
+.style-pick img { width: 120px; aspect-ratio: 16 / 10; object-fit: cover; flex: none; }
+.inline { display: grid; gap: 6px; }
+.inline .row { justify-content: flex-end; }
 </style>
 </head>
 <body>
@@ -172,6 +183,7 @@ const $app = document.getElementById("app"), $top = document.getElementById("top
 function h(tag, attrs, ...kids) {
   const el = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs || {})) {
+    if (k.startsWith("aria-") && typeof v === "boolean") { el.setAttribute(k, String(v)); continue; }
     if (v == null || v === false) continue;
     if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
     else if (k === "class") el.className = v;
@@ -196,7 +208,8 @@ function toast(msg, bad) {
 const media = (url) => url ? `/media/${S.name}/${url}` : null;
 const clone = (x) => JSON.parse(JSON.stringify(x));
 const fmtSecs = (s) => s >= 60 ? `${Math.floor(s / 60)} min ${String(s % 60).padStart(2, "0")} s` : `${s} s`;
-const STEP_NAMES = { new: "Writing the story", board: "Drawing the storyboard", retake: "Drawing retakes", film: "Making the film", status: "Status" };
+const STEP_NAMES = { new: "Writing the story", board: "Drawing the pictures", retake: "Drawing retakes", video: "Animating the shots",
+  sound: "Adding sound effects", voices: "Recording voices", music: "Scoring the music", film: "Mixing the film", status: "Status" };
 
 // ---- state ----------------------------------------------------------------------------------------
 const S = { name: null, film: null, doc: null, dirty: false, tab: "story", raw: false, rawText: "", errors: [], poll: null, openShot: null, logOpen: false };
@@ -221,22 +234,45 @@ async function home() {
   try { films = await api("GET", "/api/films"); } catch (e) { toast(e.message, true); }
   const shots = h("input", { type: "number", min: 3, max: 16, value: 8, inputmode: "numeric" });
   const title = h("input", { type: "text", placeholder: "e.g. Penguin Ice Cream", autocomplete: "off" });
-  const idea = h("textarea", { rows: 3, placeholder: "One line is enough: a shy penguin opens a tiny ice-cream shop in Antarctica and nobody comes, until a blizzard…" });
-  const notes = h("textarea", { rows: 3, placeholder: "Optional: names, looks, setting, tone, who talks, how it ends. The writer follows these." });
+  const idea = h("textarea", { rows: 6, placeholder: "A one-line idea, or your whole story, dialogue and all. The writer follows your story beat by beat and keeps your lines word for word." });
+  const notes = h("textarea", { rows: 3, placeholder: "Optional: names, looks, setting, tone, who talks, how it ends." });
+  const styleIn = h("input", { type: "file", accept: "image/png,image/jpeg", hidden: true });
+  const noPic = () => h("div", { class: "empty-media" }, "No picture");
+  const stylePrev = h("div", { style: "width:120px;flex:none" }, noPic());
+  const styleNote = h("span", { class: "small dim" }, "Optional: a picture in the style you want. The local model reads its style (medium, colours, lines, texture) and every still copies it.");
+  const styleClear = h("button", { class: "btn small ghost", hidden: true, onclick: () => { styleIn.value = ""; styleIn.dispatchEvent(new Event("change")); } }, "Remove");
+  styleIn.addEventListener("change", () => {
+    const file = styleIn.files[0];
+    styleClear.hidden = !file;
+    stylePrev.replaceChildren(file ? h("img", { src: URL.createObjectURL(file), alt: "Style picture", style: "width:120px;aspect-ratio:16/10;object-fit:cover" }) : noPic());
+  });
+  const styleBox = h("div", { class: "style-pick" }, stylePrev, h("div", { class: "stack", style: "gap:6px;min-width:0" }, styleNote,
+    h("div", { class: "row" }, h("button", { class: "btn small", onclick: () => styleIn.click() }, "Choose picture"), styleClear, styleIn)));
   const go = h("button", { class: "btn primary", onclick: async () => {
-    if (!idea.value.trim()) return toast("Write the idea first", true);
+    if (!idea.value.trim()) return toast("Write the story or idea first", true);
     go.disabled = true;
     try {
-      const r = await api("POST", "/api/films", { title: title.value.trim() || idea.value.trim().slice(0, 40), idea: idea.value, notes: notes.value, shots: +shots.value || 8 });
+      const r = await api("POST", "/api/films", { title: title.value.trim() || idea.value.trim().slice(0, 40) });
+      const params = { step: "new", idea: idea.value, notes: notes.value, shots: +shots.value || 8 };
+      const file = styleIn.files[0];
+      if (file) {
+        toast("Uploading the style picture…");
+        const ext = (file.name.match(/\.(png|jpe?g)$/i) || [".png"])[0].toLowerCase();
+        const up = await fetch(`/api/films/${r.name}/upload?name=style${ext}`, { method: "POST", body: file, headers: { "Content-Type": file.type || "application/octet-stream" } });
+        const data = await up.json(); if (!up.ok) throw new Error((data.errors || []).join("\n"));
+        params.style_image = data.path;
+      }
+      await api("POST", `/api/films/${r.name}/run`, params);
       location.hash = `#/film/${r.name}/story`;
     } catch (e) { toast(e.message, true); go.disabled = false; }
   } }, "Write the story");
   $app.replaceChildren(
     h("h1", {}, "New film"),
-    h("p", { class: "dim" }, "Spike writes the story on this Mac with the local model, then you edit it, approve the storyboard, and make the film."),
+    h("p", { class: "dim" }, "Spike writes the shot list on this Mac with the local model. Then you go step by step (story, pictures, video, sound, voices, music, final film), approving each before the next."),
     h("div", { class: "card stack" },
-      h("label", { class: "f" }, h("span", {}, "Idea"), idea),
+      h("label", { class: "f" }, h("span", {}, "Your story"), idea),
       h("label", { class: "f" }, h("span", {}, "Reference notes"), notes),
+      h("div", { class: "f" }, h("span", { class: "small dim" }, "Style picture"), styleBox),
       h("div", { class: "grid2" }, h("label", { class: "f" }, h("span", {}, "Title (optional)"), title),
         h("label", { class: "f" }, h("span", {}, "Shots", h("span", { class: "faint" }, "5 s each")), shots)),
       h("div", { class: "row" }, go, h("span", { class: "small faint" }, "About a minute"))),
@@ -278,7 +314,10 @@ async function loadFilm(quiet) {
   S.poll = setTimeout(() => loadFilm(true), S.film?.job?.running ? 2500 : 15000);
 }
 
-const TABS = [["story", "Story"], ["board", "Storyboard"], ["shots", "Video"], ["voices", "Voices"], ["music", "Music"], ["film", "Film"]];
+const TABS = [["story", "Story"], ["board", "Pictures"], ["shots", "Video"], ["sound", "Sound"], ["voices", "Voices"], ["music", "Music"], ["film", "Film"]];
+const TAB_STAGE = { story: "story", board: "board", shots: "video", sound: "sound", voices: "voices", music: "music", film: "film" };
+const stepOf = (stage) => (S.film.steps || []).find((x) => x.stage === stage) || { unlocked: true, done: false, approved: false };
+const tabOf = (stage) => Object.keys(TAB_STAGE).find((k) => TAB_STAGE[k] === stage);
 
 function renderFilm(quiet) {
   const f = S.film;
@@ -287,15 +326,18 @@ function renderFilm(quiet) {
     h("div", { class: "crumb" }, f.title));
   // When polling, keep whatever the person is typing: only refresh the job bar and the non-editor tabs.
   const active = document.activeElement;
-  if (quiet && S.tab === "story" && $app.contains(active) && active.matches("input,textarea,select")) {
+  if (quiet && $app.contains(active) && active.matches("input,textarea,select")) {
     document.getElementById("jobbar")?.replaceWith(jobBar());
     return;
   }
   const y = window.scrollY;
-  const tabs = h("nav", { class: "tabs", "aria-label": "Steps" }, TABS.map(([k, label], i) =>
-    h("button", { "aria-current": S.tab === k ? "true" : "false", onclick: () => { location.hash = `#/film/${S.name}/${k}`; } },
-      h("span", { class: "n" }, i + 1), label)));
-  const body = { story: storyTab, board: boardTab, shots: shotsTab, voices: voicesTab, music: musicTab, film: filmTab }[S.tab] || storyTab;
+  const tabs = h("nav", { class: "tabs", "aria-label": "Steps" }, TABS.map(([k, label], i) => {
+    const st = stepOf(TAB_STAGE[k]);
+    return h("button", { class: st.approved ? "ok" : st.unlocked ? "" : "locked", "aria-current": S.tab === k ? "true" : "false",
+      onclick: () => { location.hash = `#/film/${S.name}/${k}`; } },
+      h("span", { class: "n" }, i + 1), label, h("span", { class: "st", "aria-label": st.approved ? "approved" : st.unlocked ? "" : "locked" }, st.approved ? "✓" : st.unlocked ? "" : "🔒"));
+  }));
+  const body = { story: storyTab, board: boardTab, shots: shotsTab, sound: soundTab, voices: voicesTab, music: musicTab, film: filmTab }[S.tab] || storyTab;
   $app.replaceChildren(jobBar(), tabs, body());
   if (quiet) window.scrollTo(0, y);
 }
@@ -325,8 +367,56 @@ async function run(step, extra) {
   catch (e) { toast(e.message, true); }
 }
 const busy = () => S.film?.job?.running;
+const STEP_STAGE = { board: "board", retake: "board", video: "video", sound: "sound", voices: "voices", music: "music", film: "film" };
+const locked = (step) => STEP_STAGE[step] && !stepOf(STEP_STAGE[step]).unlocked;
 const runBtn = (label, step, extra, primary = true) =>
-  h("button", { class: "btn" + (primary ? " primary" : ""), disabled: busy() || !!S.film.errors.length, onclick: () => run(step, extra) }, label);
+  h("button", { class: "btn" + (primary ? " primary" : ""), disabled: busy() || !!S.film.errors.length || locked(step), onclick: () => run(step, extra) }, label);
+
+// The bottom bar of every step: what to do here, then approve it to open the next step.
+function gateBar(stage, ...actions) {
+  const st = stepOf(stage), i = TABS.findIndex(([k]) => TAB_STAGE[k] === stage), next = TABS[i + 1];
+  const goNext = () => { if (next) location.hash = `#/film/${S.name}/${next[0]}`; };
+  if (!st.unlocked) {
+    const prev = S.film.steps.find((x) => !x.approved);
+    return h("div", { class: "gatebar" }, h("div", { class: "card" }, h("span", { class: "chip" }, "🔒 Locked"),
+      h("span", { class: "small dim" }, `Approve ${prev.name} first.`), h("span", { class: "spacer" }),
+      h("button", { class: "btn small", onclick: () => { location.hash = `#/film/${S.name}/${tabOf(prev.stage)}`; } }, `Go to ${prev.name}`)));
+  }
+  if (st.approved) {
+    return h("div", { class: "gatebar ok" }, h("div", { class: "card" }, h("span", { class: "chip ok" }, "✓ Approved"), ...actions, h("span", { class: "spacer" }),
+      h("button", { class: "btn small ghost", disabled: busy(), onclick: () => approve(stage, true) }, "Reopen"),
+      next ? h("button", { class: "btn primary", onclick: goNext }, `Next: ${next[1]} ›`) : null));
+  }
+  return h("div", { class: "gatebar" }, h("div", { class: "card" }, ...actions, h("span", { class: "spacer" }),
+    st.done ? null : h("span", { class: "small faint" }, stage === "story" ? "Fix the story first" : "Generate first, then approve"),
+    h("button", { class: "btn primary", disabled: !st.done || busy() || S.dirty, onclick: async () => { if (await approve(stage)) goNext(); } },
+      next ? "Approve & continue ›" : "Approve the film")));
+}
+async function approve(stage, undo) {
+  try {
+    S.film = await api("POST", `/api/films/${S.name}/approve`, { stage, undo: !!undo });
+    toast(undo ? "Reopened: approve it again when you're happy" : "Approved"); renderFilm(true); return true;
+  } catch (e) { toast(e.message, true); return false; }
+}
+
+// Edit one field of one shot in place, outside the Story editor.
+function inlineEdit(label, value, onSave, rows = 2) {
+  const ta = h("textarea", { rows });
+  ta.value = value || "";
+  const btn = h("button", { class: "btn small", disabled: true, onclick: async () => {
+    btn.disabled = true;
+    try { await onSave(ta.value); } catch (e) { toast(e.message, true); btn.disabled = false; }
+  } }, "Save");
+  ta.addEventListener("input", () => { btn.disabled = ta.value === (value || ""); });
+  return h("label", { class: "f inline" }, h("span", {}, label), ta, h("div", { class: "row" }, btn));
+}
+async function saveShot(id, mutate, msg) {
+  if (S.dirty) throw new Error("Save or undo your edits on the Story step first");
+  const doc = clone(S.film.doc);
+  mutate(doc.shot.find((x) => x.id === id), doc);
+  const f = await api("PUT", `/api/films/${S.name}/story`, { doc });
+  S.film = f; S.doc = clone(f.doc); S.rawText = f.toml; toast(msg || "Saved"); renderFilm(true);
+}
 
 // ---- story tab ------------------------------------------------------------------------------------
 function markDirty() { if (!S.dirty) { S.dirty = true; document.getElementById("savebtn")?.removeAttribute("disabled"); } }
@@ -363,8 +453,7 @@ function storyTab() {
       h("button", { "aria-pressed": S.raw, onclick: () => switchRaw(true) }, "TOML")));
   const errs = h("div", { class: "errors", id: "errs" }, (S.errors.length ? S.errors : f.errors).join("\n"));
   const save = h("button", { class: "btn primary", id: "savebtn", disabled: !S.dirty, onclick: saveStory }, "Save story");
-  const next = runBtn(f.shots.some((s) => s.still) ? "Redraw storyboard" : "Draw storyboard", "board", {}, false);
-  const bar = h("div", { class: "savebar row" }, save, next, h("span", { class: "spacer" }),
+  const bar = gateBar("story", save,
     S.dirty ? h("button", { class: "btn ghost small", onclick: () => { S.dirty = false; S.errors = []; S.doc = clone(f.doc); S.rawText = f.toml; renderFilm(); } }, "Undo edits") : null);
   if (S.raw) {
     const ta = h("textarea", { class: "code", spellcheck: "false", autocapitalize: "off", autocorrect: "off" });
@@ -400,6 +489,9 @@ function storyForm(d) {
     field("Title", d, "title"),
     field("Idea", d, "idea", { rows: 2, placeholder: "the one-line idea", dropEmpty: true }),
     field("Reference notes", d, "notes", { rows: 3, placeholder: "names, looks, setting, tone", dropEmpty: true, note: "for your records; the writer used these" }),
+    d.style_image ? h("div", { class: "style-pick" }, h("img", { src: media(d.style_image), alt: "Style picture" }),
+      h("span", { class: "small dim" }, "Style picture. The local model read its style into the words below; edit them to steer it.")) : null,
+    d.style_image ? field("Style read from the picture", d, "style", { rows: 2, dropEmpty: true, note: "for your records" }) : null,
     field("Look (every video shot)", d, "look", { rows: 2 }),
     field("Still style (every storyboard still)", d, "still_style", { rows: 2 }),
     h("div", { class: "grid2" }, field("Seed", d, "seed", { type: "number", step: 1 }),
@@ -546,29 +638,29 @@ function boardTab() {
   const f = S.film;
   const drawn = f.shots.filter((s) => s.still).length;
   const stale = f.shots.filter((s) => s.still && s.still_fresh === false).length;
+  const todo = !drawn || stale > 0 || drawn < f.shots.length;
   return h("div", { class: "stack" },
-    h("h1", {}, "Storyboard"),
-    h("p", { class: "dim" }, drawn ? `${drawn} of ${f.shots.length} stills drawn${stale ? `; ${stale} out of date after story edits` : ""}. Retake any shot you don't like, then make the film.`
-      : "One still per shot, drawn from the story. About a minute each."),
-    h("div", { class: "row" }, runBtn(drawn ? (stale || drawn < f.shots.length ? "Draw missing and changed" : "Redraw storyboard") : "Draw storyboard", "board", {}, !drawn || stale > 0 || drawn < f.shots.length),
-      drawn === f.shots.length && !stale ? runBtn("Make the film", "film") : null),
+    h("h1", {}, "Pictures"),
+    h("p", { class: "dim" }, drawn ? `${drawn} of ${f.shots.length} pictures drawn${stale ? `; ${stale} changed and waiting to be redrawn` : ""}. Change a description and redraw, or retake a shot as often as you like; approve when every picture is right.`
+      : "One picture per shot, drawn from the story. About a minute each."),
     h("div", { class: "board" }, f.shots.map((s) => {
       const seeds = () => [0, 1, 2].map(() => Math.floor(Math.random() * 9000) + 100);
       return h("div", { class: "card shot-card" },
         h("div", { class: "row" }, h("span", { class: "id" }, s.id), h("span", { class: "spacer" }), h("span", { class: "chip" }, `seed ${s.seed}`)),
         s.still ? h("div", { class: s.still_fresh === false ? "stale" : "" }, h("img", { class: "thumb", src: media(s.still), alt: s.still_text, loading: "lazy" }))
           : h("div", { class: "empty-media" }, "Not drawn yet"),
-        h("p", { class: "small dim" }, s.still_text),
-        s.retakes.length ? h("div", {}, h("h3", { style: "margin:4px 0 6px" }, "Retakes"), h("div", { class: "retakes" }, s.retakes.slice(-6).map((r) =>
-          h("figure", {}, h("img", { class: "thumb", src: media(r.url), alt: `seed ${r.seed}`, loading: "lazy" }),
-            h("figcaption", {}, r.seed, r.seed === s.seed ? h("span", { class: "chip acc" }, "in use") :
-              h("button", { class: "btn small ghost", disabled: busy(), onclick: () => pickSeed(s.id, r.seed) }, "Use")))))) : null,
-        h("div", { class: "row" }, h("button", { class: "btn small", disabled: busy() || !!f.errors.length, onclick: () => run("retake", { shot: s.id, seeds: seeds() }) }, "Retake ×3")));
-    })));
+        inlineEdit("Picture description", s.still_text, (v) => saveShot(s.id, (x) => { x.still = v; }, "Saved; tap Redraw changed to draw it"), 3),
+        s.retakes.length ? h("div", {}, h("h3", { style: "margin:4px 0 6px" }, `Other versions (${s.retakes.length})`), h("div", { class: "retakes" }, s.retakes.slice(-9).reverse().map((r) =>
+          h("figure", {}, h("a", { href: media(r.url), target: "_blank" }, h("img", { class: "thumb", src: media(r.url), alt: `seed ${r.seed}`, loading: "lazy" })),
+            h("figcaption", {}, r.seed, r.seed === s.seed && s.still_fresh !== false ? h("span", { class: "chip acc" }, "in use") :
+              h("button", { class: "btn small ghost", disabled: busy() || locked("retake"), onclick: () => useRetake(s.id, r.seed) }, "Use")))))) : null,
+        h("div", { class: "row" }, h("button", { class: "btn small", disabled: busy() || !!f.errors.length || locked("retake"), onclick: () => run("retake", { shot: s.id, seeds: seeds() }) }, "3 more versions")));
+    })),
+    gateBar("board", runBtn(drawn ? "Redraw changed" : "Draw pictures", "board", {}, todo)));
 }
-async function pickSeed(shot, seed) {
-  if (S.dirty) return toast("Save the story first", true);
-  try { S.film = { ...(await api("POST", `/api/films/${S.name}/seed`, { shot, seed })) }; S.doc = clone(S.film.doc); S.rawText = S.film.toml; toast(`${shot} now uses seed ${seed}; redraw the storyboard to apply`); renderFilm(true); }
+async function useRetake(shot, seed) {
+  if (S.dirty) return toast("Save or undo your Story edits first", true);
+  try { S.film = await api("POST", `/api/films/${S.name}/use`, { shot, seed }); S.doc = clone(S.film.doc); S.rawText = S.film.toml; toast(`${shot}: using version ${seed}`); renderFilm(true); }
   catch (e) { toast(e.message, true); }
 }
 
@@ -578,14 +670,46 @@ function shotsTab() {
   const done = f.shots.filter((s) => s.clip).length;
   return h("div", { class: "stack" },
     h("h1", {}, "Video"),
-    h("p", { class: "dim" }, done ? `${done} of ${f.shots.length} shots animated, each with its own sound effects.` : "Each still becomes a 5-second shot (Wan 2.2), then gets sound effects made from its picture (MMAudio). Making the film runs every step and skips anything already done."),
-    h("div", { class: "row" }, runBtn(f.film ? "Remake changed parts" : "Make the film", "film")),
-    h("div", { class: "board" }, f.shots.map((s) => h("div", { class: "card shot-card" },
-      h("span", { class: "id" }, s.id),
-      s.clip ? h("video", { src: media(s.clip), poster: s.still ? media(s.still) : null, controls: true, playsinline: true, muted: true, loop: true, preload: "none" })
-        : s.still ? h("img", { class: "thumb", src: media(s.still), alt: "", loading: "lazy", style: "opacity:.5" }) : h("div", { class: "empty-media" }, "No still yet"),
-      h("p", { class: "small dim" }, s.motion),
-      s.sfx ? h("div", {}, h("h3", { style: "margin:2px 0 6px" }, "Effects"), h("audio", { src: media(s.sfx), controls: true, preload: "none" })) : null))));
+    h("p", { class: "dim" }, done ? `${done} of ${f.shots.length} shots animated (no sound yet). Change a shot's motion or Calm/Action and regenerate: only changed shots are redone.`
+      : "Each picture becomes a 5-second shot (Wan 2.2), about 1.5 minutes per shot."),
+    h("div", { class: "board" }, f.shots.map((s) => {
+      const doc = f.doc.shot.find((x) => x.id === s.id) || {};
+      const setAnchor = (a) => saveShot(s.id, (x) => { if (a === 0) x.anchor = 0; else delete x.anchor; }, a === 0 ? "Action: more movement" : "Calm: stays close to the picture").catch((e) => toast(e.message, true));
+      return h("div", { class: "card shot-card" },
+        h("span", { class: "id" }, s.id),
+        s.clip ? h("video", { src: media(s.clip), poster: s.still ? media(s.still) : null, controls: true, playsinline: true, muted: true, loop: true, preload: "none" })
+          : s.still ? h("img", { class: "thumb", src: media(s.still), alt: "", loading: "lazy", style: "opacity:.5" }) : h("div", { class: "empty-media" }, "No picture yet"),
+        inlineEdit("Motion (what moves in 5 s)", s.motion, (v) => saveShot(s.id, (x) => { x.motion = v; }, "Saved; regenerate to apply")),
+        h("div", { class: "row" }, h("span", { class: "small dim" }, "Movement"),
+          h("div", { class: "seg", role: "group", "aria-label": "Movement" },
+            h("button", { "aria-pressed": (doc.anchor ?? 1) !== 0, onclick: () => setAnchor(1) }, "Calm"),
+            h("button", { "aria-pressed": doc.anchor === 0, onclick: () => setAnchor(0) }, "Action"))));
+    })),
+    gateBar("video", runBtn(done ? "Regenerate changed shots" : "Generate video", "video")));
+}
+
+// ---- sound tab ------------------------------------------------------------------------------------
+function soundTab() {
+  const f = S.film;
+  const done = f.shots.filter((s) => s.sfx).length;
+  return h("div", { class: "stack" },
+    h("h1", {}, "Sound effects"),
+    h("p", { class: "dim" }, done ? `${done} of ${f.shots.length} shots have sound. Play the clip and its sound together; change the description and regenerate to redo a shot.`
+      : "Sound is made from each shot's picture and its description (MMAudio), about 30 s per shot."),
+    h("div", { class: "board" }, f.shots.map((s) => {
+      const vid = s.clip ? h("video", { src: media(s.clip), poster: s.still ? media(s.still) : null, playsinline: true, muted: true, preload: "none" }) : null;
+      const aud = s.sfx ? h("audio", { src: media(s.sfx), controls: true, preload: "none" }) : null;
+      if (vid && aud) {   // play picture and sound together
+        aud.addEventListener("play", () => { vid.currentTime = aud.currentTime; vid.play(); });
+        aud.addEventListener("pause", () => vid.pause());
+        aud.addEventListener("seeked", () => { vid.currentTime = aud.currentTime; });
+      }
+      const doc = f.doc.shot.find((x) => x.id === s.id) || {};
+      return h("div", { class: "card shot-card" }, h("span", { class: "id" }, s.id),
+        vid || h("div", { class: "empty-media" }, "No video yet"), aud,
+        inlineEdit("Sounds in this shot", doc.sfx || "", (v) => saveShot(s.id, (x) => { if (v.trim()) x.sfx = v; else delete x.sfx; }, "Saved; regenerate to apply")));
+    })),
+    gateBar("sound", runBtn(done ? "Regenerate changed" : "Add sound effects", "sound")));
 }
 
 // ---- voices tab -----------------------------------------------------------------------------------
@@ -596,33 +720,33 @@ function voicesTab() {
   const spoken = [];
   for (const s of f.shots) {
     if (s.narration) spoken.push({ sid: s.id, who: "Narrator", line: s.narration, url: s.narration_audio, check: chk.narration?.[s.id] });
-    (s.dialogue || []).forEach((l, k) => spoken.push({ sid: s.id, who: l.speaker, line: l.line, emotion: l.emotion, url: s.dialogue_audio[k], check: chk.dialogue?.[`${s.id}-${k + 1}`], over: k === s.dialogue.length - 1 ? chk.dialogue_overflow?.[s.id] : null }));
+    (s.dialogue || []).forEach((l, k) => spoken.push({ sid: s.id, k, who: l.speaker, line: l.line, emotion: l.emotion, url: s.dialogue_audio[k], check: chk.dialogue?.[`${s.id}-${k + 1}`], over: k === s.dialogue.length - 1 ? chk.dialogue_overflow?.[s.id] : null }));
   }
   return h("div", { class: "stack" },
     h("h1", {}, "Voices"),
-    h("p", { class: "dim" }, "Each voice is designed once from its description, then every line is cloned from it, so a character always sounds the same. Every line is checked by speech-to-text."),
+    h("p", { class: "dim" }, "Each voice is designed once from its description, then every line is cloned from it, so a character always sounds the same. Every line is checked by speech-to-text. Change how someone sounds on the Story step."),
     voices.length ? h("div", { class: "board" }, voices.map(([name, url]) => {
       const c = name === "narrator" ? f.doc?.narrator : f.doc?.characters?.[name];
       return h("div", { class: "card stack", style: "gap:8px" }, h("b", { style: "font-family:var(--display);font-size:1.1rem" }, name === "narrator" ? "Narrator" : name),
-        h("span", { class: "small dim" }, c?.voice || ""), url ? h("audio", { src: media(url), controls: true, preload: "none" }) : h("span", { class: "small faint" }, "Designed when the film is made"));
+        h("span", { class: "small dim" }, c?.voice || ""), url ? h("audio", { src: media(url), controls: true, preload: "none" }) : h("span", { class: "small faint" }, "Designed when the voices are recorded"));
     })) : h("p", { class: "dim" }, "No one speaks in this story yet. Add a narrator or give a character a voice on the Story step."),
     spoken.length ? h("h2", {}, "Lines") : null,
     h("div", { class: "lines" }, spoken.map((x) => h("div", { class: "line" },
       h("div", { class: "row" }, h("span", { class: "mono faint" }, x.sid), h("span", { class: "who" }, x.who), x.emotion ? h("span", { class: "small faint" }, x.emotion) : null, h("span", { class: "spacer" }), score(x.check),
         x.over ? h("span", { class: "chip bad" }, `runs ${x.over}s past the cut`) : null),
-      h("div", { class: "said" }, `“${x.line}”`),
-      x.url ? h("audio", { src: media(x.url), controls: true, preload: "none" }) : null))),
-    spoken.length ? h("div", { class: "row" }, runBtn(f.film ? "Remake changed parts" : "Make the film", "film", {}, false)) : null);
+      x.url ? h("audio", { src: media(x.url), controls: true, preload: "none" }) : null,
+      inlineEdit("Line", x.line, (v) => saveShot(x.sid, (sh) => { if (x.k == null) sh.narration = v; else sh.dialogue[x.k].line = v; }, "Saved; record again to apply"), 1)))),
+    gateBar("voices", spoken.length ? runBtn(spoken.some((x) => x.url) ? "Record changed lines" : "Record voices", "voices") : h("span", { class: "small dim" }, "Nothing to record")));
 }
 
 // ---- music tab ------------------------------------------------------------------------------------
 function musicTab() {
   const f = S.film, sc = f.score;
-  if (!f.doc?.music) return h("div", { class: "stack" }, h("h1", {}, "Music"), h("p", { class: "dim" }, "This story has no score. Add one under Music on the Story step."));
+  if (!f.doc?.music) return h("div", { class: "stack" }, h("h1", {}, "Music"), h("p", { class: "dim" }, "This story has no score. Add one under Music on the Story step, or approve to go on without music."), gateBar("music"));
   const pin = async (take) => {
     if (S.dirty) return toast("Save the story first", true);
     try { S.film = await api("POST", `/api/films/${S.name}/take`, { take }); S.doc = clone(S.film.doc); S.rawText = S.film.toml;
-      toast(take == null ? "Back to picking the best take automatically" : `Take ${take} pinned; remake the film to use it`); renderFilm(true); }
+      toast(take == null ? "Back to picking the best take automatically" : `Take ${take} chosen`); renderFilm(true); }
     catch (e) { toast(e.message, true); }
   };
   return h("div", { class: "stack" },
@@ -635,8 +759,8 @@ function musicTab() {
         t.seed === sc.chosen ? h("span", { class: "chip ok" }, "in the film") : null, t.seed === sc.pinned ? h("span", { class: "chip acc" }, "pinned") : null,
         h("span", { class: "spacer" }), t.seed !== sc.pinned ? h("button", { class: "btn small", onclick: () => pin(t.seed) }, "Use this take") : null),
       h("audio", { src: media(t.url), controls: true, preload: "none" }))))
-      : h("p", { class: "dim" }, "The takes appear here once the film is made."),
-    h("div", { class: "row" }, runBtn(f.film ? "Remake changed parts" : "Make the film", "film", {}, false)));
+      : h("p", { class: "dim" }, "The takes appear here once they're made: about 2 minutes for all of them."),
+    gateBar("music", runBtn(sc.takes.length ? "Remake music" : "Make music", "music", {}, !sc.takes.length)));
 }
 
 // ---- film tab -------------------------------------------------------------------------------------
@@ -645,17 +769,12 @@ function filmTab() {
   const allLines = [...Object.values(c.narration || {}), ...Object.values(c.dialogue || {})];
   const weak = allLines.filter((v) => v < 0.8).length;
   const over = Object.keys(c.dialogue_overflow || {}).length;
-  const missing = f.shots.filter((s) => !s.still || s.still_fresh === false).length;
   return h("div", { class: "stack" },
     h("h1", {}, f.title),
     f.idea ? h("p", { class: "dim", style: "font-family:var(--display);font-style:italic" }, `“${f.idea}”`) : null,
     f.film ? h("video", { class: "film", src: media(f.film), poster: f.shots[0]?.still ? media(f.shots[0].still) : null, controls: true, playsinline: true, preload: "metadata" })
-      : h("div", { class: "empty-media" }, missing ? "Draw and approve the storyboard first" : "Not made yet"),
-    h("div", { class: "row" },
-      missing ? h("button", { class: "btn primary", onclick: () => { location.hash = `#/film/${S.name}/board`; } }, "Go to storyboard")
-        : runBtn(f.film ? "Remake changed parts" : "Make the film", "film"),
-      f.film ? h("a", { class: "btn ghost", href: media(f.film), download: "" }, "Download") : null,
-      h("span", { class: "small faint" }, f.film ? "Only edited parts are redone" : "About 20–30 minutes for 8 shots")),
+      : h("div", { class: "empty-media" }, "Not mixed yet"),
+    f.film ? h("div", { class: "row" }, h("a", { class: "btn ghost", href: media(f.film), download: "" }, "Download")) : null,
     f.film ? h("div", { class: "card stack", style: "gap:8px" },
       h("h3", { style: "margin:0" }, "Checks"),
       h("div", { class: "row" },
@@ -664,7 +783,8 @@ function filmTab() {
         over ? h("span", { class: "chip bad" }, `${over} shot(s) with dialogue past the cut`) : allLines.length ? h("span", { class: "chip ok" }, "dialogue fits its shots") : null,
         c.length ? h("span", { class: "chip" }, `${c.length.film} s`) : null,
         f.score.chosen != null ? h("span", { class: "chip" }, `music take ${f.score.chosen}`) : null)) : null,
-    f.board ? h("div", {}, h("h2", {}, "Storyboard"), h("img", { src: media(f.board), alt: "Storyboard", loading: "lazy" })) : null);
+    f.board ? h("div", {}, h("h2", {}, "Storyboard"), h("img", { src: media(f.board), alt: "Storyboard", loading: "lazy" })) : null,
+    gateBar("film", runBtn(f.film ? "Mix again" : "Mix the film", "film", {}, !f.film)));
 }
 
 route();
