@@ -262,3 +262,55 @@ def test_new_reads_the_style_from_a_picture_with_the_local_model(ollama, tmp_pat
     d = tomllib.loads((tmp_path / "gull" / "story.toml").read_text())
     assert d["style"] == "soft watercolor, muted pastels"
     assert (tmp_path / "gull" / d["style_image"]).read_bytes() == pic.read_bytes()
+
+
+# --- optional parts: narrator, dialogue, music --------------------------------------------
+
+def test_a_film_can_have_no_narrator_no_dialogue_and_no_music(tmp_path):
+    parts = sa.Parts(narrator=False, dialogue=False, music=False)
+    p = sa.writer_prompt("a gull and a keeper", shots=3, parts=parts)
+    rules = p.split("Example of the format")[0]
+    assert "There is no narrator" in rules and "No one speaks" in rules and "no score" in rules
+    schema = sa.draft_schema(parts)
+    assert not {"narrator", "music"} & set(schema["required"]) and "narrator" not in schema["properties"]
+    d = draft()
+    del d["narrator"], d["music"]
+    for s in d["shots"]:
+        s["narration"] = ""
+    path = tmp_path / "story.toml"
+    path.write_text(sa.draft_to_toml(d, idea="x"))
+    story = sa.load_story(path)
+    assert story.narrator is None and story.music is None
+    assert "[narrator]" not in path.read_text() and "[music]" not in path.read_text()
+
+
+def test_lint_holds_the_writer_to_the_parts_the_author_chose():
+    d = draft()
+    d["shots"][0]["dialogue"] = [{"speaker": "KEEPER", "line": "Hello there.", "emotion": ""}]
+    d["characters"][0]["voice"] = "gruff"
+    problems = sa.lint_draft(d, 3, sa.Parts(narrator=False, dialogue=False))
+    assert any("01-light" in p and "no narrator" in p for p in problems)
+    assert any("01-light" in p and "no one speaks" in p for p in problems)
+    assert not sa.lint_draft(draft(), 3)                       # everything on, as before
+
+
+def test_new_can_leave_out_the_narrator_and_music(ollama, tmp_path):
+    d = draft()
+    del d["narrator"], d["music"]
+    for s in d["shots"]:
+        s["narration"] = ""
+    FakeOllama.replies = [d]
+    r = new(ollama, "gull", "a keeper and a gull", "--shots", "3", "--no-narrator", "--no-music", cwd=tmp_path)
+    assert r.returncode == 0, r.stderr
+    req = FakeOllama.requests[0]
+    assert "narrator" not in req["format"]["required"] and "There is no narrator" in req["prompt"]
+    story = sa.load_story(tmp_path / "gull" / "story.toml")
+    assert story.narrator is None and story.music is None
+
+
+# --- motion that stays inside the picture ---------------------------------------------------
+
+def test_motion_may_only_move_what_the_still_shows_and_silent_faces_stay_closed():
+    rules = sa.writer_prompt("a student studies at a cafe", shots=6).split("Example of the format")[0]
+    assert "only what the still shows" in rules            # "as she reads" grew a book out of a laptop edge
+    assert "mouth closed" in rules                          # the video model makes idle faces talk

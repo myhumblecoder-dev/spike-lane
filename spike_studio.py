@@ -162,49 +162,46 @@ def use_retake(folder: Path, shot_id: str, seed: int) -> list[str]:
 
 
 # --- one step at a time ------------------------------------------------------------
+# The story, then each scene in order (picture → motion → sound → lines → preview), then the music
+# and the final film. Each part is approved before the next one opens; an approval is a fingerprint
+# of the files that part and the earlier parts of the same scene made, so redoing anything in a
+# scene reopens that scene from there on, and nothing in the other scenes.
 
-STAGES = ("story", "board", "video", "sound", "voices", "music", "film")
-STEP_STAGE = {"board": "board", "retake": "board", "video": "video", "sound": "sound", "voices": "voices",
-              "music": "music", "film": "film"}
-STAGE_NAMES = {"story": "Story", "board": "Pictures", "video": "Video", "sound": "Sound effects",
-               "voices": "Voices & dialogue", "music": "Music", "film": "Final film"}
+SCENE_PARTS = ("picture", "video", "sound", "voices", "preview")
+PART_NAMES = {"picture": "picture", "video": "motion", "sound": "sound", "voices": "lines", "preview": "preview"}
+STEP_PART = {"board": "picture", "retake": "picture", "video": "video", "sound": "sound", "voices": "voices",
+             "scene": "preview"}
 
 
-def _outputs(folder: Path, doc: dict, story) -> dict[str, list[Path] | None]:
-    """The files each step makes; None while the step isn't finished."""
-    shots = doc.get("shot", [])
-    ids = [x.get("id", "") for x in shots]
-
-    def every(paths):
-        return paths if all(p.is_file() for p in paths) else None
-
-    out: dict[str, list[Path] | None] = {"story": [] if story else None}
-    board = [folder / "board" / f"{i}.png" for i in ids]
-    if story:
-        keys = sa.Keys(folder)
-        fresh = all(not keys.stale(sa.still_path(story, sh), sa.still_key(story, sh)) for sh in story.shots)
-        out["board"] = board if fresh else None
-    else:
-        out["board"] = None
-    out["video"] = every([folder / "shots" / f"{i}.mp4" for i in ids])
-    out["sound"] = every([folder / "sfx" / f"{i}.flac" for i in ids] + [folder / "film" / "sfx.wav"])
-    voices = [folder / "voice" / f"{x['id']}.wav" for x in shots if x.get("narration")]
-    for x in shots:
-        voices += [folder / "voice" / "dialogue" / f"{x['id']}-{n}-{l.get('speaker', '')}.wav"
-                   for n, l in enumerate(x.get("dialogue", []), 1)]
-    out["voices"] = every(voices)
-    music = doc.get("music")
-    if music is None:
-        out["music"] = []
-    elif "take" in music:
-        out["music"] = every([folder / "score" / f"take-s{int(music['take'])}.wav"])
-    else:
-        try:
-            chosen = json.loads((folder / "film" / "checks.json").read_text())["score"]["chosen"]
-            out["music"] = every([Path(chosen)])
-        except (OSError, ValueError, KeyError, TypeError):
-            out["music"] = None
-    out["film"] = every([folder / "film" / f"{_slug(doc.get('title', '')) or 'film'}.mp4"])
+def _scene_outputs(folder: Path, story, shot, keys) -> dict[str, list[Path] | None]:
+    """The files each part of one scene makes; [] for a part with nothing to make, None while it isn't
+    made or is out of date (made from an older picture, line or voice)."""
+    fresh = lambda p, k: k is not None and not keys.stale(p, k)   # noqa: E731
+    out: dict[str, list[Path] | None] = {}
+    still = sa.still_path(story, shot)
+    out["picture"] = [still] if fresh(still, sa.still_key(story, shot)) else None
+    clip = sa.shot_path(story, shot)
+    out["video"] = [clip] if out["picture"] and fresh(clip, sa.shot_key(story, shot)) else None
+    sfx = sa.sfx_path(story, shot)
+    out["sound"] = [] if not shot.sfx.strip() else [sfx] if out["video"] and fresh(sfx, sa.sfx_key(story, shot)) else None
+    lines: list[Path] | None = []
+    if shot.narration and story.narrator:
+        card, wav = folder / "voice" / "card.wav", folder / "voice" / f"{shot.id}.wav"
+        ok = fresh(card, sa.narrator_card_key(story)) and fresh(wav, sa.narration_key(story, shot))
+        lines = lines + [card, wav] if ok else None
+    for n, line in enumerate(shot.dialogue, 1):
+        card = folder / "voice" / "cards" / f"{line.speaker}.wav"
+        wav = folder / "voice" / "dialogue" / f"{shot.id}-{n}-{line.speaker}.wav"
+        if story.dialogue_mode == "scene":
+            ok = wav.exists()
+        else:
+            ok = fresh(card, sa.character_card_key(story, line.speaker)) and fresh(wav, sa.dialogue_key(story, line))
+        lines = lines + [wav] if ok and lines is not None else None
+    out["voices"] = lines
+    made = [*(out["video"] or []), *(out["sound"] or []), *(lines or [])]
+    prev = sa.scene_path(story, shot)
+    ready = out["video"] and out["sound"] is not None and lines is not None
+    out["preview"] = [prev] if ready and prev.exists() and all(prev.stat().st_mtime_ns >= p.stat().st_mtime_ns for p in made) else None
     return out
 
 
@@ -220,25 +217,67 @@ def _approvals_file(folder: Path) -> Path:
     return Path(folder) / ".spike-animate" / "approved.json"
 
 
-def _steps(folder: Path, doc: dict | None, story) -> list[dict]:
-    """Each step: done (its files exist), approved (and nothing it or an earlier step made has changed since),
-    unlocked (every earlier step is approved). An approval covers the files of its step and all before it."""
-    folder = Path(folder)
+def _saved(folder: Path) -> dict:
     try:
-        saved = json.loads(_approvals_file(folder).read_text())
+        return json.loads(_approvals_file(folder).read_text())
     except (OSError, ValueError):
-        saved = {}
-    outs = _outputs(folder, doc or {}, story) if doc is not None else {k: None for k in STAGES}
-    steps, upstream, ok = [], [], True
-    for stage in STAGES:
-        files = outs[stage]
+        return {}
+
+
+def _music_files(folder: Path, doc: dict) -> list[Path] | None:
+    music = doc.get("music")
+    if music is None:
+        return []
+    if "take" in music:
+        f = folder / "score" / f"take-s{int(music['take'])}.wav"
+        return [f] if f.is_file() else None
+    try:
+        chosen = Path(json.loads((folder / "film" / "checks.json").read_text())["score"]["chosen"])
+        return [chosen] if chosen.is_file() else None
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _steps(folder: Path, doc: dict | None, story) -> list[dict]:
+    """Every step in order: done (made and up to date), approved (and unchanged since), unlocked (open to
+    work on), skip (nothing to make: approved by itself once reached)."""
+    folder = Path(folder)
+    saved = _saved(folder)
+    steps = []
+
+    def add(stage, name, files, unlocked, upstream=(), **extra):
         done = files is not None
-        fp = _fingerprint(upstream + files) if done else None
-        approved = ok and done and saved.get(stage) == fp
-        steps.append({"stage": stage, "name": STAGE_NAMES[stage], "done": done, "approved": approved,
-                      "unlocked": ok, "fingerprint": fp})
-        ok = approved
-        upstream += files or []
+        fp = _fingerprint([*upstream, *files]) if done else None
+        skip = files == [] and stage != "story"
+        approved = unlocked and done and (skip or saved.get(stage) == fp)
+        steps.append({"stage": stage, "name": name, "done": done, "approved": approved, "unlocked": unlocked,
+                      "skip": skip, "fingerprint": fp, **extra})
+        return approved
+
+    ok = add("story", "Story", [] if story else None, True)
+    shots = story.shots if story else [{"id": s.get("id", "")} for s in (doc or {}).get("shot", [])]
+    keys = sa.Keys(folder) if story else None
+    all_done, every_file = ok, []
+    prev_complete = ok
+    for i, shot in enumerate(shots):
+        sid = shot.id if story else shot["id"]
+        outs = _scene_outputs(folder, story, shot, keys) if story else {p: None for p in SCENE_PARTS}
+        # a scene opens once the one before it is finished, and stays open once work in it was approved
+        started = any(saved.get(f"scene:{sid}:{p}") for p in SCENE_PARTS)
+        open_ = ok and (prev_complete or started)
+        upstream, part_ok = [], open_
+        for part in SCENE_PARTS:
+            files = outs[part]
+            part_ok = add(f"scene:{sid}:{part}", f"Scene {i + 1} {PART_NAMES[part]}", files, part_ok, upstream,
+                          scene=sid, part=part)
+            upstream += files or []
+        prev_complete = part_ok
+        all_done = all_done and part_ok
+        every_file += upstream
+    music = _music_files(folder, doc) if doc is not None else None
+    music_ok = add("music", "Music", music, all_done)
+    film = folder / "film" / f"{_slug((doc or {}).get('title', '')) or 'film'}.mp4"
+    add("film", "Final film", [film] if film.is_file() else None, music_ok, every_file + (music or []))
     return steps
 
 
@@ -252,14 +291,10 @@ def _load(folder: Path):
 
 
 def approve(folder: Path, stage: str, undo: bool = False) -> list[str]:
-    if stage not in STAGES:
-        return [f"unknown step '{stage}'"]
     steps = {x["stage"]: x for x in _steps(folder, *_load(folder))}
-    f = _approvals_file(folder)
-    try:
-        saved = json.loads(f.read_text())
-    except (OSError, ValueError):
-        saved = {}
+    if stage not in steps:
+        return [f"unknown step '{stage}'"]
+    saved = _saved(folder)
     me = steps[stage]
     if undo:
         saved.pop(stage, None)
@@ -267,21 +302,34 @@ def approve(folder: Path, stage: str, undo: bool = False) -> list[str]:
         before = next(x for x in steps.values() if not x["approved"])
         return [f"approve {before['name']} first"]
     elif not me["done"]:
-        return [f"{me['name']} isn't finished yet"]
+        return [f"{me['name']} isn't made yet"]
     else:
         saved[stage] = me["fingerprint"]
+    f = _approvals_file(folder)
     f.parent.mkdir(parents=True, exist_ok=True)
     f.write_text(json.dumps(saved, indent=1))
     return []
 
 
-def gate(folder: Path, step: str) -> str | None:
-    """Why `step` can't run yet, or None when every step before it is approved."""
-    stage = STEP_STAGE.get(step)
-    if stage is None:
-        return None
+def gate(folder: Path, step: str, params: dict | None = None) -> str | None:
+    """Why `step` can't run yet, or None when what it needs is approved."""
     steps = _steps(folder, *_load(folder))
-    if next(x for x in steps if x["stage"] == stage)["unlocked"]:
+    by = {x["stage"]: x for x in steps}
+    shot = (params or {}).get("shot")
+    if step in STEP_PART and shot:
+        me = by.get(f"scene:{shot}:{STEP_PART[step]}")
+        if me is None:
+            return f"no shot '{shot}' in the story"
+    elif step in ("music", "film"):
+        me = by[step]
+    elif step in STEP_PART:            # a whole-film step: only needs the story
+        me = by["story"] if by["story"]["approved"] else None
+        if me:
+            return None
+        return "approve Story first"
+    else:
+        return None
+    if me["unlocked"]:
         return None
     before = next(x for x in steps if not x["approved"])
     return f"approve {before['name']} first"
@@ -312,6 +360,11 @@ def inside(folder: Path, rel: str) -> Path | None:
 def _url(folder: Path, rel: str) -> str | None:
     p = folder / rel
     return f"{rel}?v={int(p.stat().st_mtime)}" if p.is_file() else None
+
+
+def _heard(wav: Path) -> str | None:
+    f = wav.with_suffix(".heard.txt")
+    return f.read_text().strip() if f.is_file() else None
 
 
 def film_state(folder: Path) -> dict:
@@ -360,6 +413,9 @@ def film_state(folder: Path) -> dict:
             "clip": _url(folder, f"shots/{sid}.mp4"), "sfx": _url(folder, f"sfx/{sid}.flac"),
             "narration_audio": _url(folder, f"voice/{sid}.wav"),
             "dialogue_audio": [_url(folder, str(p.relative_to(folder))) for p in lines],
+            "narration_heard": _heard(folder / "voice" / f"{sid}.wav"),
+            "dialogue_heard": [_heard(p) for p in lines],
+            "preview": _url(folder, f"scenes/{sid}.mp4"), "sfx_text": s.get("sfx", ""),
         })
     voices = {"narrator": _url(folder, "voice/card.wav")} if "narrator" in doc else {}
     for name, c in doc.get("characters", {}).items():
@@ -416,6 +472,11 @@ def step_argv(folder: Path, step: str, params: dict) -> list[str]:
     """The spike-animate arguments for one step, checked: anything odd is a ValueError, never a command."""
     folder = Path(folder)
     story = str(folder / "story.toml")
+    if step in ("board", "video", "sound", "voices", "scene") and (params.get("shot") or step == "scene"):
+        ids = [s.get("id") for s in _doc(folder).get("shot", [])]
+        if params.get("shot") not in ids:
+            raise ValueError(f"no shot '{params.get('shot')}' in the story")
+        return ["scene", story, params["shot"]] if step == "scene" else [step, story, "--shot", params["shot"]]
     if step in ("board", "video", "sound", "voices", "music", "film", "status"):
         return [step, story]
     if step == "retake":
@@ -440,6 +501,7 @@ def step_argv(folder: Path, step: str, params: dict) -> list[str]:
             if pic is None or not pic.is_file() or pic.suffix.lower() not in IMAGE_TYPES:
                 raise ValueError("the style picture must be an uploaded image")
             argv += ["--style-image", str(pic)]
+        argv += [f"--no-{part}" for part in ("narrator", "dialogue", "music") if params.get(part, True) is False]
         return argv
     raise ValueError(f"unknown step '{step}'")
 
@@ -669,7 +731,7 @@ class Handler(BaseHTTPRequestHandler):
                 argv = step_argv(folder, p.get("step", ""), p)
                 if p.get("step") == "new" and (folder / "story.toml").exists():
                     raise Busy("this film already has a story")
-                why = gate(folder, p.get("step", ""))
+                why = gate(folder, p.get("step", ""), p)
                 if why:
                     raise Busy(why)
                 jobs.start(folder, argv)

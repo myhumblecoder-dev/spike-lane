@@ -404,72 +404,153 @@ def stages(folder: Path) -> dict:
     return {s["stage"]: s for s in st.film_state(folder)["steps"]}
 
 
+def make(folder: Path, sid: str, part: str) -> None:
+    """Stand in for spike-animate making one part of one scene, with the keys it would record."""
+    story = sa.load_story(folder / "story.toml")
+    keys = sa.Keys(folder)
+    shot = next(s for s in story.shots if s.id == sid)
+    time.sleep(0.01)
+    if part == "picture":
+        keys.record(fake_still(folder, f"board/{sid}.png", sa.still_prompt(story, shot)), sa.still_key(story, shot))
+    elif part == "video":
+        if shot.reference and not Path(shot.reference.clip).exists():
+            touch(folder, str(Path(shot.reference.clip).relative_to(folder)))
+        touch(folder, f"shots/{sid}.mp4")
+        keys.record(folder / "shots" / f"{sid}.mp4", sa.shot_key(story, shot))
+    elif part == "sound":
+        touch(folder, f"sfx/{sid}.flac")
+        keys.record(sa.sfx_path(story, shot), sa.sfx_key(story, shot))
+    elif part == "voices":
+        if shot.narration:
+            touch(folder, "voice/card.wav", f"voice/{sid}.wav")
+            keys.record(folder / "voice" / "card.wav", sa.narrator_card_key(story))
+            keys.record(folder / "voice" / f"{sid}.wav", sa.narration_key(story, shot))
+        for n, line in enumerate(shot.dialogue, 1):
+            touch(folder, f"voice/cards/{line.speaker}.wav", f"voice/dialogue/{sid}-{n}-{line.speaker}.wav")
+            keys.record(folder / "voice" / "cards" / f"{line.speaker}.wav", sa.character_card_key(story, line.speaker))
+            keys.record(folder / "voice" / "dialogue" / f"{sid}-{n}-{line.speaker}.wav", sa.dialogue_key(story, line))
+    elif part == "preview":
+        touch(folder, f"scenes/{sid}.mp4")
+
+
+def finish(folder: Path, sid: str) -> None:
+    """Make and approve every part of one scene, in order."""
+    for part in st.SCENE_PARTS:
+        s = stages(folder)[f"scene:{sid}:{part}"]
+        if s["skip"]:
+            continue
+        make(folder, sid, part)
+        assert st.approve(folder, f"scene:{sid}:{part}") == [], part
+
+
+IDS = ("01-heap", "02-claim", "03-lunge")
+
+
 def test_only_the_story_is_open_at_first(tmp_path):
     folder = write_story(tmp_path / "bolt").parent
     s = stages(folder)
-    assert list(s) == ["story", "board", "video", "sound", "voices", "music", "film"]
+    assert list(s) == ["story"] + [f"scene:{i}:{p}" for i in IDS for p in st.SCENE_PARTS] + ["music", "film"]
     assert s["story"]["unlocked"] and not s["story"]["approved"]
-    assert not any(s[k]["unlocked"] for k in list(s)[1:])
-    assert st.gate(folder, "board") is not None and st.gate(folder, "film") is not None
+    assert not any(v["unlocked"] for k, v in s.items() if k != "story")
+    assert st.gate(folder, "board", {"shot": "01-heap"}) is not None and st.gate(folder, "film") is not None
 
 
-def test_approving_a_step_unlocks_the_next(tmp_path):
+def test_a_scene_is_made_one_part_at_a_time(tmp_path):
     folder = write_story(tmp_path / "bolt").parent
     assert st.approve(folder, "story") == []
-    assert stages(folder)["board"]["unlocked"] and st.gate(folder, "board") is None
-    assert st.gate(folder, "retake") is None and st.gate(folder, "video") is not None
+    assert st.gate(folder, "board", {"shot": "01-heap"}) is None
+    assert st.gate(folder, "retake", {"shot": "01-heap"}) is None
+    assert st.gate(folder, "video", {"shot": "01-heap"}) is not None          # approve its picture first
+    assert st.gate(folder, "board", {"shot": "02-claim"}) is not None         # finish scene 1 first
+    assert st.approve(folder, "scene:01-heap:picture") != []                   # nothing drawn yet
+    make(folder, "01-heap", "picture")
+    assert st.approve(folder, "scene:01-heap:picture") == []
+    assert st.gate(folder, "video", {"shot": "01-heap"}) is None
+    make(folder, "01-heap", "video")
+    assert st.approve(folder, "scene:01-heap:video") == []
+    s = stages(folder)
+    assert s["scene:01-heap:sound"]["skip"] and s["scene:01-heap:sound"]["approved"]   # no sounds written
+    assert s["scene:01-heap:voices"]["unlocked"] and not s["scene:01-heap:voices"]["skip"]
+    make(folder, "01-heap", "voices")
+    assert st.approve(folder, "scene:01-heap:voices") == []
+    assert st.gate(folder, "scene", {"shot": "01-heap"}) is None
+    make(folder, "01-heap", "preview")
+    assert st.approve(folder, "scene:01-heap:preview") == []
+    assert st.gate(folder, "board", {"shot": "02-claim"}) is None               # on to scene 2
 
 
-def test_a_step_cannot_be_approved_before_it_is_done(tmp_path):
+def test_changing_a_picture_reopens_only_that_scene(tmp_path):
     folder = write_story(tmp_path / "bolt").parent
     st.approve(folder, "story")
-    assert st.approve(folder, "board") != []          # no pictures yet
-    assert st.approve(folder, "video") != []          # locked
-    render_board(folder)
-    assert st.approve(folder, "board") == []
-    assert stages(folder)["video"]["unlocked"]
-
-
-def test_changing_a_picture_withdraws_its_approval_and_everything_after(tmp_path):
-    folder = write_story(tmp_path / "bolt").parent
-    st.approve(folder, "story")
-    render_board(folder)
-    st.approve(folder, "board")
-    for sid in ("01-heap", "02-claim", "03-lunge"):
-        touch(folder, f"shots/{sid}.mp4")
-    assert st.approve(folder, "video") == []
-    assert stages(folder)["sound"]["unlocked"]
+    finish(folder, "01-heap")
+    finish(folder, "02-claim")
     doc = st._doc(folder)
-    doc["shot"][0]["still"] = "close-up of JUNK at night"   # the picture is now out of date
+    doc["shot"][0]["still"] = "close-up of JUNK at night"
     st.save_story(folder, doc=doc)
     s = stages(folder)
-    assert not s["board"]["approved"] and not s["video"]["approved"] and not s["sound"]["unlocked"]
-    render_board(folder)                                     # redrawn: a new picture to look at
-    assert not stages(folder)["board"]["approved"]
-    assert st.approve(folder, "board") == []
-    assert not stages(folder)["video"]["approved"]          # that video was made from the old picture
+    assert not s["scene:01-heap:picture"]["done"]
+    assert not any(s[f"scene:01-heap:{p}"]["approved"] for p in ("picture", "video", "voices", "preview"))
+    assert all(s[f"scene:02-claim:{p}"]["approved"] for p in st.SCENE_PARTS)    # scene 2 is untouched
+    assert s["scene:02-claim:picture"]["unlocked"]                              # and can still be reopened
+    make(folder, "01-heap", "picture")
+    assert st.approve(folder, "scene:01-heap:picture") == []
+    assert not stages(folder)["scene:01-heap:video"]["done"]                     # made from the old picture
 
 
-def test_regenerated_video_needs_a_new_look(tmp_path):
+def test_an_edited_line_must_be_recorded_again(tmp_path):
     folder = write_story(tmp_path / "bolt").parent
     st.approve(folder, "story")
-    render_board(folder)
-    st.approve(folder, "board")
-    for sid in ("01-heap", "02-claim", "03-lunge"):
-        touch(folder, f"shots/{sid}.mp4")
-    st.approve(folder, "video")
-    time.sleep(0.01)
-    (folder / "shots" / "02-claim.mp4").write_bytes(b"a different take")
+    finish(folder, "01-heap")
+    finish(folder, "02-claim")
+    doc = st._doc(folder)
+    doc["shot"][1]["dialogue"][0]["line"] = "Mine! I saw it first!"
+    st.save_story(folder, doc=doc)
     s = stages(folder)
-    assert not s["video"]["approved"] and s["video"]["unlocked"] and not s["sound"]["unlocked"]
+    assert not s["scene:02-claim:voices"]["done"] and not s["scene:02-claim:preview"]["approved"]
+    assert s["scene:02-claim:video"]["approved"] and s["scene:01-heap:voices"]["approved"]
 
 
-def test_steps_with_nothing_to_make_are_done_at_once(tmp_path):
-    silent = STORY.replace('narration = "In the scrap heap, life was quiet."\n', "").replace(
-        'dialogue = [{ speaker = "ZAP", line = "I saw it first! It\'s mine!", emotion = "smug" }]\n', "")
-    folder = write_story(tmp_path / "quiet", silent).parent
-    assert stages(folder)["voices"]["done"]
-    assert not stages(write_story(tmp_path / "talky").parent)["voices"]["done"]
+def test_music_and_the_film_wait_for_every_scene(tmp_path):
+    folder = write_story(tmp_path / "bolt").parent
+    st.approve(folder, "story")
+    finish(folder, "01-heap")
+    finish(folder, "02-claim")
+    assert st.gate(folder, "music") is not None
+    finish(folder, "03-lunge")
+    assert st.gate(folder, "music") is None and st.gate(folder, "film") is not None
+    touch(folder, "score/take-s2.wav")
+    assert st.approve(folder, "music") == []
+    assert st.gate(folder, "film") is None
+
+
+def test_no_music_means_the_music_step_is_skipped(tmp_path):
+    folder = write_story(tmp_path / "bolt", STORY.split("[music]")[0] + "[dialogue]" + STORY.split("[dialogue]")[1]).parent
+    st.approve(folder, "story")
+    for sid in IDS:
+        finish(folder, sid)
+    s = stages(folder)
+    assert s["music"]["skip"] and s["music"]["approved"] and st.gate(folder, "film") is None
+
+
+def test_each_scene_step_becomes_a_spike_animate_command(tmp_path):
+    folder = write_story(tmp_path / "bolt").parent
+    story = str(folder / "story.toml")
+    for step in ("board", "video", "sound", "voices"):
+        assert st.step_argv(folder, step, {"shot": "02-claim"}) == [step, story, "--shot", "02-claim"]
+    assert st.step_argv(folder, "scene", {"shot": "02-claim"}) == ["scene", story, "02-claim"]
+    for bad in [("video", {"shot": "99-nope"}), ("scene", {})]:
+        with pytest.raises(ValueError):
+            st.step_argv(folder, *bad)
+
+
+def test_the_page_shows_what_each_line_was_heard_as_and_the_scene_preview(tmp_path):
+    folder = write_story(tmp_path / "bolt").parent
+    touch(folder, "voice/dialogue/02-claim-1-ZAP.wav", "scenes/02-claim.mp4")
+    (folder / "voice" / "dialogue" / "02-claim-1-ZAP.heard.txt").write_text("I saw it first. It's mine.")
+    (folder / "voice" / "01-heap.heard.txt").write_text("In the scrap heap")
+    s1, s2 = st.film_state(folder)["shots"][:2]
+    assert s2["dialogue_heard"] == ["I saw it first. It's mine."] and s1["narration_heard"] == "In the scrap heap"
+    assert s2["preview"].startswith("scenes/02-claim.mp4")
 
 
 # --- many rounds of pictures --------------------------------------------------------------
@@ -520,10 +601,18 @@ def test_a_film_can_be_made_first_and_written_after(server):
 
 def test_the_api_approves_steps_and_refuses_locked_ones(server):
     srv, films = server
-    status, _, body = call(srv, "POST", "/api/films/bolt/run", {"step": "video"})
+    status, _, body = call(srv, "POST", "/api/films/bolt/run", {"step": "video", "shot": "01-heap"})
     assert status == 409 and "approve" in json.loads(body)["errors"][0].lower()
     status, _, body = call(srv, "POST", "/api/films/bolt/approve", {"stage": "story"})
     assert status == 200 and {s["stage"]: s for s in json.loads(body)["steps"]}["story"]["approved"]
-    assert call(srv, "POST", "/api/films/bolt/approve", {"stage": "board"})[0] == 400
+    assert call(srv, "POST", "/api/films/bolt/approve", {"stage": "scene:01-heap:picture"})[0] == 400
+    assert call(srv, "POST", "/api/films/bolt/approve", {"stage": "scene:99-x:picture"})[0] == 400
     assert call(srv, "POST", "/api/films/bolt/approve", {"stage": "story", "undo": True})[0] == 200
     assert not stages(films / "bolt")["story"]["approved"]
+
+
+def test_a_new_film_can_leave_out_the_narrator_dialogue_and_music(tmp_path):
+    folder = tmp_path / "pip"
+    argv = st.step_argv(folder, "new", {"idea": "Pip paints.", "shots": 4, "narrator": False, "dialogue": False, "music": False})
+    assert argv[-3:] == ["--no-narrator", "--no-dialogue", "--no-music"]
+    assert "--no-narrator" not in st.step_argv(folder, "new", {"idea": "Pip paints.", "shots": 4})

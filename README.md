@@ -48,6 +48,7 @@ ln -sf ~/spike-lane/bin/spike-animate ~/.local/bin/spike-animate
 cd ~/Movies/spike-video/my-film
 spike-animate new my-film "an idea, or the whole story"   # local gemma4 drafts my-film/story.toml (~1 min)
 #   --notes "names, looks, setting"   --style-image ref.png (gemma4 reads its style into look/still_style)
+#   --no-narrator  --no-dialogue  --no-music   (leave those parts out of the film)
 spike-animate board story.toml                    # stills + board/contact-sheet.jpg, then stop
 spike-animate retake story.toml 06-pounce --seeds 7,42,99   # alternates; keep one with `seed = N`
 spike-animate video story.toml                    # one step at a time: shots (no sound) → film/picture.mp4
@@ -56,6 +57,8 @@ spike-animate voices story.toml                   #   narration + dialogue, chec
 spike-animate music story.toml                    #   score takes, best one chosen
 spike-animate film story.toml                     # whatever is left, then mix → film/<title>.mp4 + film/review/
 spike-animate status story.toml
+# or one scene at a time: board|video|sound|voices --shot 03-reveal, then
+spike-animate scene story.toml 03-reveal          # preview: that clip + its own sound and lines → scenes/03-reveal.mp4
 ```
 
 | Step | Engine | Per 8-shot film | Peak memory |
@@ -101,16 +104,20 @@ Every line is checked with speech-to-text (`film/checks.json` → `dialogue`).
 A web UI over spike-animate, made for an iPhone. A film starts from your story (one line or the whole thing,
 dialogue kept word for word), optional reference notes and an optional style picture. Then it goes step by step,
 and each step must be approved before the next one unlocks:
-1. **Story:** edit it as a form or as raw TOML.
-2. **Pictures:** draw the stills; edit a description and redraw it, or get three more versions of a shot as often as you like; **Use** swaps one in instantly.
-3. **Video:** each shot animated, no sound; edit a motion or switch Calm/Action and regenerate only what changed.
-4. **Sound:** each shot's effects, played against its clip; edit and regenerate.
-5. **Voices:** voice cards, then every narration and dialogue line with its speech check; edit a line and record again.
-6. **Music:** listen to the ranked takes and pick one.
-7. **Film:** the mix and its checks.
+1. **Story:** edit it as a form or as raw TOML. A new film can leave out the narrator, dialogue or music.
+2. **Scenes, one at a time and in order.** Each scene has five parts, each approved before the next opens:
+   **Picture** (draw, redraw, three more versions, Use) → **Motion** (animate; edit the motion, Calm/Action) →
+   **Sound** (effects against the clip) → **Lines** (narration and dialogue for this scene only, with what
+   speech-to-text heard; add, edit, remove, record) → **Preview** (the clip with its own sound and lines at the
+   film's loudness). Parts with nothing to make are skipped. Changing a scene reopens that scene from the
+   changed part on and leaves every other scene alone.
+3. **Music:** once all scenes are finished; listen to the ranked takes and pick one.
+4. **Film:** the mix and its checks, plus a Loudness card: sound effects, music and voices each have a level (default 20 / 20 / 50%, where 100% is the old -16 LUFS mix), saved as `[mix] sound = 20, music = 20, voices = 50` in story.toml. Changing them re-mixes in seconds.
 
-An approval covers the files of its step and every step before it (`.spike-animate/approved.json`): if a
-picture is redrawn after the video was approved, the video's approval, and everything after it, lapses.
+An approval is a fingerprint of that part's files and the earlier parts of the same scene
+(`.spike-animate/approved.json`). A part only counts as made when it matches the story now: edit a line and
+its recording is out of date until you record it again; redraw a picture and that scene's motion, sound,
+lines and preview need a new look. The final film covers every scene and the music.
 
 A real wildlife clip can be uploaded and attached to a shot for real motion.
 

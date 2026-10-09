@@ -17,6 +17,7 @@ from __future__ import annotations
 import difflib
 import hashlib
 import json
+import math
 import re
 import tomllib
 from dataclasses import dataclass, field
@@ -92,6 +93,14 @@ class Music:
 
 
 @dataclass
+class Levels:
+    """How loud each layer plays in the final film, in percent of the old normalized mix."""
+    sound: float = 20
+    music: float = 20
+    voices: float = 50
+
+
+@dataclass
 class Story:
     path: Path
     title: str
@@ -106,6 +115,7 @@ class Story:
     sfx_db: float = -4.0
     voices: dict[str, CharVoice] = field(default_factory=dict)
     dialogue_mode: str = "clone"
+    levels: Levels = field(default_factory=Levels)
 
     @property
     def root(self) -> Path:
@@ -186,7 +196,10 @@ def load_story(path: Path) -> Story:
     if mode not in DIALOGUE_MODES:
         raise StoryError(f"[dialogue] mode must be one of {', '.join(DIALOGUE_MODES)}, not '{mode}'")
     sound = d.get("sound", {})
-    return Story(path=path, title=_need(d, "title", "the story"), seed=seed, look=_need(d, "look", "the story"),
+    lv = {k: float(v) for k, v in d.get("mix", {}).items() if k in ("sound", "music", "voices")}
+    if any(v < 0 for v in lv.values()):
+        raise StoryError("[mix] levels are percentages and cannot be negative")
+    return Story(levels=Levels(**lv), path=path, title=_need(d, "title", "the story"), seed=seed, look=_need(d, "look", "the story"),
                  still_style=_need(d, "still_style", "the story"), characters=characters,
                  shots=shots, narrator=narrator, music=music, voices=voices, dialogue_mode=mode,
                  sfx_negative=sound.get("negative", Story.sfx_negative), sfx_db=float(sound.get("db", -4.0)))
@@ -331,21 +344,33 @@ def words_match(expected: str, heard: str) -> float:
 
 # --- mixing -----------------------------------------------------------------
 
-def mix_filtergraph(narration_ms: list[int], total: float, sfx_db: float, music_db: float) -> str:
+def _pct_db(pct: float) -> float:
+    return 20 * math.log10(pct / 100) if pct > 0 else -120.0
+
+
+def mix_filtergraph(narration_ms: list[int], total: float, sfx_db: float, music_db: float,
+                    levels: Levels | None = None, master_db: float = 0.0) -> str:
     """ffmpeg graph for the final mix. Inputs: 0 picture, 1 sound effects, 2 music,
-    3.. one narration line each, delayed to its start. Music and effects duck under the voice."""
+    3.. one narration line each, delayed to its start. Music and effects duck under the voice.
+    Without levels it is the plain mix normalized to -16 LUFS (also used to measure master_db,
+    the gain that normalization applies). With levels, every layer gets master_db plus its own
+    share, and only a limiter follows, so turning a layer down really makes it quieter."""
     fmt = "aresample=48000,aformat=channel_layouts=stereo"
+    sfx_db, music_db = (sfx_db, music_db) if levels is None else \
+        (round(sfx_db + master_db + _pct_db(levels.sound), 4), round(music_db + master_db + _pct_db(levels.music), 4))
     g = (f"[1:a]{fmt},volume={sfx_db:g}dB[sfx];"
          f"[2:a]{fmt},volume={music_db:g}dB,apad,atrim=0:{total:g}[mus];"
          "[sfx][mus]amix=inputs=2:normalize=0[bed];")
-    master = "loudnorm=I=-16:TP=-1.5,aresample=48000[out]"
+    master = ("loudnorm=I=-16:TP=-1.5" if levels is None else "alimiter=limit=0.84:level=0") + ",aresample=48000[out]"
     if not narration_ms:
         return g + f"[bed]{master}"
     lines = "".join(f"[{3 + i}:a]{fmt},adelay={ms}:all=1[n{i}];" for i, ms in enumerate(narration_ms))
     names = "".join(f"[n{i}]" for i in range(len(narration_ms)))
-    return (g + lines + f"{names}amix=inputs={len(narration_ms)}:normalize=0,apad,atrim=0:{total:g},asplit[nar][key];"
-            "[bed][key]sidechaincompress=threshold=0.02:ratio=9:attack=20:release=450[duck];"
-            f"[duck][nar]amix=inputs=2:normalize=0,{master}")
+    g += lines + (f"{names}amix=inputs={len(narration_ms)}:normalize=0,apad,atrim=0:{total:g},asplit[nar][key];"
+                  "[bed][key]sidechaincompress=threshold=0.02:ratio=9:attack=20:release=450[duck];")
+    if levels is not None:   # the ducking key stays at full level, so ducking works as before
+        g += f"[nar]volume={round(master_db + _pct_db(levels.voices), 4):g}dB[narv];"
+    return g + f"[duck][{'nar' if levels is None else 'narv'}]amix=inputs=2:normalize=0,{master}"
 
 
 # --- engines ----------------------------------------------------------------
@@ -454,17 +479,20 @@ def check_stills(story: Story, paths: dict[str, Path]) -> list[str]:
             if png_prompt(p) != still_prompt(story, next(s for s in story.shots if s.id == sid))]
 
 
-def cmd_board(story: Story) -> int:
+def cmd_board(story: Story, shot_id: str | None = None) -> int:
     keys = Keys(story.root)
-    for shot in story.shots:
+    shots = _scene(story, shot_id)
+    if shots is None:
+        return 2
+    for shot in shots:
         out, k = still_path(story, shot), still_key(story, shot)
         if keys.stale(out, k):
             _say(f"still {shot.id} …")
             render_still(still_prompt(story, shot), shot.seed, out)
             keys.record(out, k)
-    bad = check_stills(story, {s.id: still_path(story, s) for s in story.shots})
+    bad = check_stills(story, {s.id: still_path(story, s) for s in shots})
     sheet = story.root / "board" / "contact-sheet.jpg"
-    contact_sheet([still_path(story, s) for s in story.shots], sheet)
+    contact_sheet([still_path(story, s) for s in story.shots if still_path(story, s).exists()], sheet)
     if bad:
         for sid in bad:
             print(f"✗ {sid}: the still's stored prompt doesn't match the story (lost prompt?); "
@@ -499,14 +527,22 @@ def shot_path(story: Story, shot: Shot, suffix: str = "") -> Path:
     return story.root / "shots" / f"{shot.id}{suffix}.mp4"
 
 
+def shot_key(story: Story, shot: Shot) -> str | None:
+    """What a shot's clip is made from (None while its still is missing)."""
+    still, ref = still_path(story, shot), shot.reference
+    if not still.exists() or (ref and not Path(ref.clip).exists()):
+        return None
+    parts = ["shot", file_digest(still), motion_prompt(story, shot), shot.anchor, shot.seed, shot.colormatch]
+    if ref:
+        parts += [file_digest(ref.clip), ref.start, ref.sigma, ref.first_strength]
+    return key_for(*parts)
+
+
 def animate_shot(story: Story, shot: Shot, keys: Keys) -> bool:
     """Render one shot if its inputs changed. Returns True when it re-rendered."""
     still, out, raw = still_path(story, shot), shot_path(story, shot), shot_path(story, shot, "-raw")
     ref = shot.reference
-    parts = ["shot", file_digest(still), motion_prompt(story, shot), shot.anchor, shot.seed, shot.colormatch]
-    if ref:
-        parts += [file_digest(ref.clip), ref.start, ref.sigma, ref.first_strength]
-    k = key_for(*parts)
+    k = shot_key(story, shot)
     if not keys.stale(out, k):
         return False
     _say(f"shot {shot.id} …")
@@ -557,9 +593,18 @@ def build_picture(story: Story, keys: Keys) -> Path:
     return out
 
 
+def sfx_path(story: Story, shot: Shot) -> Path:
+    return story.root / "sfx" / f"{shot.id}.flac"
+
+
+def sfx_key(story: Story, shot: Shot) -> str | None:
+    clip = shot_path(story, shot)
+    return key_for("sfx", file_digest(clip), shot.sfx, story.sfx_negative) if clip.exists() else None
+
+
 def sound_shot(story: Story, shot: Shot, keys: Keys) -> Path:
-    clip, out = shot_path(story, shot), story.root / "sfx" / f"{shot.id}.flac"
-    k = key_for("sfx", file_digest(clip), shot.sfx, story.sfx_negative)
+    clip, out = shot_path(story, shot), sfx_path(story, shot)
+    k = sfx_key(story, shot)
     if keys.stale(out, k):
         _say(f"effects {shot.id} …")
         heavy("sfx", [_venv("MMAUDIO_HOME", "MMAudio"), "demo.py", "--video", clip, "--duration", f"{shot_seconds():.6f}",
@@ -607,16 +652,37 @@ def heard(audio: Path, keys: Keys) -> str:
     return txt.read_text().strip()
 
 
-def narrate(story: Story, keys: Keys, checks: dict) -> list[tuple[Path, float]]:
-    """Design the narrator's voice once, clone it for every line, and check each line is intelligible."""
-    offsets = narration_offsets(story)
+def narrator_card_key(story: Story) -> str:
+    return key_for("card", story.narrator.voice, story.narrator.sample)
+
+
+def narration_key(story: Story, shot: Shot) -> str | None:
+    card = story.root / "voice" / "card.wav"
+    return key_for("line", file_digest(card), story.narrator.sample, shot.narration) if card.exists() else None
+
+
+def character_card_key(story: Story, name: str) -> str:
+    v = story.voices[name]
+    return key_for("card", v.voice, v.sample)
+
+
+def dialogue_key(story: Story, line) -> str | None:
+    """A cloned dialogue line's key (clone mode); None while the speaker has no voice yet."""
+    card = story.root / "voice" / "cards" / f"{line.speaker}.wav"
+    return key_for("dline", file_digest(card), story.voices[line.speaker].sample, line.line) if card.exists() else None
+
+
+def narrate(story: Story, keys: Keys, checks: dict, only: set[str] | None = None) -> list[tuple[Path, float]]:
+    """Design the narrator's voice once, clone it for every line, and check each line is intelligible.
+    `only` limits it to those shots (one scene at a time)."""
+    offsets = [(sid, at) for sid, at in narration_offsets(story) if only is None or sid in only]
     if not offsets:
         return []
     vdir = story.root / "voice"
     vdir.mkdir(exist_ok=True)
     n = story.narrator
     card = vdir / "card.wav"
-    k = key_for("card", n.voice, n.sample)
+    k = narrator_card_key(story)
     if keys.stale(card, k):
         _say("narrator voice …")
         tts(TTS_DESIGN, n.sample, card, ["--instruct", n.voice])
@@ -625,7 +691,7 @@ def narrate(story: Story, keys: Keys, checks: dict) -> list[tuple[Path, float]]:
     for sid, at in offsets:
         shot = next(s for s in story.shots if s.id == sid)
         out = vdir / f"{sid}.wav"
-        k = key_for("line", file_digest(card), n.sample, shot.narration)
+        k = narration_key(story, shot)
         if keys.stale(out, k):
             _say(f"narration {sid} …")
             tts(TTS_CLONE, shot.narration, out, ["--ref_audio", card, "--ref_text", n.sample])
@@ -635,14 +701,14 @@ def narrate(story: Story, keys: Keys, checks: dict) -> list[tuple[Path, float]]:
     return lines
 
 
-def voice_cards(story: Story, keys: Keys) -> dict[str, Path]:
+def voice_cards(story: Story, keys: Keys, only: set[str] | None = None) -> dict[str, Path]:
     """One designed voice per speaking character, made once and reused for every line."""
     cdir = story.root / "voice" / "cards"
     cdir.mkdir(parents=True, exist_ok=True)
     cards = {}
-    for name in dict.fromkeys(l.speaker for _, l in dialogue_lines(story)):
+    for name in dict.fromkeys(l.speaker for sid, l in dialogue_lines(story) if only is None or sid in only):
         v, card = story.voices[name], cdir / f"{name}.wav"
-        k = key_for("card", v.voice, v.sample)
+        k = character_card_key(story, name)
         if keys.stale(card, k):
             _say(f"voice for {name} …")
             tts(TTS_DESIGN, v.sample, card, ["--instruct", v.voice])
@@ -659,12 +725,15 @@ def _silences(audio: Path) -> list[tuple[float, float]]:
     return list(zip(starts, ends))
 
 
-def speak_dialogue(story: Story, keys: Keys, checks: dict) -> list[tuple[Path, float]]:
-    """Voice every dialogue line, check it is intelligible, and place it in its shot."""
+def speak_dialogue(story: Story, keys: Keys, checks: dict, only: set[str] | None = None) -> list[tuple[Path, float]]:
+    """Voice every dialogue line, check it is intelligible, and place it in its shot.
+    `only` limits it to those shots (one scene at a time; scene mode still performs them together)."""
     said = dialogue_lines(story)
+    if only is not None and story.dialogue_mode != "scene":
+        said = [(sid, l) for sid, l in said if sid in only]
     if not said:
         return []
-    cards = voice_cards(story, keys)
+    cards = voice_cards(story, keys, None if story.dialogue_mode == "scene" else only)
     ddir = story.root / "voice" / "dialogue"
     ddir.mkdir(parents=True, exist_ok=True)
     count: dict[str, int] = {}
@@ -690,7 +759,7 @@ def speak_dialogue(story: Story, keys: Keys, checks: dict) -> list[tuple[Path, f
                 keys.record(o, k)
     else:
         for sid, l, o in outs:
-            k = key_for("dline", file_digest(cards[l.speaker]), story.voices[l.speaker].sample, l.line)
+            k = dialogue_key(story, l)
             if keys.stale(o, k):
                 _say(f"dialogue {o.stem} …")
                 tts(TTS_CLONE, l.line, o, ["--ref_audio", cards[l.speaker], "--ref_text", story.voices[l.speaker].sample])
@@ -748,19 +817,33 @@ def score(story: Story, keys: Keys, checks: dict, total: float) -> Path | None:
     return chosen
 
 
+def mix_gain(ins: list, starts: list[int], total: float, sfx_db: float, music_db: float) -> float:
+    """The gain (dB) that normalizing the plain mix to -16 LUFS would apply: 100% on every layer
+    then sounds exactly as loud as films did before levels existed."""
+    g = mix_filtergraph(starts, total, sfx_db, music_db).replace("loudnorm=I=-16:TP=-1.5", "loudnorm=I=-16:TP=-1.5:print_format=json")
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", *map(str, ins), "-filter_complex", g, "-map", "[out]",
+                        "-f", "null", "-"], capture_output=True, text=True)
+    m = re.search(r'"input_i"\s*:\s*"(-?[\d.]+|-inf)"', r.stderr)
+    if r.returncode != 0 or not m:
+        raise StageError(f"could not measure the mix: {r.stderr.strip()[-400:]}")
+    return 0.0 if m[1] == "-inf" else round(-16 - float(m[1]), 2)
+
+
 def mix(story: Story, keys: Keys, picture: Path, soundtrack: Path, music: Path | None,
         lines: list[tuple[Path, float]], total: float) -> Path:
     out = story.root / "film" / f"{story.slug}.mp4"
     mdb = story.music.db if story.music else 0
+    lv = story.levels
     k = key_for("mix", file_digest(picture), file_digest(soundtrack), music and file_digest(music),
-                [(file_digest(p), at) for p, at in lines], story.sfx_db, mdb)
+                [(file_digest(p), at) for p, at in lines], story.sfx_db, mdb, lv.sound, lv.music, lv.voices)
     if keys.stale(out, k):
         _say("mix …")
         music_in = ["-i", music] if music else ["-f", "lavfi", "-t", f"{total:.3f}", "-i", "anullsrc=r=48000:cl=stereo"]
         ins = ["-i", picture, "-i", soundtrack, *music_in]
         for p, _ in lines:
             ins += ["-i", p]
-        g = mix_filtergraph([round(at * 1000) for _, at in lines], round(total, 4), story.sfx_db, mdb)
+        starts, total = [round(at * 1000) for _, at in lines], round(total, 4)
+        g = mix_filtergraph(starts, total, story.sfx_db, mdb, lv, mix_gain(ins, starts, total, story.sfx_db, mdb))
         ffmpeg(*ins, "-filter_complex", g, "-map", "0:v", "-map", "[out]", "-c:v", "copy", "-c:a", "aac",
                "-b:a", "192k", "-shortest", "-movflags", "+faststart", out)
         keys.record(out, k)
@@ -812,15 +895,17 @@ def _stills_ready(story: Story, keys: Keys) -> bool:
     return not missing
 
 
-def save_checks(story: Story, part: dict) -> None:
-    """Merge one step's checks into film/checks.json, so steps can run one at a time."""
+def save_checks(story: Story, part: dict, merge: bool = False) -> None:
+    """Merge one step's checks into film/checks.json, so steps can run one at a time. With merge,
+    per-shot tables are updated entry by entry (one scene's results keep the other scenes')."""
     f = story.root / "film" / "checks.json"
     f.parent.mkdir(parents=True, exist_ok=True)
     try:
         checks = json.loads(f.read_text())
     except (OSError, ValueError):
         checks = {}
-    checks.update(part)
+    for k, v in part.items():
+        checks[k] = {**checks.get(k, {}), **v} if merge and isinstance(v, dict) else v
     f.write_text(json.dumps(checks, indent=1))
 
 
@@ -830,8 +915,28 @@ def film_seconds(story: Story) -> float:
     return media_seconds(picture) if picture.exists() else len(story.shots) * shot_seconds()
 
 
-def cmd_video(story: Story) -> int:
+def _scene(story: Story, shot_id: str | None) -> list[Shot] | None:
+    """The shots a step works on: one scene, or all of them. None (after saying why) for an unknown id."""
+    if shot_id is None:
+        return story.shots
+    shot = next((s for s in story.shots if s.id == shot_id), None)
+    if shot is None:
+        print(f"no shot '{shot_id}' in the story", file=sys.stderr)
+    return [shot] if shot else None
+
+
+def cmd_video(story: Story, shot_id: str | None = None) -> int:
     keys = Keys(story.root)
+    shots = _scene(story, shot_id)
+    if shots is None:
+        return 2
+    if shot_id:
+        if keys.stale(still_path(story, shots[0]), still_key(story, shots[0])):
+            print(f"no still for {shot_id} yet: run `spike-animate board --shot {shot_id}` first", file=sys.stderr)
+            return 2
+        animate_shot(story, shots[0], keys)
+        _say(f"Video: {shot_path(story, shots[0])}")
+        return 0
     if not _stills_ready(story, keys):
         return 2
     for shot in story.shots:
@@ -841,21 +946,31 @@ def cmd_video(story: Story) -> int:
     return 0
 
 
-def cmd_sound(story: Story) -> int:
+def cmd_sound(story: Story, shot_id: str | None = None) -> int:
     keys = Keys(story.root)
-    missing = [s.id for s in story.shots if not shot_path(story, s).exists()]
+    shots = _scene(story, shot_id)
+    if shots is None:
+        return 2
+    missing = [s.id for s in shots if not shot_path(story, s).exists()]
     if missing:
         print(f"no video yet for {', '.join(missing)}: run `spike-animate video` first", file=sys.stderr)
         return 2
+    if shot_id:
+        _say(f"Sound effects: {sound_shot(story, shots[0], keys)}")
+        return 0
     out = build_soundtrack(story, [sound_shot(story, s, keys) for s in story.shots], keys)
     _say(f"Sound effects: {out}")
     return 0
 
 
-def cmd_voices(story: Story) -> int:
+def cmd_voices(story: Story, shot_id: str | None = None) -> int:
     keys, checks = Keys(story.root), {}
-    lines = narrate(story, keys, checks) + speak_dialogue(story, keys, checks)
-    save_checks(story, checks)
+    shots = _scene(story, shot_id)
+    if shots is None:
+        return 2
+    only = {shot_id} if shot_id else None
+    lines = narrate(story, keys, checks, only) + speak_dialogue(story, keys, checks, only)
+    save_checks(story, checks, merge=only is not None)
     _say(f"Voices: {len(lines)} line(s) recorded")
     return 0
 
@@ -865,6 +980,54 @@ def cmd_music(story: Story) -> int:
     chosen = score(story, keys, checks, film_seconds(story))
     save_checks(story, checks)
     _say(f"Music: {chosen}" if chosen else "Music: the story has no [music]")
+    return 0
+
+
+def scene_path(story: Story, shot: Shot) -> Path:
+    return story.root / "scenes" / f"{shot.id}.mp4"
+
+
+def scene_lines(story: Story, shot: Shot, keys: Keys) -> list[tuple[Path, float]]:
+    """This scene's narration and dialogue, each with its start time inside the shot."""
+    checks: dict = {}
+    start = story.shots.index(shot) * shot_seconds()
+    lines = narrate(story, keys, checks, {shot.id}) + speak_dialogue(story, keys, checks, {shot.id})
+    return [(p, round(at - start, 3)) for p, at in lines if p.stem.startswith(shot.id)]
+
+
+def cmd_scene(story: Story, shot_id: str) -> int:
+    """Preview one scene: its clip with its own sound effects and lines, at the film's levels (no music)."""
+    keys = Keys(story.root)
+    shots = _scene(story, shot_id)
+    if shots is None:
+        return 2
+    shot = shots[0]
+    clip = shot_path(story, shot)
+    if not clip.exists():
+        print(f"no video for {shot.id} yet: run `spike-animate video --shot {shot.id}` first", file=sys.stderr)
+        return 2
+    sfx = story.root / "sfx" / f"{shot.id}.flac"
+    lines = scene_lines(story, shot, keys)
+    out, L = scene_path(story, shot), shot_seconds()
+    lv = story.levels
+    k = key_for("scene", file_digest(clip), sfx.exists() and file_digest(sfx), [(file_digest(p), at) for p, at in lines],
+                story.sfx_db, lv.sound, lv.voices)
+    if keys.stale(out, k):
+        out.parent.mkdir(parents=True, exist_ok=True)
+        bed = out.with_name(f".{shot.id}-sfx.wav")   # normalized like the film's soundtrack
+        src = ["-i", sfx] if sfx.exists() else ["-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono"]
+        ffmpeg(*src, "-af", f"apad,atrim=0:{L:.6f}" + (",loudnorm=I=-16:TP=-1.5" if sfx.exists() else ""),
+               "-ar", 44100, "-c:a", "pcm_s16le", bed)
+        ins = ["-i", clip, "-i", bed, "-f", "lavfi", "-t", f"{L:.3f}", "-i", "anullsrc=r=48000:cl=stereo"]
+        for p, _ in lines:
+            ins += ["-i", p]
+        starts = [max(0, round(at * 1000)) for _, at in lines]
+        g = mix_filtergraph(starts, round(L, 4), story.sfx_db, 0, lv, mix_gain(ins, starts, round(L, 4), story.sfx_db, 0))
+        ffmpeg(*ins, "-filter_complex", g, "-map", "0:v", "-map", "[out]", "-c:v", "copy", "-c:a", "aac",
+               "-b:a", "192k", "-t", f"{L:.6f}", "-movflags", "+faststart", out)
+        bed.unlink(missing_ok=True)
+        keys.record(out, k)
+    _say(f"Scene: {out}")
     return 0
 
 
@@ -943,6 +1106,26 @@ DRAFT_SCHEMA = {
     },
 }
 
+@dataclass
+class Parts:
+    """Which optional parts the author wants in the film."""
+    narrator: bool = True
+    dialogue: bool = True
+    music: bool = True
+
+
+def draft_schema(parts: Parts = Parts()) -> dict:
+    """DRAFT_SCHEMA without the parts the author left out."""
+    s = json.loads(json.dumps(DRAFT_SCHEMA))
+    for name, on in (("narrator", parts.narrator), ("music", parts.music)):
+        if not on:
+            s["required"].remove(name)
+            del s["properties"][name]
+    if not parts.dialogue:
+        s["properties"]["characters"]["items"]["required"].remove("voice")
+    return s
+
+
 MAX_NARRATION_WORDS = 12   # ~3.5 s of unhurried narration: fits inside a 5 s shot with its lead-in
 MAX_DIALOGUE_WORDS = 12    # all the dialogue in one shot, for the same reason
 
@@ -968,7 +1151,7 @@ WRITER_EXAMPLE = {
               "key": "D minor"},
     "shots": [
         {"id": "01-establish", "still": "wide shot of FOX walking through a snowy pine forest at dawn, soft pink sky",
-         "motion": "static camera, a slender red fox walks steadily through the snowy pine forest at dawn",
+         "motion": "static camera, a slender red fox walks steadily through the snowy pine forest at dawn, mouth closed",
          "sfx": "soft paw footsteps crunching in snow, quiet winter wind", "narration":
          "Deep in the winter woods, the fox was hungry.", "intensity": 0.15, "action": False, "dialogue": []},
         {"id": "02-reveal", "still": "point-of-view shot through snowy branches of RAB nibbling grass, unaware",
@@ -988,8 +1171,31 @@ WRITER_EXAMPLE = {
 }
 
 
+# The writer's rules for the optional parts, used when the author wants that part.
+NARRATION_RULE = '- "narration" is optional and at most {max_words} words; leave it "" on action shots. Narrate about half\n  the shots at most. The narrator speaks over the film.\n'
+DIALOGUE_RULE = '- Characters may talk if the idea calls for it. Give every character who speaks a "voice": how they sound\n  (pitch, pace, texture, personality), e.g. "small, bright, chirpy robot voice, fast and excitable"; leave\n  "voice" "" for characters who never speak. Put spoken lines in a shot\'s "dialogue" list as\n  {{"speaker": NAME, "line": ..., "emotion": ...}}. Keep one speaker per shot and cut between speakers\n  (shot / reverse shot); at most {max_words} words of speech per shot, counting narration and dialogue\n  together (the narrator speaks first, then the character). Frame talking shots as medium shots or over the shoulder and say "talking" in the motion.\n  Reaction shots of the listener, with no dialogue, make conversations read well. Use "dialogue": [] otherwise.\n'
+MUSIC_RULE = '- "music" describes an instrumental score that follows the intensity arc; "structure" is 3-6 section tags\n  like "[Intro - ...]" separated by blank lines; "key" like "D minor" or "C major".\n'
+
+
+def _example(parts: Parts) -> dict:
+    ex = json.loads(json.dumps(WRITER_EXAMPLE))
+    for name, on in (("narrator", parts.narrator), ("music", parts.music)):
+        if not on:
+            del ex[name]
+    for s in ex["shots"]:
+        if not parts.narrator:
+            s["narration"] = ""
+        if not parts.dialogue:
+            s["dialogue"] = []
+            s["motion"] = s["motion"].replace("grins and talks quietly", "grins silently, mouth closed")
+    if not parts.dialogue:
+        for c in ex["characters"]:
+            c["voice"] = ""
+    return ex
+
+
 def writer_prompt(idea: str, shots: int, problems: list[str] | None = None, previous: dict | None = None,
-                  notes: str = "", style: str = "") -> str:
+                  notes: str = "", style: str = "", parts: Parts = Parts()) -> str:
     ref = f"\nREFERENCE NOTES from the author (follow them: names, looks, setting, tone, events):\n{notes.strip()}\n" if notes.strip() else ""
     if style.strip():
         ref += (f"\nVISUAL STYLE, read from the author's reference picture:\n{style.strip()}\n"
@@ -999,6 +1205,12 @@ def writer_prompt(idea: str, shots: int, problems: list[str] | None = None, prev
     else:
         looks = ('- "look" starts with "2D cartoon animation," then the palette and setting. "still_style" starts with\n'
                  '  "2D cartoon animation still, bold black outlines, flat vibrant colors," then the setting.')
+    narration_rule = (NARRATION_RULE.format(max_words=MAX_NARRATION_WORDS) if parts.narrator else
+                      '- There is no narrator: leave every "narration" "".\n')
+    dialogue_rule = (DIALOGUE_RULE.format(max_words=MAX_DIALOGUE_WORDS) if parts.dialogue else
+                     '- No one speaks in this film: every character\'s "voice" is "" and every "dialogue" is []. Tell the\n'
+                     '  story through what we see and hear.\n')
+    music_rule = MUSIC_RULE if parts.music else '- There is no score: leave out "music".\n'
     p = f"""You are the story artist for a short 2D cartoon. Turn the idea below into a shot list of exactly {shots} shots.
 
 IDEA: {idea}
@@ -1015,24 +1227,17 @@ How the film is made, so write for it:
   In every still, write the UPPERCASE name, never re-describe the character.
 - "motion" says what moves during the 5 seconds, in plain words without the UPPERCASE names; start calm shots
   with "static camera,". Set "action": true only for fast, violent or acrobatic shots.
+  The motion moves only what the still shows: never bring in a prop, person or action the still doesn't
+  contain (the video model draws whatever the words suggest, so "as she reads" grows a book; write "her eyes
+  follow the laptop screen"). A character who doesn't speak in the shot keeps their mouth closed: add
+  "mouth closed" to the motion, or the video model animates their lips.
 - "sfx" lists the sounds of that shot (no music, no speech).
-- "narration" is optional and at most {MAX_NARRATION_WORDS} words; leave it "" on action shots. Narrate about half
-  the shots at most. The narrator speaks over the film.
-- Characters may talk if the idea calls for it. Give every character who speaks a "voice": how they sound
-  (pitch, pace, texture, personality), e.g. "small, bright, chirpy robot voice, fast and excitable"; leave
-  "voice" "" for characters who never speak. Put spoken lines in a shot's "dialogue" list as
-  {{"speaker": NAME, "line": ..., "emotion": ...}}. Keep one speaker per shot and cut between speakers
-  (shot / reverse shot); at most {MAX_DIALOGUE_WORDS} words of speech per shot, counting narration and dialogue
-  together (the narrator speaks first, then the character). Frame talking shots as medium shots or over the shoulder and say "talking" in the motion.
-  Reaction shots of the listener, with no dialogue, make conversations read well. Use "dialogue": [] otherwise.
-- "intensity" is the story's energy in that shot, from 0 (calm) to 1 (peak). Build to one peak near the end.
+{narration_rule}{dialogue_rule}- "intensity" is the story's energy in that shot, from 0 (calm) to 1 (peak). Build to one peak near the end.
 {looks}
-- "music" describes an instrumental score that follows the intensity arc; "structure" is 3-6 section tags
-  like "[Intro - ...]" separated by blank lines; "key" like "D minor" or "C major".
-- Shot ids look like 01-name, 02-name, ... in order.
+{music_rule}- Shot ids look like 01-name, 02-name, ... in order.
 
 Example of the format and the level of detail (a different film, 4 shots; FOX talks, RAB does not):
-{json.dumps(WRITER_EXAMPLE, indent=1)}
+{json.dumps(_example(parts), indent=1)}
 
 Write the story for the IDEA as one JSON object in the same format, with exactly {shots} shots."""
     if problems:
@@ -1047,9 +1252,14 @@ def _ngrams(words: list[str], n: int) -> set[tuple[str, ...]]:
     return {tuple(words[i:i + n]) for i in range(len(words) - n + 1)}
 
 
-def lint_draft(d: dict, shots: int) -> list[str]:
+def lint_draft(d: dict, shots: int, parts: Parts = Parts()) -> list[str]:
     """Story rules a draft must follow; each problem says which shot and how to fix it."""
     problems = []
+    for s in d.get("shots", []):
+        if not parts.narrator and s.get("narration", "").strip():
+            problems.append(f"shot {s.get('id', '?')} has narration but this film has no narrator; leave \"narration\" empty")
+        if not parts.dialogue and s.get("dialogue"):
+            problems.append(f"shot {s.get('id', '?')} has dialogue but no one speaks in this film; leave \"dialogue\" empty")
     got = d.get("shots", [])
     if len(got) != shots:
         problems.append(f"the story needs exactly {shots} shots, it has {len(got)}")
@@ -1109,10 +1319,13 @@ def draft_to_toml(d: dict, idea: str, notes: str = "", style_image: str = "", st
     for c in d["characters"]:
         if c.get("voice"):
             out += ["", f"[characters.{c['name']}]", f"look = {q(c['description'])}", f"voice = {q(c['voice'])}"]
-    n, m = d["narrator"], d["music"]
-    out += ["", "[narrator]", f"voice = {q(n['voice'])}", f"sample = {q(n['sample'])}", "lead = 0.5",
-            "", "[music]", f"caption = {q(m['caption'])}", f"key = {q(m['key'])}", "takes = 8", "db = -10",
-            f"structure = {q(m['structure'])}"]
+    if d.get("narrator") and any(s.get("narration") for s in d["shots"]):
+        n = d["narrator"]
+        out += ["", "[narrator]", f"voice = {q(n['voice'])}", f"sample = {q(n['sample'])}", "lead = 0.5"]
+    if d.get("music"):
+        m = d["music"]
+        out += ["", "[music]", f"caption = {q(m['caption'])}", f"key = {q(m['key'])}", "takes = 8", "db = -10",
+                f"structure = {q(m['structure'])}"]
     for s in d["shots"]:
         out += ["", "[[shot]]", f"id = {q(s['id'])}", f"still = {q(s['still'])}", f"motion = {q(s['motion'])}"]
         if s.get("action"):
@@ -1165,7 +1378,7 @@ def describe_style(image: Path, model: str) -> str:
 
 
 def cmd_new(folder: Path, idea: str, shots: int, model: str, attempts: int = 3, notes: str = "",
-            style_image: Path | None = None) -> int:
+            style_image: Path | None = None, parts: Parts = Parts()) -> int:
     import spike_lane
     story_file = folder / "story.toml"
     if story_file.exists():
@@ -1181,8 +1394,8 @@ def cmd_new(folder: Path, idea: str, shots: int, model: str, attempts: int = 3, 
         problems, d = None, None
         for attempt in range(1, attempts + 1):
             d = ollama_generate(writer_prompt(idea, shots, problems, previous=d if problems else None, notes=notes,
-                                              style=style), model)
-            problems = lint_draft(d, shots)
+                                              style=style, parts=parts), model, draft_schema(parts))
+            problems = lint_draft(d, shots, parts)
             if not problems:
                 break
             _say(f"draft {attempt} broke {len(problems)} rule(s); asking for a fix …")
@@ -1216,7 +1429,13 @@ def main(argv: list[str]) -> int:
                            ("music", "score the film"),
                            ("film", "do whatever is left of the steps above, then mix the film"),
                            ("status", "show what is done")]:
-        sub.add_parser(name, help=helptext).add_argument("story", type=Path)
+        sp = sub.add_parser(name, help=helptext)
+        sp.add_argument("story", type=Path)
+        if name in ("board", "video", "sound", "voices"):
+            sp.add_argument("--shot", help="work on this one scene only")
+    sc = sub.add_parser("scene", help="preview one scene: its clip with its own sound and lines")
+    sc.add_argument("story", type=Path)
+    sc.add_argument("shot")
     nw = sub.add_parser("new", help="draft story.toml for a new film from a one-line idea (local model)")
     nw.add_argument("folder", type=Path)
     nw.add_argument("idea")
@@ -1224,6 +1443,9 @@ def main(argv: list[str]) -> int:
     nw.add_argument("--notes", default="", help="reference material for the writer: names, looks, setting, tone")
     nw.add_argument("--style-image", type=Path, help="a picture whose style the film should copy")
     nw.add_argument("--model", default=os.environ.get("SPIKE_WRITER_MODEL", "gemma4:26b"))
+    nw.add_argument("--no-narrator", action="store_true", help="no narrator: the story is told by picture and dialogue")
+    nw.add_argument("--no-dialogue", action="store_true", help="the characters never speak")
+    nw.add_argument("--no-music", action="store_true", help="no score")
     rt = sub.add_parser("retake", help="render alternate seeds for one shot's still")
     rt.add_argument("story", type=Path)
     rt.add_argument("shot")
@@ -1231,13 +1453,18 @@ def main(argv: list[str]) -> int:
     a = ap.parse_args(argv)
     try:
         if a.cmd == "new":
-            return cmd_new(a.folder, a.idea, a.shots, a.model, notes=a.notes, style_image=a.style_image)
+            return cmd_new(a.folder, a.idea, a.shots, a.model, notes=a.notes, style_image=a.style_image,
+                           parts=Parts(narrator=not a.no_narrator, dialogue=not a.no_dialogue, music=not a.no_music))
         story = load_story(a.story)
         if a.cmd == "board":
-            return cmd_board(story)
+            return cmd_board(story, a.shot)
+        if a.cmd == "scene":
+            return cmd_scene(story, a.shot)
         if a.cmd == "retake":
             return cmd_retake(story, a.shot, [int(s) for s in a.seeds.split(",") if s.strip()])
-        steps = {"film": cmd_film, "video": cmd_video, "sound": cmd_sound, "voices": cmd_voices, "music": cmd_music}
+        if a.cmd in ("video", "sound", "voices"):
+            return {"video": cmd_video, "sound": cmd_sound, "voices": cmd_voices}[a.cmd](story, a.shot)
+        steps = {"film": cmd_film, "music": cmd_music}
         if a.cmd in steps:
             return steps[a.cmd](story)
         return cmd_status(story)

@@ -208,3 +208,26 @@ def test_mix_graph_ducks_the_bed_under_the_narrator():
 def test_mix_graph_without_narration_is_just_the_bed():
     g = sa.mix_filtergraph(narration_ms=[], total=10.0, sfx_db=-4, music_db=-10)
     assert "sidechaincompress" not in g and "[3:a]" not in g and g.endswith("[out]")
+
+
+def test_mix_levels_default_to_quiet_beds_and_half_voices(story, tmp_path):
+    assert (story.levels.sound, story.levels.music, story.levels.voices) == (20, 20, 50)
+    s = sa.load_story(write_story(tmp_path, 'title="x"\nlook="l"\nstill_style="s"\n'
+                                  '[mix]\nsound = 35\nvoices = 80\n[[shot]]\nid="01-a"\nstill="s"\nmotion="m"\n'))
+    assert (s.levels.sound, s.levels.music, s.levels.voices) == (35, 20, 80)
+    with pytest.raises(sa.StoryError, match="mix"):
+        sa.load_story(write_story(tmp_path, 'title="x"\nlook="l"\nstill_style="s"\n'
+                                  '[mix]\nmusic = -5\n[[shot]]\nid="01-a"\nstill="s"\nmotion="m"\n'))
+
+
+def test_mix_graph_sets_each_layer_to_its_level_without_renormalizing():
+    # master_db brings the old mix to its old loudness; each level is a share of that.
+    g = sa.mix_filtergraph(narration_ms=[500], total=10.0, sfx_db=-4, music_db=-10,
+                           levels=sa.Levels(sound=20, music=20, voices=50), master_db=3)
+    assert "volume=-14.9794dB" in g          # -4 + 3 + 20·log10(0.20)
+    assert "volume=-20.9794dB" in g          # -10 + 3 + 20·log10(0.20)
+    assert "[nar]volume=-3.0206dB" in g      # 3 + 20·log10(0.50), after the ducking key is split off
+    assert "loudnorm" not in g and "alimiter" in g and g.endswith("[out]")
+    bed = sa.mix_filtergraph(narration_ms=[], total=10.0, sfx_db=-4, music_db=-10,
+                             levels=sa.Levels(sound=20, music=20, voices=50), master_db=3)
+    assert "loudnorm" not in bed and "alimiter" in bed and "sidechaincompress" not in bed

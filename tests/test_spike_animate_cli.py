@@ -470,3 +470,93 @@ def test_after_every_step_the_film_only_mixes(env):
     assert not _tools(log) & {"wan22_i2v.py", "demo.py", "mlx_audio.tts.generate", "score_gen.py",
                               "mflux-generate-z-image-turbo"}
     assert (film / "film" / "fox-hunt.mp4").exists()
+
+
+def loudness(path):
+    err = subprocess.run([FFMPEG, "-hide_banner", "-i", str(path), "-map", "0:a", "-af", "ebur128", "-f", "null", "-"],
+                         capture_output=True, text=True).stderr
+    return float(err.rsplit("I:", 1)[1].split("LUFS")[0])
+
+
+def test_the_mix_turns_each_layer_down_to_its_level(env):
+    film, _, _ = env
+    story = film / "story.toml"
+    full = story.read_text().replace("[[shot]]", "[mix]\nsound = 100\nmusic = 100\nvoices = 100\n\n[[shot]]", 1)
+    story.write_text(full)
+    assert run(env, "board", "story.toml").returncode == 0
+    r = run(env, "film", "story.toml")
+    assert r.returncode == 0, r.stdout + r.stderr
+    loud = loudness(film / "film" / "fox-hunt.mp4")
+    assert loud == pytest.approx(-16, abs=1.5)              # 100% everywhere = the old normalized mix
+
+    story.write_text(STORY)                                  # defaults: sound 20, music 20, voices 50
+    r = run(env, "film", "story.toml")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert loudness(film / "film" / "fox-hunt.mp4") < loud - 6
+
+
+# --- one scene at a time -------------------------------------------------------
+
+def test_board_can_draw_one_scene(env):
+    film, _, log = env
+    r = run(env, "board", "story.toml", "--shot", "02-pounce")
+    assert r.returncode == 0, r.stdout + r.stderr
+    drawn = [made(c["args"]) for c in calls(log, "mflux-generate-z-image-turbo")]
+    assert drawn == [film / "board" / "02-pounce.png"]
+
+
+def test_video_sound_and_voices_can_make_one_scene(env):
+    film, _, log = env
+    assert run(env, "board", "story.toml").returncode == 0
+    log.unlink()
+    r = run(env, "video", "story.toml", "--shot", "01-walk")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _tools(log) == {"wan22_i2v.py", "colormatch.py"}             # animate, then match the still's colours
+    assert len([c for c in calls(log, "python") if c["args"][0].endswith("wan22_i2v.py")]) == 1
+    assert (film / "shots" / "01-walk.mp4").exists() and not (film / "shots" / "02-pounce.mp4").exists()
+    assert not (film / "film" / "picture.mp4").exists()            # the whole picture waits for the end
+
+    log.unlink()
+    r = run(env, "sound", "story.toml", "--shot", "01-walk")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert [flag(c["args"], "--prompt") for c in calls(log, "python")] == ["paws in snow"]
+
+    log.unlink()
+    r = run(env, "voices", "story.toml", "--shot", "01-walk")
+    assert r.returncode == 0, r.stdout + r.stderr
+    said = [flag(c["args"], "--text") for c in calls(log, "mlx_audio.tts.generate")]
+    assert said == ["Deep in the winter woods.", "The fox was hungry."]   # narrator's voice, then the line
+    checks = json.loads((film / "film" / "checks.json").read_text())
+    assert set(checks["narration"]) == {"01-walk"}
+
+
+def test_one_scenes_voices_keep_the_other_scenes_checks(env):
+    film, _, _ = env
+    talk = talking(env)
+    assert run(env, "voices", "story.toml").returncode == 0
+    before = json.loads((film / "film" / "checks.json").read_text())
+    assert set(before["dialogue"]) == {"01-hello-1", "02-reply-1", "02-reply-2"}
+    r = run(talk, "voices", "story.toml", "--shot", "01-hello")
+    assert r.returncode == 0, r.stdout + r.stderr
+    after = json.loads((film / "film" / "checks.json").read_text())
+    assert after["dialogue"] == before["dialogue"]
+
+
+def test_scene_preview_is_one_shot_with_its_own_sound(env):
+    film, _, log = env
+    assert run(env, "scene", "story.toml", "01-walk").returncode == 2          # needs its video first
+    assert run(env, "board", "story.toml", "--shot", "01-walk").returncode == 0
+    for step in ("video", "sound", "voices"):
+        assert run(env, step, "story.toml", "--shot", "01-walk").returncode == 0, step
+    log.unlink()
+    r = run(env, "scene", "story.toml", "01-walk")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not _tools(log) & {"wan22_i2v.py", "demo.py", "mlx_audio.tts.generate", "score_gen.py"}
+    out = film / "scenes" / "01-walk.mp4"
+    assert duration(out) == pytest.approx(121 / 24, abs=0.06)
+    assert loudness(out) > -40                                                  # it has sound
+
+
+def test_unknown_scene_is_refused(env):
+    r = run(env, "video", "story.toml", "--shot", "99-nope")
+    assert r.returncode == 2 and "no shot '99-nope'" in r.stderr
