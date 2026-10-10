@@ -5,6 +5,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -404,6 +405,19 @@ def stages(folder: Path) -> dict:
     return {s["stage"]: s for s in st.film_state(folder)["steps"]}
 
 
+def open_scenes(folder: Path) -> None:
+    """Approve the story, draw and approve every look and every voice, so the scenes open."""
+    assert st.approve(folder, "story") == []
+    story = sa.load_story(folder / "story.toml")
+    for name in sa.look_names(story):
+        draw_look(folder, name)
+        assert st.approve(folder, f"look:{name}") == []
+    for name in sa.voice_names(story):
+        design(folder, name, 1)
+        assert st.use_voice(folder, name, 1) == []
+        assert st.approve(folder, f"voice:{name}") == []
+
+
 def make(folder: Path, sid: str, part: str) -> None:
     """Stand in for spike-animate making one part of one scene, with the keys it would record."""
     story = sa.load_story(folder / "story.toml")
@@ -422,11 +436,15 @@ def make(folder: Path, sid: str, part: str) -> None:
         keys.record(sa.sfx_path(story, shot), sa.sfx_key(story, shot))
     elif part == "voices":
         if shot.narration:
-            touch(folder, "voice/card.wav", f"voice/{sid}.wav")
+            if not (folder / "voice" / "card.wav").exists():
+                touch(folder, "voice/card.wav")
+            touch(folder, f"voice/{sid}.wav")
             keys.record(folder / "voice" / "card.wav", sa.narrator_card_key(story))
             keys.record(folder / "voice" / f"{sid}.wav", sa.narration_key(story, shot))
         for n, line in enumerate(shot.dialogue, 1):
-            touch(folder, f"voice/cards/{line.speaker}.wav", f"voice/dialogue/{sid}-{n}-{line.speaker}.wav")
+            if not (folder / "voice" / "cards" / f"{line.speaker}.wav").exists():   # the voice chosen in the Look step
+                touch(folder, f"voice/cards/{line.speaker}.wav")
+            touch(folder, f"voice/dialogue/{sid}-{n}-{line.speaker}.wav")
             keys.record(folder / "voice" / "cards" / f"{line.speaker}.wav", sa.character_card_key(story, line.speaker))
             keys.record(folder / "voice" / "dialogue" / f"{sid}-{n}-{line.speaker}.wav", sa.dialogue_key(story, line))
     elif part == "preview":
@@ -449,7 +467,8 @@ IDS = ("01-heap", "02-claim", "03-lunge")
 def test_only_the_story_is_open_at_first(tmp_path):
     folder = write_story(tmp_path / "bolt").parent
     s = stages(folder)
-    assert list(s) == ["story"] + [f"scene:{i}:{p}" for i in IDS for p in st.SCENE_PARTS] + ["music", "film"]
+    assert list(s) == ["story", "look:JUNK", "look:ZAP", "look:CLANK", "voice:narrator", "voice:ZAP", "voice:CLANK"] + \
+        [f"scene:{i}:{p}" for i in IDS for p in st.SCENE_PARTS] + ["music", "film"]
     assert s["story"]["unlocked"] and not s["story"]["approved"]
     assert not any(v["unlocked"] for k, v in s.items() if k != "story")
     assert st.gate(folder, "board", {"shot": "01-heap"}) is not None and st.gate(folder, "film") is not None
@@ -457,7 +476,7 @@ def test_only_the_story_is_open_at_first(tmp_path):
 
 def test_a_scene_is_made_one_part_at_a_time(tmp_path):
     folder = write_story(tmp_path / "bolt").parent
-    assert st.approve(folder, "story") == []
+    open_scenes(folder)
     assert st.gate(folder, "board", {"shot": "01-heap"}) is None
     assert st.gate(folder, "retake", {"shot": "01-heap"}) is None
     assert st.gate(folder, "video", {"shot": "01-heap"}) is not None          # approve its picture first
@@ -481,7 +500,7 @@ def test_a_scene_is_made_one_part_at_a_time(tmp_path):
 
 def test_changing_a_picture_reopens_only_that_scene(tmp_path):
     folder = write_story(tmp_path / "bolt").parent
-    st.approve(folder, "story")
+    open_scenes(folder)
     finish(folder, "01-heap")
     finish(folder, "02-claim")
     doc = st._doc(folder)
@@ -499,7 +518,7 @@ def test_changing_a_picture_reopens_only_that_scene(tmp_path):
 
 def test_an_edited_line_must_be_recorded_again(tmp_path):
     folder = write_story(tmp_path / "bolt").parent
-    st.approve(folder, "story")
+    open_scenes(folder)
     finish(folder, "01-heap")
     finish(folder, "02-claim")
     doc = st._doc(folder)
@@ -512,7 +531,7 @@ def test_an_edited_line_must_be_recorded_again(tmp_path):
 
 def test_music_and_the_film_wait_for_every_scene(tmp_path):
     folder = write_story(tmp_path / "bolt").parent
-    st.approve(folder, "story")
+    open_scenes(folder)
     finish(folder, "01-heap")
     finish(folder, "02-claim")
     assert st.gate(folder, "music") is not None
@@ -525,7 +544,7 @@ def test_music_and_the_film_wait_for_every_scene(tmp_path):
 
 def test_no_music_means_the_music_step_is_skipped(tmp_path):
     folder = write_story(tmp_path / "bolt", STORY.split("[music]")[0] + "[dialogue]" + STORY.split("[dialogue]")[1]).parent
-    st.approve(folder, "story")
+    open_scenes(folder)
     for sid in IDS:
         finish(folder, sid)
     s = stages(folder)
@@ -644,7 +663,7 @@ def test_animate_again_asks_for_a_new_take(tmp_path):
 
 def test_an_earlier_take_can_be_used_again_at_once(tmp_path):
     folder = write_story(tmp_path / "bolt").parent
-    st.approve(folder, "story")
+    open_scenes(folder)
     make(folder, "01-heap", "picture")
     take(folder, "01-heap", 1024, b"first take")
     take(folder, "01-heap", 555, b"second take")
@@ -674,7 +693,7 @@ def test_takes_of_an_old_picture_are_not_offered(tmp_path):
 def test_the_api_starts_a_new_take(server):
     srv, films = server
     folder = films / "bolt"
-    st.approve(folder, "story")
+    open_scenes(folder)
     make(folder, "01-heap", "picture")
     st.approve(folder, "scene:01-heap:picture")
     status, _, _ = call(srv, "POST", "/api/films/bolt/run", {"step": "video", "shot": "01-heap", "new_take": True})
@@ -690,3 +709,316 @@ def test_a_shot_made_before_takes_existed_is_kept_when_animating_again(tmp_path)
     sa.Keys(folder).record(folder / "shots" / "01-heap.mp4", sa.shot_key(story, story.shots[0]))
     assert st.new_take(folder, "01-heap") == []
     assert (folder / "shots" / "takes" / "01-heap-m1024.mp4").read_bytes() == b"the old shot"
+
+
+# --- the film bible -------------------------------------------------------------------------
+
+def test_the_page_shows_whether_a_picture_keeps_the_film_bible(tmp_path):
+    folder = write_story(tmp_path / "bolt", STORY.replace("seed = 1024\n", 'seed = 1024\nlighting = "sunset, orange light"\n', 1)).parent
+    make(folder, "02-claim", "picture")
+    story = sa.load_story(folder / "story.toml")
+    shot = story.shots[1]
+    assert st.film_state(folder)["shots"][1]["continuity"] is None          # not checked yet
+    out = sa.check_path(story, shot)
+    out.write_text(json.dumps({"misses": ["ZAP is red, not yellow"]}))
+    sa.Keys(folder).record(out, sa.key_for("check", sa.file_digest(sa.still_path(story, shot)), sa.continuity_prompt(story, shot)))
+    assert st.film_state(folder)["shots"][1]["continuity"] == ["ZAP is red, not yellow"]
+    make(folder, "02-claim", "picture")                                      # a new picture: the old check no longer applies
+    (folder / "board" / "02-claim.png").write_bytes(b"\x89PNG another picture")
+    assert st.film_state(folder)["shots"][1]["continuity"] is None
+    assert st.step_argv(folder, "check", {"shot": "02-claim"}) == ["check", str(folder / "story.toml"), "--shot", "02-claim"]
+
+
+def test_a_film_bible_survives_the_editor(tmp_path):
+    text = STORY.replace("seed = 1024\n", 'seed = 1024\nlighting = "sunset, orange light from the left"\n', 1) + '''
+[places]
+HEAP = "a mountain of rusty scrap under a red sky"
+
+[angles.LOW]
+frame = "low wide shot from the ground"
+seed = 2024
+'''
+    text = text.replace('id = "01-heap"\n', 'id = "01-heap"\nangle = "LOW"\n')
+    doc = tomllib.loads(text)
+    folder = tmp_path / "bolt"
+    folder.mkdir()
+    assert st.save_story(folder, doc=doc) == []
+    assert tomllib.loads((folder / "story.toml").read_text()) == doc
+    story = sa.load_story(folder / "story.toml")
+    assert story.shots[0].seed == 2024 and story.places["HEAP"].startswith("a mountain")
+
+
+# --- deleting a film ------------------------------------------------------------------------
+
+def test_deleting_a_film_moves_it_to_the_trash(tmp_path, monkeypatch):
+    trash = tmp_path / "Trash"
+    trash.mkdir()
+    monkeypatch.setattr(st, "TRASH", trash)
+    folder = write_story(tmp_path / "films" / "bolt").parent
+    touch(folder, "board/01-heap.png", "shots/01-heap.mp4")
+    assert st.trash_film(folder) == []
+    assert not folder.exists() and (trash / "bolt" / "shots" / "01-heap.mp4").exists()
+    again = write_story(tmp_path / "films" / "bolt").parent       # a second film of the same name
+    assert st.trash_film(again) == []
+    assert sorted(p.name for p in trash.iterdir()) == ["bolt", "bolt 2"]
+
+
+def test_the_api_deletes_a_film_but_not_while_it_is_working(server, monkeypatch, tmp_path):
+    srv, films = server
+    trash = tmp_path / "Trash"
+    trash.mkdir()
+    monkeypatch.setattr(st, "TRASH", trash)
+    monkeypatch.setenv("FAKE_SLEEP", "3")
+    st.approve(films / "bolt", "story")
+    assert call(srv, "POST", "/api/films/bolt/run", {"step": "board"})[0] == 202
+    status, _, body = call(srv, "DELETE", "/api/films/bolt")
+    assert status == 409 and "running" in json.loads(body)["errors"][0]
+    call(srv, "POST", "/api/films/bolt/stop")
+    time.sleep(0.5)
+    assert call(srv, "DELETE", "/api/films/bolt")[0] == 200
+    assert not (films / "bolt").exists() and (trash / "bolt").exists()
+    assert call(srv, "GET", "/api/films/bolt")[0] == 404
+
+
+# --- the Look step ----------------------------------------------------------------------------
+
+def draw_look(folder: Path, name: str, seed: int | None = None) -> None:
+    """Stand in for `spike-animate look`: the picture, and the key it records."""
+    story = sa.load_story(folder / "story.toml")
+    keys = sa.Keys(folder)
+    seed = sa.look_seed(story, name) if seed is None else seed
+    take = sa.look_take_path(story, name, seed)
+    fake_still(folder, str(take.relative_to(folder)), f"{name} {seed}")
+    keys.record(take, sa.look_key(story, name, seed))
+    if seed == sa.look_seed(story, name):
+        out = sa.look_path(story, name)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(take.read_bytes())
+        keys.record(out, sa.look_key(story, name))
+
+
+def test_every_character_and_place_has_a_look_to_approve_before_the_scenes(tmp_path):
+    folder = write_story(tmp_path / "bolt", STORY + '\n[places]\nHEAP = "a mountain of rusty scrap"\n').parent
+    s = stages(folder)
+    looks = [k for k in s if k.startswith("look:")]
+    assert looks == ["look:JUNK", "look:ZAP", "look:CLANK", "look:HEAP"]
+    assert list(s).index("look:HEAP") < list(s).index("scene:01-heap:picture")
+    st.approve(folder, "story")
+    assert all(stages(folder)[k]["unlocked"] for k in looks)                 # in any order
+    assert st.gate(folder, "board", {"shot": "01-heap"}) is not None
+    for name in ("JUNK", "ZAP", "CLANK", "HEAP"):
+        assert st.gate(folder, "look", {"name": name}) is None
+        draw_look(folder, name)
+        assert st.approve(folder, f"look:{name}") == []
+    for name in ("narrator", "ZAP", "CLANK"):
+        design(folder, name, 1)
+        st.use_voice(folder, name, 1)
+        assert st.approve(folder, f"voice:{name}") == []
+    assert st.gate(folder, "board", {"shot": "01-heap"}) is None
+    assert st.step_argv(folder, "look", {"name": "ZAP"}) == ["look", str(folder / "story.toml"), "ZAP"]
+    assert st.step_argv(folder, "look", {"name": "ZAP", "seeds": [4, 5]})[-2:] == ["--seeds", "4,5"]
+    with pytest.raises(ValueError):
+        st.step_argv(folder, "look", {"name": "NOPE"})
+
+
+def test_a_new_look_reopens_the_scenes_drawn_from_it(tmp_path):
+    folder = write_story(tmp_path / "bolt").parent
+    open_scenes(folder)
+    finish(folder, "01-heap")
+    finish(folder, "02-claim")
+    draw_look(folder, "ZAP", 99)
+    assert st.use_look(folder, "ZAP", 99) == []
+    assert st._doc(folder)["looks"]["ZAP"] == 99
+    s = stages(folder)
+    assert not s["look:ZAP"]["approved"] and s["look:ZAP"]["done"]
+    assert not s["scene:02-claim:picture"]["done"]                          # ZAP is in it: draw it again
+    assert s["scene:01-heap:picture"]["approved"]                           # JUNK only: untouched
+    assert st.use_look(folder, "ZAP", 12345) != []
+
+
+def test_a_character_can_be_drawn_from_an_uploaded_picture(tmp_path):
+    folder = write_story(tmp_path / "bolt").parent
+    touch(folder, "reference/zap.jpg")                                       # uploads are saved in lower case
+    story = sa.load_story(folder / "story.toml")
+    assert sa.look_reference(story, "ZAP") == folder / "reference" / "zap.jpg"
+    look = next(x for x in st.film_state(folder)["looks"] if x["name"] == "ZAP")
+    assert look["kind"] == "character" and look["reference"].startswith("reference/zap.jpg")
+
+
+# --- voices chosen in the Look step -------------------------------------------------------------
+
+def design(folder: Path, name: str, n: int) -> None:
+    """Stand in for one take of `spike-animate voice`."""
+    story = sa.load_story(folder / "story.toml")
+    take = sa.voice_take_path(story, name, n)
+    touch(folder, str(take.relative_to(folder)))
+    take.write_bytes(f"{name} take {n}".encode())
+    sa.Keys(folder).record(take, sa.card_key(story, name))
+
+
+def test_voices_are_chosen_in_the_look_step(tmp_path):
+    folder = write_story(tmp_path / "bolt").parent
+    s = stages(folder)
+    assert [k for k in s if k.startswith("voice:")] == ["voice:narrator", "voice:ZAP", "voice:CLANK"]
+    st.approve(folder, "story")
+    assert st.gate(folder, "voice", {"name": "ZAP"}) is None
+    assert st.step_argv(folder, "voice", {"name": "ZAP", "takes": 3})[-3:] == ["ZAP", "--takes", "3"]
+    design(folder, "ZAP", 1)
+    design(folder, "ZAP", 2)
+    assert st.use_voice(folder, "ZAP", 2) == []
+    assert (folder / "voice" / "cards" / "ZAP.wav").read_bytes() == b"ZAP take 2"
+    assert stages(folder)["voice:ZAP"]["done"]
+    zap = next(v for v in st.film_state(folder)["voice_looks"] if v["name"] == "ZAP")
+    assert [t["n"] for t in zap["takes"]] == [1, 2] and zap["in_use"] == 2
+    assert st.use_voice(folder, "ZAP", 7) != []
+
+
+def test_scenes_wait_for_the_voices_too(tmp_path):
+    folder = write_story(tmp_path / "bolt").parent
+    st.approve(folder, "story")
+    for name in ("JUNK", "ZAP", "CLANK"):
+        draw_look(folder, name)
+        st.approve(folder, f"look:{name}")
+    assert st.gate(folder, "board", {"shot": "01-heap"}) is not None
+    for name in ("narrator", "ZAP", "CLANK"):
+        design(folder, name, 1)
+        assert st.use_voice(folder, name, 1) == []
+        assert st.approve(folder, f"voice:{name}") == []
+    assert st.gate(folder, "board", {"shot": "01-heap"}) is None
+
+
+# --- adding and removing scenes -----------------------------------------------------------------
+
+def test_a_scene_added_after_another_takes_its_place_in_the_order(tmp_path):
+    folder = write_story(tmp_path / "bolt").parent
+    errors, sid = st.add_scene(folder, after="01-heap", still="BOLT sniffing the ground", motion="static camera, BOLT sniffs")
+    assert errors == []
+    shots = sa.load_story(folder / "story.toml").shots
+    assert [s.id for s in shots] == ["01-heap", sid, "02-claim", "03-lunge"]
+    added = shots[1]
+    assert added.still == "BOLT sniffing the ground" and added.motion == "static camera, BOLT sniffs"
+
+
+def test_a_scene_added_without_a_place_goes_last_and_never_reuses_an_id(tmp_path):
+    folder = write_story(tmp_path / "bolt").parent
+    first = st.add_scene(folder, after=None, still="a wide sky", motion="static camera")[1]
+    second = st.add_scene(folder, after=None, still="a wide sky", motion="static camera")[1]
+    ids = [s.id for s in sa.load_story(folder / "story.toml").shots]
+    assert ids[-2:] == [first, second] and len(set(ids)) == len(ids)
+
+
+def test_a_scene_needs_a_picture_description(tmp_path):
+    folder = write_story(tmp_path / "bolt").parent
+    before = (folder / "story.toml").read_text()
+    errors, sid = st.add_scene(folder, after=None, still="  ", motion="static camera")
+    assert errors and "picture" in errors[0] and sid is None
+    assert (folder / "story.toml").read_text() == before
+
+
+def test_a_new_scene_opens_once_the_one_before_is_finished_and_others_stay_approved(tmp_path):
+    folder = write_story(tmp_path / "bolt").parent
+    open_scenes(folder)
+    finish(folder, "01-heap")
+    finish(folder, "02-claim")
+    sid = st.add_scene(folder, after="01-heap", still="BOLT sniffing the ground", motion="static camera, BOLT sniffs")[1]
+    s = stages(folder)
+    assert s[f"scene:{sid}:picture"]["unlocked"] and not s[f"scene:{sid}:picture"]["approved"]
+    assert all(s[f"scene:{x}:{p}"]["approved"] for x in ("01-heap", "02-claim") for p in st.SCENE_PARTS)
+
+
+def test_removing_a_scene_drops_it_and_its_approvals_and_opens_the_next(tmp_path):
+    folder = write_story(tmp_path / "bolt").parent
+    open_scenes(folder)
+    finish(folder, "01-heap")
+    finish(folder, "02-claim")
+    assert st.remove_scene(folder, "02-claim") == []
+    assert [x.id for x in sa.load_story(folder / "story.toml").shots] == ["01-heap", "03-lunge"]
+    assert not any(k.startswith("scene:02-claim:") for k in st._saved(folder))
+    s = stages(folder)
+    assert s["scene:03-lunge:picture"]["unlocked"]
+    assert all(s[f"scene:01-heap:{p}"]["approved"] for p in st.SCENE_PARTS)
+
+
+def test_the_last_scene_and_unknown_scenes_cannot_be_removed(tmp_path):
+    folder = write_story(tmp_path / "bolt").parent
+    assert "no scene" in st.remove_scene(folder, "99-nope")[0]
+    assert st.remove_scene(folder, "01-heap") == [] and st.remove_scene(folder, "02-claim") == []
+    assert "only scene" in st.remove_scene(folder, "03-lunge")[0]
+    assert [x.id for x in sa.load_story(folder / "story.toml").shots] == ["03-lunge"]
+
+
+def test_the_api_adds_and_removes_scenes_but_not_while_working(server, monkeypatch):
+    srv, films = server
+    status, _, body = call(srv, "POST", "/api/films/bolt/scenes", {"after": "01-heap", "still": "BOLT sniffing", "motion": "static camera"})
+    assert status == 200
+    state = json.loads(body)
+    sid = state["added"]
+    assert [s["id"] for s in state["film"]["shots"]][:2] == ["01-heap", sid]
+    assert call(srv, "POST", "/api/films/bolt/scenes", {"still": "", "motion": "x"})[0] == 400
+    monkeypatch.setenv("FAKE_SLEEP", "3")
+    st.approve(films / "bolt", "story")
+    assert call(srv, "POST", "/api/films/bolt/run", {"step": "board"})[0] == 202
+    assert call(srv, "DELETE", f"/api/films/bolt/scenes/{sid}")[0] == 409
+    call(srv, "POST", "/api/films/bolt/stop")
+    time.sleep(0.5)
+    status, _, body = call(srv, "DELETE", f"/api/films/bolt/scenes/{sid}")
+    assert status == 200 and sid not in [s["id"] for s in json.loads(body)["shots"]]
+
+
+# --- voice pace: a scene's lines come before its motion -----------------------------------------
+
+VOICE_PACED = STORY.replace("seed = 1024\n", 'seed = 1024\npace = "voice"\n', 1)
+
+
+def tone(path: Path, secs: float) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", f"sine=frequency=300:duration={secs}",
+                    "-ac", "1", "-ar", "24000", str(path)], check=True)
+
+
+def speak(folder: Path, sid: str, secs: float = 2.0) -> None:
+    """Record a scene's lines as real audio, so their length can set the shot's."""
+    make(folder, sid, "voices")
+    for wav in [folder / "voice" / f"{sid}.wav", *(folder / "voice" / "dialogue").glob(f"{sid}-*.wav")]:
+        if wav.exists():
+            tone(wav, secs)
+
+
+def test_a_voice_paced_scene_records_its_lines_before_its_motion(tmp_path):
+    fixed = write_story(tmp_path / "fixed").parent
+    assert st.film_state(fixed)["parts"] == list(st.SCENE_PARTS)
+    folder = write_story(tmp_path / "bolt", VOICE_PACED).parent
+    assert st.film_state(folder)["parts"] == ["picture", "voices", "video", "sound", "preview"]
+    open_scenes(folder)
+    make(folder, "01-heap", "picture")
+    assert st.approve(folder, "scene:01-heap:picture") == []
+    s = stages(folder)
+    assert s["scene:01-heap:voices"]["unlocked"] and not s["scene:01-heap:video"]["unlocked"]
+    assert "lines" in (st.gate(folder, "video", {"shot": "01-heap"}) or "")
+    speak(folder, "01-heap")
+    assert st.approve(folder, "scene:01-heap:voices") == []
+    assert stages(folder)["scene:01-heap:video"]["unlocked"]
+    assert st.gate(folder, "video", {"shot": "01-heap"}) is None
+
+
+def test_re_recording_a_line_to_a_new_length_reopens_the_motion(tmp_path):
+    folder = write_story(tmp_path / "bolt", VOICE_PACED).parent
+    open_scenes(folder)
+    make(folder, "01-heap", "picture")
+    assert st.approve(folder, "scene:01-heap:picture") == []
+    speak(folder, "01-heap", 2.0)
+    assert st.approve(folder, "scene:01-heap:voices") == []
+    make(folder, "01-heap", "video")
+    assert st.approve(folder, "scene:01-heap:video") == []
+    tone(folder / "voice" / "01-heap.wav", 3.5)                     # a longer take of the same line
+    s = stages(folder)
+    assert not s["scene:01-heap:voices"]["approved"] and not s["scene:01-heap:video"]["done"]
+
+
+def test_each_scene_shows_how_long_it_lasts(tmp_path):
+    folder = write_story(tmp_path / "bolt", VOICE_PACED).parent
+    assert [s["seconds"] for s in st.film_state(folder)["shots"]] == [None, None, pytest.approx(sa.wan_frames(3.0) / 24)]
+    speak(folder, "01-heap", 2.0)                                       # known once its line is recorded
+    assert st.film_state(folder)["shots"][0]["seconds"] == pytest.approx(sa.wan_frames(0.5 + 2.0 + sa.TAIL) / 24)
+    fixed = write_story(tmp_path / "fixed").parent
+    assert [s["seconds"] for s in st.film_state(fixed)["shots"]] == pytest.approx([121 / 24] * 3)

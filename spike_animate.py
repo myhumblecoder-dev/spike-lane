@@ -5,8 +5,8 @@ records a key (a hash of everything that went into an output) in `.spike-animate
 so re-running a command only re-renders what changed. Heavy steps go through spike-lane.
 
 The rules here were proven on the fox-hunt film (2026-10):
-  * every shot is 121 frames at 24 fps (5.04 s); effects, narration timing and the score's
-    tempo all rely on that, so it is fixed, not configurable;
+  * every shot is 121 frames at 24 fps (5.04 s), unless the story says pace = "voice": then each
+    shot lasts its own lines plus a breath (49-121 frames, a count the video model can make);
   * stills: Z-Image Turbo, characters pasted verbatim from the story + a fixed seed;
   * video: Wan 2.2 5B started from the still (latent frame 0 pinned, light anchoring),
     colour-matched back to the still; or restyled from a real clip with a cartoon first frame;
@@ -24,7 +24,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 SHOT_FRAMES = 121
+MIN_FRAMES = 49                 # the shortest clip a voice-paced shot gets (about 2 s)
 FPS = 24
+TAIL = 0.5                      # voice pace: a breath after a shot's last line before the cut
+SILENT_SECONDS = 3.0            # voice pace: a shot with nothing said
+PACES = ("fixed", "voice")
 STILL_SIZE = (1248, 720)        # storyboard stills (Z-Image)
 FIRST_FRAME_SIZE = (1248, 672)  # cartoon first frame for real-clip shots: the video's 832x448 aspect
 
@@ -55,9 +59,12 @@ class Shot:
     reference: Reference | None = None
     still_style: str = ""        # overrides the film's still style for this shot
     dialogue: list["Line"] = field(default_factory=list)
+    angle: str = ""                  # a named camera angle from [angles]
+    pictures: list[tuple[Path, str]] = field(default_factory=list)   # this scene's own reference pictures + notes
     motion_seed: int | None = None   # the video's seed when it differs from the still's (a new take)
     end: float | None = None         # use the motion only up to here (seconds) ...
     fill: str = "slow"               # ... then "slow" it down to fill the shot, or "hold" its last frame
+    seconds: float | None = None     # voice pace: this shot's own length instead of its lines'
 
     @property
     def video_seed(self) -> int:
@@ -108,6 +115,13 @@ class Levels:
 
 
 @dataclass
+class Angle:
+    """A camera setup shared by shots: the same framing words and the same seed every time."""
+    frame: str
+    seed: int | None = None
+
+
+@dataclass
 class Story:
     path: Path
     title: str
@@ -123,6 +137,16 @@ class Story:
     voices: dict[str, CharVoice] = field(default_factory=dict)
     dialogue_mode: str = "clone"
     levels: Levels = field(default_factory=Levels)
+    lighting: str = ""                                          # the film bible: light in every shot,
+    places: dict[str, str] = field(default_factory=dict)        # places named like characters,
+    angles: dict[str, Angle] = field(default_factory=dict)      # and camera setups shots share
+    look_seeds: dict[str, int] = field(default_factory=dict)    # the version of each character sheet / place picture
+    pace: str = "fixed"                                         # "fixed": 5 s shots; "voice": as long as their lines
+
+    @property
+    def names(self) -> dict[str, str]:
+        """Every NAME a still or motion can use, with the words it stands for."""
+        return {**self.characters, **self.places}
 
     @property
     def root(self) -> Path:
@@ -166,6 +190,13 @@ def load_story(path: Path) -> Story:
             characters[name] = _need(c, "look", f"character {name}")
             if c.get("voice"):
                 voices[name] = CharVoice(voice=c["voice"], sample=c.get("sample", DEFAULT_VOICE_SAMPLE))
+    places = {str(k): str(v) for k, v in d.get("places", {}).items()}
+    for name in places:
+        if name in characters:
+            raise StoryError(f"{name} is both a character and a place; give one of them another name")
+    angles = {}
+    for name, a in d.get("angles", {}).items():
+        angles[name] = Angle(frame=_need(a, "frame", f"angle {name}"), seed=int(a["seed"]) if "seed" in a else None)
     raw_shots = d.get("shot", [])
     if not raw_shots:
         raise StoryError("the story has no shots ([[shot]] tables)")
@@ -181,18 +212,31 @@ def load_story(path: Path) -> Story:
             ref = Reference(clip=(path.parent / _need(r, "clip", f"shot {sid} reference")).resolve(),
                             start=float(r.get("start", 0.0)), sigma=float(r.get("sigma", 0.88)),
                             first_strength=float(r.get("first_strength", 0.4)))
+        angle = s.get("angle", "")
+        if angle and angle not in angles:
+            raise StoryError(f"shot {sid} uses angle '{angle}', which isn't one of the [angles] ({', '.join(angles) or 'none'})")
+        pictures = []
+        for pic in s.get("pictures", []):
+            f = (path.parent / _need(pic, "file", f"shot {sid} picture")).resolve()
+            if not f.is_file():
+                raise StoryError(f"shot {sid}: reference picture {pic['file']} is missing")
+            pictures.append((f, str(pic.get("note", "")).strip() or "a reference for this scene"))
+        shot_seed = int(s["seed"]) if "seed" in s else (angles[angle].seed if angle and angles[angle].seed is not None else seed)
+        secs = float(s["seconds"]) if "seconds" in s else None
+        if secs is not None and not MIN_FRAMES / FPS <= secs <= shot_seconds():
+            raise StoryError(f"shot {sid}: seconds must be between {MIN_FRAMES / FPS:.2f} and {shot_seconds():.2f}")
         end = float(s["end"]) if "end" in s else None
         if end is not None and not 1.0 <= end < shot_seconds():
             raise StoryError(f"shot {sid}: end must be between 1 and {shot_seconds():.2f} seconds")
         if s.get("fill", "slow") not in ("slow", "hold"):
             raise StoryError(f"shot {sid}: fill must be \"slow\" or \"hold\"")
         shots.append(Shot(id=sid, still=_need(s, "still", f"shot {sid}"), motion=_need(s, "motion", f"shot {sid}"),
-                          seed=int(s.get("seed", seed)), anchor=int(s.get("anchor", 1)), sfx=s.get("sfx", ""),
+                          seed=shot_seed, anchor=int(s.get("anchor", 1)), sfx=s.get("sfx", ""),
                           narration=s.get("narration", ""), intensity=float(s.get("intensity", 0.5)),
                           colormatch=bool(s.get("colormatch", ref is None)), reference=ref,
                           still_style=s.get("still_style", ""), dialogue=_lines(s, sid, characters, voices),
                           motion_seed=int(s["motion_seed"]) if "motion_seed" in s else None, end=end,
-                          fill=s.get("fill", "slow")))
+                          fill=s.get("fill", "slow"), angle=angle, pictures=pictures, seconds=secs))
     narrator = None
     if "narrator" in d:
         n = d["narrator"]
@@ -213,7 +257,11 @@ def load_story(path: Path) -> Story:
     lv = {k: float(v) for k, v in d.get("mix", {}).items() if k in ("sound", "music", "voices")}
     if any(v < 0 for v in lv.values()):
         raise StoryError("[mix] levels are percentages and cannot be negative")
-    return Story(levels=Levels(**lv), path=path, title=_need(d, "title", "the story"), seed=seed, look=_need(d, "look", "the story"),
+    look_seeds = {str(k): int(v) for k, v in d.get("looks", {}).items()}
+    pace = d.get("pace", "fixed")
+    if pace not in PACES:
+        raise StoryError(f"pace must be one of {', '.join(PACES)}, not '{pace}'")
+    return Story(pace=pace, levels=Levels(**lv), lighting=d.get("lighting", ""), places=places, angles=angles, look_seeds=look_seeds, path=path, title=_need(d, "title", "the story"), seed=seed, look=_need(d, "look", "the story"),
                  still_style=_need(d, "still_style", "the story"), characters=characters,
                  shots=shots, narrator=narrator, music=music, voices=voices, dialogue_mode=mode,
                  sfx_negative=sound.get("negative", Story.sfx_negative), sfx_db=float(sound.get("db", -4.0)))
@@ -226,16 +274,31 @@ def expand(text: str, characters: dict[str, str]) -> str:
     describes the character with exactly the same words; that is what keeps it consistent."""
     if not characters:
         return text
-    pat = re.compile(r"\b(" + "|".join(map(re.escape, characters)) + r")\b")
-    return pat.sub(lambda m: characters[m.group(1)], text)
+    # "on the TERRACE" with TERRACE = "a seaside terrace" reads "on a seaside terrace", not "on the a ..."
+    pat = re.compile(r"\b(?:(?P<art>the|a|an) )?(?P<name>" + "|".join(map(re.escape, characters)) + r")\b", re.I)
+
+    def sub(m):
+        name = next((n for n in characters if n == m.group("name")), None)
+        if name is None:   # matched case-insensitively only: not a NAME
+            return m.group(0)
+        desc = characters[name]
+        art = m.group("art")
+        if art and not re.match(r"(the|a|an)\b", desc, re.I):
+            return f"{art} {desc}"
+        return desc
+
+    return pat.sub(sub, text)
 
 
 def still_prompt(story: Story, shot: Shot) -> str:
-    return f"{expand(shot.still, story.characters)}, {shot.still_style or story.still_style}"
+    frame = f"{expand(story.angles[shot.angle].frame, story.names)}, " if shot.angle else ""
+    light = f"{story.lighting}, " if story.lighting else ""
+    return f"{frame}{expand(shot.still, story.names)}, {light}{shot.still_style or story.still_style}"
 
 
 def motion_prompt(story: Story, shot: Shot) -> str:
-    return f"{story.look}, {expand(shot.motion, story.characters)}"
+    light = f"{story.lighting}, " if story.lighting else ""
+    return f"{story.look}, {light}{expand(shot.motion, story.names)}"
 
 
 # --- timing -----------------------------------------------------------------
@@ -244,13 +307,65 @@ def shot_seconds() -> float:
     return SHOT_FRAMES / FPS
 
 
+def wan_frames(seconds: float) -> int:
+    """The clip length for `seconds`: frames the video model can make (4n+1), between about 2 and 5 s."""
+    n = math.ceil(round(seconds * FPS, 6))
+    return min(SHOT_FRAMES, max(MIN_FRAMES, n + (-(n - 1)) % 4))
+
+
+def spoken_seconds(story: Story, shot: Shot) -> float | None:
+    """When a shot's last line ends, from its recordings; 0 when nothing is said, None while a line isn't recorded."""
+    end, narr = 0.0, story.root / "voice" / f"{shot.id}.wav"
+    if shot.narration:
+        if not narr.exists():
+            return None
+        end = (story.narrator.lead if story.narrator else 0.0) + media_seconds(narr)
+    if shot.dialogue:
+        wavs = [story.root / "voice" / "dialogue" / f"{shot.id}-{n}-{l.speaker}.wav" for n, l in enumerate(shot.dialogue, 1)]
+        if not all(w.exists() for w in wavs):
+            return None
+        lead = dialogue_lead(media_seconds(narr) if shot.narration else None, story.narrator.lead if story.narrator else 0.0)
+        starts, _ = place_lines(0.0, [media_seconds(w) for w in wavs], lead=lead)
+        end = starts[-1] + media_seconds(wavs[-1])
+    return end
+
+
+def shot_frames(story: Story, shot: Shot) -> int | None:
+    """How many frames the shot lasts; None while a voice-paced shot's lines aren't recorded."""
+    if story.pace != "voice":
+        return SHOT_FRAMES
+    if shot.seconds is not None:
+        return wan_frames(shot.seconds)
+    said = spoken_seconds(story, shot)
+    if said is None:
+        return None
+    return wan_frames(said + TAIL if said else SILENT_SECONDS)
+
+
+def shot_len(story: Story, shot: Shot) -> float:
+    """The shot's length in seconds (5.04 s until a voice-paced shot's lines are recorded)."""
+    return (shot_frames(story, shot) or SHOT_FRAMES) / FPS
+
+
+def shot_starts(story: Story) -> list[float]:
+    starts, t = [], 0.0
+    for s in story.shots:
+        starts.append(t)
+        t += shot_len(story, s)
+    return starts
+
+
+def film_length(story: Story) -> float:
+    return sum(shot_len(story, s) for s in story.shots)
+
+
 def score_bpm(shot_len: float, beats: int = 8) -> int:
     return round(beats * 60 / shot_len)
 
 
 def narration_offsets(story: Story) -> list[tuple[str, float]]:
     lead = story.narrator.lead if story.narrator else 0.0
-    return [(s.id, i * shot_seconds() + lead) for i, s in enumerate(story.shots) if s.narration]
+    return [(s.id, at + lead) for s, at in zip(story.shots, shot_starts(story)) if s.narration]
 
 
 def intensity_arc(story: Story) -> list[float]:
@@ -259,7 +374,7 @@ def intensity_arc(story: Story) -> list[float]:
 
 def hit_time(story: Story) -> float:
     arc = intensity_arc(story)
-    return arc.index(max(arc)) * shot_seconds()
+    return shot_starts(story)[arc.index(max(arc))]
 
 
 def dialogue_lines(story: Story) -> list[tuple[str, Line]]:
@@ -271,14 +386,15 @@ def spoken_text(story: Story) -> str:
     return " ".join(x for s in story.shots for x in ([s.narration] if s.narration else []) + [l.line for l in s.dialogue])
 
 
-def place_lines(shot_start: float, durations: list[float], lead: float = 0.4, gap: float = 0.3) -> tuple[list[float], float]:
+def place_lines(shot_start: float, durations: list[float], lead: float = 0.4, gap: float = 0.3,
+                length: float | None = None) -> tuple[list[float], float]:
     """Start times for a shot's lines, one after another; and how far the last runs past the cut (0 if not)."""
     starts, t = [], shot_start + lead
     for d in durations:
         starts.append(t)
         t += d + gap
     end = (starts[-1] + durations[-1]) if durations else shot_start
-    return starts, max(0.0, end - (shot_start + shot_seconds()))
+    return starts, max(0.0, end - (shot_start + (shot_seconds() if length is None else length)))
 
 
 def dialogue_lead(narration_seconds: float | None, narrator_lead: float, gap: float = 0.3,
@@ -395,6 +511,7 @@ import argparse  # noqa: E402
 import os  # noqa: E402
 import shutil  # noqa: E402
 import subprocess  # noqa: E402
+import time  # noqa: E402
 import sys  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
@@ -427,8 +544,15 @@ def heavy(name: str, cmd: list, log: Path, cwd: Path | None = None) -> None:
     if name in ("image", "video"):
         lane.append("--evict-ollama")
     log.parent.mkdir(parents=True, exist_ok=True)
-    with open(log, "w") as f:
-        rc = subprocess.run([*lane, name, "--", *map(str, cmd)], stdout=f, stderr=subprocess.STDOUT, cwd=cwd).returncode
+    for attempt in (1, 2):
+        with open(log, "w") as f:
+            rc = subprocess.run([*lane, name, "--", *map(str, cmd)], stdout=f, stderr=subprocess.STDOUT, cwd=cwd).returncode
+        # Memory the previous job (or another app) held may not be free yet: wait, then try once more.
+        if rc == 0 or attempt == 2 or "out of memory" not in log.read_text(errors="replace").lower():
+            break
+        pause = float(os.environ.get("SPIKE_OOM_PAUSE", "30"))
+        _say(f"{name} step ran out of memory; trying again in {pause:g} s …")
+        time.sleep(pause)
     if rc != 0:
         tail = log.read_text(errors="replace").strip().splitlines()[-8:]
         raise StageError(f"{name} step failed (exit {rc}); log {log}\n  " + "\n  ".join(tail))
@@ -450,14 +574,20 @@ def media_seconds(path: Path) -> float:
 
 
 def render_still(prompt: str, seed: int, out: Path, size=STILL_SIZE, from_image: Path | None = None,
-                 strength: float | None = None) -> None:
+                 strength: float | None = None, refs: list[Path] | None = None) -> None:
+    """Draw one picture: from the prompt alone (Z-Image), or from reference pictures (FLUX.2 klein edit)."""
     model = os.environ.get("IMAGE_MODEL") or str(Path.home() / "image-models" / "z-image-turbo-mflux-q8")
     # mflux never overwrites: given an existing file it saves NAME_1.png beside it. Render to a fresh
     # name, then move it into place.
     tmp = out.with_name(f".{out.stem}-new{out.suffix}")
     tmp.unlink(missing_ok=True)
-    cmd = ["mflux-generate-z-image-turbo", "--model", model, "--prompt", prompt, "--output", tmp, "--steps", "9",
-           "--seed", seed, "--width", size[0], "--height", size[1]]
+    if refs:
+        cmd = ["mflux-generate-flux2-edit", "--model", os.environ.get("KLEIN_MODEL") or "flux2-klein-4b", "--quantize", "8",
+               "--image-paths", *refs, "--prompt", prompt, "--output", tmp, "--seed", seed,
+               "--width", size[0], "--height", size[1]]
+    else:
+        cmd = ["mflux-generate-z-image-turbo", "--model", model, "--prompt", prompt, "--output", tmp, "--steps", "9",
+               "--seed", seed, "--width", size[0], "--height", size[1]]
     if from_image is not None:
         cmd += ["--image-path", from_image, "--image-strength", strength]
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -483,14 +613,198 @@ def still_path(story: Story, shot: Shot) -> Path:
     return story.root / "board" / f"{shot.id}.png"
 
 
+# --- the Look: one character sheet per character and one picture per place --------------------
+# Drawn and approved before the scenes; every scene picture is then drawn from the ones it shows.
+
+IMAGE_EXTS = (".png", ".jpg", ".jpeg")
+
+
+def look_names(story: Story) -> list[str]:
+    return [*story.characters, *story.places]
+
+
+def look_path(story: Story, name: str) -> Path:
+    return story.root / "looks" / f"{name}.png"
+
+
+def look_take_path(story: Story, name: str, seed: int) -> Path:
+    return story.root / "looks" / "takes" / f"{name}-s{seed}.png"
+
+
+def look_reference(story: Story, name: str) -> Path | None:
+    """A picture the author uploaded for a character (reference/NAME.png or .jpg)."""
+    if name not in story.characters or not (story.root / "reference").is_dir():
+        return None
+    found = [p for p in (story.root / "reference").iterdir()
+             if p.is_file() and p.stem.lower() == name.lower() and p.suffix.lower() in IMAGE_EXTS]
+    return sorted(found)[0] if found else None
+
+
+def look_seed(story: Story, name: str) -> int:
+    return story.look_seeds.get(name, story.seed)
+
+
+def look_prompt(story: Story, name: str) -> str:
+    style = story.still_style
+    if name in story.characters:   # the film's look without its setting, so the sheet has a plain background
+        style = story.look
+    if name in story.places:
+        light = f"{story.lighting}, " if story.lighting else ""
+        return f"wide establishing view of {story.places[name]}, no people, {light}{style}"
+    look = story.characters[name]
+    if look_reference(story, name):
+        return (f"Character sheet of the person in image 1, keeping exactly their face, hair, skin, markings and "
+                f"style. They look like this: {look}. Show them twice side by side: a full body front view and a "
+                f"full body three-quarter view, standing in a relaxed neutral pose, on a plain off-white background. {style}")
+    return (f"character sheet, the same character shown twice side by side: full body front view and full body "
+            f"three-quarter view, standing, neutral pose, plain off-white background, {look}, {style}")
+
+
+def look_key(story: Story, name: str, seed: int | None = None) -> str:
+    ref = look_reference(story, name)
+    return key_for("look", look_prompt(story, name), look_seed(story, name) if seed is None else seed,
+                   file_digest(ref) if ref else None)
+
+
+def draw_look(story: Story, name: str, seed: int, keys: Keys) -> Path:
+    """One version of a character sheet or place picture, kept in looks/takes/."""
+    take, k = look_take_path(story, name, seed), look_key(story, name, seed)
+    if keys.stale(take, k):
+        _say(f"look {name} seed {seed} …")
+        ref = look_reference(story, name)
+        render_still(look_prompt(story, name), seed, take, refs=[ref] if ref else None)
+        keys.record(take, k)
+    return take
+
+
+def cmd_look(story: Story, name: str, seeds: list[int] | None = None) -> int:
+    if name not in look_names(story):
+        print(f"'{name}' is not a character or a place in the story", file=sys.stderr)
+        return 2
+    keys = Keys(story.root)
+    if seeds:
+        for seed in seeds:
+            draw_look(story, name, seed, keys)
+        _say(f"{len(seeds)} version(s) of {name} in looks/takes/; keep one with `{name} = SEED` under [looks]")
+        return 0
+    out, k = look_path(story, name), look_key(story, name)
+    if keys.stale(out, k):
+        take = draw_look(story, name, look_seed(story, name), keys)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(take, out)
+        keys.record(out, k)
+    _say(f"Look: {out}")
+    return 0
+
+
+# --- voices, designed and chosen before any line is recorded -----------------------------------
+
+def voice_names(story: Story) -> list[str]:
+    return (["narrator"] if story.narrator else []) + list(story.voices)
+
+
+def card_path(story: Story, name: str) -> Path:
+    return story.root / "voice" / ("card.wav" if name == "narrator" else f"cards/{name}.wav")
+
+
+def card_key(story: Story, name: str) -> str:
+    return narrator_card_key(story) if name == "narrator" else character_card_key(story, name)
+
+
+def voice_take_path(story: Story, name: str, n: int) -> Path:
+    return story.root / "voice" / "takes" / f"{name}-{n}.wav"
+
+
+def _voice_desc(story: Story, name: str) -> tuple[str, str]:
+    v = story.narrator if name == "narrator" else story.voices[name]
+    return v.voice, v.sample
+
+
+def voice_takes(story: Story, name: str, keys: Keys) -> list[tuple[int, Path]]:
+    """This voice's takes made from its current description and sample line."""
+    found = []
+    for p in (story.root / "voice" / "takes").glob(f"{name}-*.wav"):
+        m = re.fullmatch(rf"{re.escape(name)}-(\d+)\.wav", p.name)
+        if m and keys.keys.get(keys._rel(p)) == card_key(story, name):
+            found.append((int(m.group(1)), p))
+    return sorted(found)
+
+
+def design_voice(story: Story, name: str, keys: Keys) -> Path:
+    """One more take of a voice, kept in voice/takes/ (each run of the voice designer sounds a little different)."""
+    taken = [int(m.group(1)) for p in (story.root / "voice" / "takes").glob(f"{name}-*.wav")
+             if (m := re.fullmatch(rf"{re.escape(name)}-(\d+)\.wav", p.name))]
+    take = voice_take_path(story, name, max(taken, default=0) + 1)
+    take.parent.mkdir(parents=True, exist_ok=True)
+    voice, sample = _voice_desc(story, name)
+    _say(f"voice {name} take {take.stem.rsplit('-', 1)[1]} …")
+    tts(TTS_DESIGN, sample, take, ["--instruct", voice])
+    keys.record(take, card_key(story, name))
+    return take
+
+
+def cmd_voice(story: Story, name: str, takes: int | None = None) -> int:
+    if name not in voice_names(story):
+        print(f"'{name}' has no voice in the story (the narrator, or a character with a voice)", file=sys.stderr)
+        return 2
+    keys = Keys(story.root)
+    card = card_path(story, name)
+    if not voice_takes(story, name, keys) and not keys.stale(card, card_key(story, name)):
+        take = voice_take_path(story, name, 1)   # the voice in use before takes existed: keep it as take 1
+        take.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(card, take)
+        keys.record(take, card_key(story, name))
+    if takes:
+        for _ in range(takes):
+            design_voice(story, name, keys)
+        _say(f"{takes} more take(s) of {name}'s voice in voice/takes/")
+        return 0
+    if keys.stale(card, card_key(story, name)):
+        take = design_voice(story, name, keys)
+        card.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(take, card)
+        keys.record(card, card_key(story, name))
+    _say(f"Voice: {card}")
+    return 0
+
+
+def scene_refs(story: Story, shot: Shot) -> list[tuple[str, Path]]:
+    """The looks a scene's picture is drawn from: its characters, then its places (those drawn)."""
+    text = shot.still + (" " + story.angles[shot.angle].frame if shot.angle else "")
+    names = [n for n in story.characters if re.search(rf"\b{re.escape(n)}\b", text)]
+    names += [n for n in story.places if re.search(rf"\b{re.escape(n)}\b", text)]
+    return [(n, look_path(story, n)) for n in names if look_path(story, n).is_file()]
+
+
+def render_prompt(story: Story, shot: Shot) -> tuple[str, list[Path]]:
+    """What a scene's picture is drawn from: the prompt, and the reference pictures (none: text only):
+    the looks it shows, then the scene's own pictures."""
+    refs = scene_refs(story, shot) + [(note, f) for f, note in shot.pictures]
+    prompt = still_prompt(story, shot)
+    if not refs:
+        return prompt, []
+
+    def say(i, n):
+        if n in story.characters:
+            return f"image {i} is {n}, keep their face, hair, clothes and markings exactly"
+        if n in story.places:
+            return f"image {i} is the place {n}, keep its layout, colours and light"
+        return f"image {i} is {n}, copy it as shown"
+    said = "; ".join(say(i, n) for i, (n, _) in enumerate(refs, 1))
+    return f"{prompt}. Reference pictures: {said}. Match the drawing style of the references.", [p for _, p in refs]
+
+
 def still_key(story: Story, shot: Shot) -> str:
-    return key_for("still", still_prompt(story, shot), shot.seed, STILL_SIZE)
+    prompt, refs = render_prompt(story, shot)
+    if not refs:   # the same key as before looks existed, so older pictures stay current
+        return key_for("still", prompt, shot.seed, STILL_SIZE)
+    return key_for("still", prompt, shot.seed, STILL_SIZE, [file_digest(r) for r in refs])
 
 
 def check_stills(story: Story, paths: dict[str, Path]) -> list[str]:
     """Shots whose PNG doesn't carry the prompt it was asked for (a lost prompt renders an empty scene)."""
     return [sid for sid, p in paths.items()
-            if png_prompt(p) != still_prompt(story, next(s for s in story.shots if s.id == sid))]
+            if png_prompt(p) != render_prompt(story, next(s for s in story.shots if s.id == sid))[0]]
 
 
 def cmd_board(story: Story, shot_id: str | None = None) -> int:
@@ -502,8 +816,14 @@ def cmd_board(story: Story, shot_id: str | None = None) -> int:
         out, k = still_path(story, shot), still_key(story, shot)
         if keys.stale(out, k):
             _say(f"still {shot.id} …")
-            render_still(still_prompt(story, shot), shot.seed, out)
+            prompt, refs = render_prompt(story, shot)
+            render_still(prompt, shot.seed, out, refs=refs)
             keys.record(out, k)
+    for shot in shots:
+        try:
+            _report_check(shot, check_still(story, shot, keys))
+        except StageError as e:   # the picture stands; the check is advice
+            _say(f"continuity check skipped for {shot.id}: {e}")
     bad = check_stills(story, {s.id: still_path(story, s) for s in shots})
     sheet = story.root / "board" / "contact-sheet.jpg"
     contact_sheet([still_path(story, s) for s in story.shots if still_path(story, s).exists()], sheet)
@@ -517,6 +837,87 @@ def cmd_board(story: Story, shot_id: str | None = None) -> int:
     return 0
 
 
+# --- continuity: does a picture match the film bible? -------------------------------------
+
+CHECK_SCHEMA = {"type": "object", "required": ["misses"],
+                "properties": {"misses": {"type": "array", "items": {"type": "string"}}}}
+
+
+def _named(text: str, names) -> list[str]:
+    return [n for n in names if re.search(rf"\b{re.escape(n)}\b", text)]
+
+
+def continuity_facts(story: Story, shot: Shot) -> list[str]:
+    """The bible facts this picture should show: its characters, its places, the light and the framing."""
+    facts = [f"{n}: {story.characters[n]}" for n in _named(shot.still, story.characters)]
+    facts += [f"Place {n}: {story.places[n]}" for n in _named(shot.still, story.places)]
+    if story.lighting:
+        facts.append(f"Lighting: {story.lighting}")
+    if shot.angle:
+        facts.append(f"Framing: {story.angles[shot.angle].frame}")
+    return facts
+
+
+def continuity_prompt(story: Story, shot: Shot) -> str:
+    facts = "\n".join(f"- {f}" for f in continuity_facts(story, shot))
+    return f"""You check one storyboard picture of an animated film against the film's fixed design, so every
+scene matches the others. Compare the picture with each fact below. List only the facts the picture clearly
+breaks, each as one short sentence that says what you see instead, for example "ELENA's shirt is blue, not
+cream linen" or "the light comes from the right, not the left". Ignore the drawing style and anything the
+facts don't mention. If the picture matches, return an empty list.
+
+Facts:
+{facts}
+
+Reply with JSON: {{"misses": [...]}}"""
+
+
+def check_path(story: Story, shot: Shot) -> Path:
+    return story.root / "board" / f"{shot.id}.check.json"
+
+
+def check_still(story: Story, shot: Shot, keys: Keys, model: str | None = None) -> list[str] | None:
+    """Ask the local vision model whether this shot's picture keeps the bible. None when there is
+    nothing to check; the answer is kept until the picture or the bible changes."""
+    import base64
+    if not continuity_facts(story, shot):
+        return None
+    still, out = still_path(story, shot), check_path(story, shot)
+    prompt = continuity_prompt(story, shot)
+    k = key_for("check", file_digest(still), prompt)
+    if keys.stale(out, k):
+        import spike_lane
+        _say(f"continuity {shot.id} …")
+        fd = spike_lane.acquire("writer", ["spike-animate", "check", shot.id], wait=None)
+        try:
+            reply = ollama_generate(prompt, model or os.environ.get("SPIKE_WRITER_MODEL", "gemma4:26b"), CHECK_SCHEMA,
+                                    [base64.b64encode(still.read_bytes()).decode()])
+        finally:
+            os.close(fd)
+        misses = [" ".join(str(m).split()) for m in reply.get("misses", []) if str(m).strip()]
+        out.write_text(json.dumps({"misses": misses}, indent=1))
+        keys.record(out, k)
+    return json.loads(out.read_text())["misses"]
+
+
+def _report_check(shot: Shot, misses: list[str] | None) -> None:
+    if misses:
+        _say(f"⚠ {shot.id} doesn't match the film bible:\n  " + "\n  ".join(misses))
+    elif misses is not None:
+        _say(f"✓ {shot.id} matches the film bible")
+
+
+def cmd_check(story: Story, shot_id: str | None = None) -> int:
+    shots = _scene(story, shot_id)
+    if shots is None:
+        return 2
+    keys = Keys(story.root)
+    for shot in shots:
+        if still_path(story, shot).exists():
+            _report_check(shot, check_still(story, shot, keys))
+    return 0
+
+
 def cmd_retake(story: Story, shot_id: str, seeds: list[int]) -> int:
     shot = next((s for s in story.shots if s.id == shot_id), None)
     if shot is None:
@@ -526,7 +927,8 @@ def cmd_retake(story: Story, shot_id: str, seeds: list[int]) -> int:
     for seed in seeds:
         out = story.root / "board" / "retakes" / f"{shot.id}-s{seed}.png"
         _say(f"retake {shot.id} seed {seed} …")
-        render_still(still_prompt(story, shot), seed, out)
+        prompt, refs = render_prompt(story, shot)
+        render_still(prompt, seed, out, refs=refs)
         outs.append(out)
     sheet = story.root / "board" / "retakes" / f"{shot.id}-sheet.jpg"
     contact_sheet(outs, sheet, cols=len(outs))
@@ -555,8 +957,13 @@ def shot_key(story: Story, shot: Shot, seed: int | None = None) -> str | None:
     still, ref = still_path(story, shot), shot.reference
     if not still.exists() or (ref and not Path(ref.clip).exists()):
         return None
+    n = shot_frames(story, shot)
+    if n is None:
+        return None
     parts = ["shot", file_digest(still), motion_prompt(story, shot), shot.anchor,
              shot.video_seed if seed is None else seed, shot.colormatch]
+    if story.pace == "voice":
+        parts.append(n)
     if ref:
         parts += [file_digest(ref.clip), ref.start, ref.sigma, ref.first_strength]
     return key_for(*parts)
@@ -590,7 +997,7 @@ def clip_fresh(story: Story, shot: Shot, keys: Keys) -> bool:
 
 
 def trim_clip(story: Story, shot: Shot, keys: Keys) -> None:
-    """The shot from its whole take: as is, or ended early and filled back to 5 s (slowed down or held)."""
+    """The shot from its whole take: as is, or ended early and filled back to its length (slowed down or held)."""
     full, out = full_path(story, shot), shot_path(story, shot)
     k = clip_key(story, shot)
     if not keys.stale(out, k):
@@ -598,12 +1005,13 @@ def trim_clip(story: Story, shot: Shot, keys: Keys) -> None:
     if shot.end is None:
         shutil.copyfile(full, out)
     else:
-        E, L = shot.end, shot_seconds()
+        n = shot_frames(story, shot) or SHOT_FRAMES
+        E, L = min(shot.end, n / FPS - 0.2), n / FPS
         vf = (f"trim=end={E},setpts=(PTS-STARTPTS)*{L / E:.6f},minterpolate=fps={FPS}:mi_mode=mci:mc_mode=aobmc:vsbmc=1,"
               f"tpad=stop_mode=clone:stop=12" if shot.fill == "slow" else
-              f"trim=end={E},setpts=PTS-STARTPTS,tpad=stop_mode=clone:stop={SHOT_FRAMES}")
+              f"trim=end={E},setpts=PTS-STARTPTS,tpad=stop_mode=clone:stop={n}")
         _say(f"trim {shot.id} at {E:g} s ({'slowed down' if shot.fill == 'slow' else 'last frame held'}) …")
-        ffmpeg("-i", full, "-vf", vf, "-frames:v", SHOT_FRAMES, "-c:v", "libx264", "-crf", 16, "-pix_fmt", "yuv420p", "-an", out)
+        ffmpeg("-i", full, "-vf", vf, "-frames:v", n, "-c:v", "libx264", "-crf", 16, "-pix_fmt", "yuv420p", "-an", out)
     keys.record(out, k)
 
 
@@ -616,11 +1024,12 @@ def animate_shot(story: Story, shot: Shot, keys: Keys) -> bool:
     if not keys.stale(out, k):
         trim_clip(story, shot, keys)
         return False
-    _say(f"shot {shot.id} …")
+    n = shot_frames(story, shot) or SHOT_FRAMES
+    _say(f"shot {shot.id} ({n / FPS:.2f} s) …")
     model = _home("WAN5B_MODEL", "wan-models/FastMetal-5B-QAD")
     cmd = [_venv("FASTVIDEO_HOME", "FastVideo"), ENGINES / "wan22_i2v.py", "--mlx-checkpoint", model,
            "--text-encoder-root", model, "--vae-root", model / "vae", "--prompt", motion_prompt(story, shot),
-           "--seed", shot.video_seed, "--output-path", raw]
+           "--seed", shot.video_seed, "--num-frames", n, "--output-path", raw]
     if ref:
         # Motion from the real clip; look from a cartoon version of the clip's first frame.
         real, first = shot_path(story, shot, "-first-real").with_suffix(".png"), shot_path(story, shot, "-first").with_suffix(".png")
@@ -634,8 +1043,8 @@ def animate_shot(story: Story, shot: Shot, keys: Keys) -> bool:
         cmd += ["--image", still, "--anchor-start", shot.anchor]
     heavy("video", cmd, raw.with_suffix(".log"), cwd=_home("FASTVIDEO_HOME", "FastVideo"))
     if ref:
-        # Drop the first frames (the hand-over from the pinned cartoon frame), hold the last to keep 121.
-        ffmpeg("-ss", 4 / FPS, "-i", raw, "-vf", "tpad=stop_mode=clone:stop=4", "-frames:v", SHOT_FRAMES,
+        # Drop the first frames (the hand-over from the pinned cartoon frame), hold the last to keep the length.
+        ffmpeg("-ss", 4 / FPS, "-i", raw, "-vf", "tpad=stop_mode=clone:stop=4", "-frames:v", n,
                "-c:v", "libx264", "-crf", 16, "-pix_fmt", "yuv420p", "-an", out)
     elif shot.colormatch:
         r = subprocess.run([_venv("FASTVIDEO_HOME", "FastVideo"), str(ENGINES / "colormatch.py"), str(still),
@@ -645,8 +1054,8 @@ def animate_shot(story: Story, shot: Shot, keys: Keys) -> bool:
     else:
         shutil.copyfile(raw, out)
     secs = media_seconds(out)
-    if abs(secs - shot_seconds()) > 0.06:
-        raise StageError(f"shot {shot.id} is {secs:.2f} s, expected {shot_seconds():.2f} s")
+    if abs(secs - n / FPS) > 0.06:
+        raise StageError(f"shot {shot.id} is {secs:.2f} s, expected {n / FPS:.2f} s")
     keys.record(out, k)
     take = take_path(story, shot, shot.video_seed)   # every take is kept, to go back to
     take.parent.mkdir(parents=True, exist_ok=True)
@@ -683,7 +1092,7 @@ def sound_shot(story: Story, shot: Shot, keys: Keys) -> Path:
     k = sfx_key(story, shot)
     if keys.stale(out, k):
         _say(f"effects {shot.id} …")
-        heavy("sfx", [_venv("MMAUDIO_HOME", "MMAudio"), "demo.py", "--video", clip, "--duration", f"{shot_seconds():.6f}",
+        heavy("sfx", [_venv("MMAUDIO_HOME", "MMAudio"), "demo.py", "--video", clip, "--duration", f"{shot_len(story, shot):.6f}",
                       "--prompt", shot.sfx, "--negative_prompt", story.sfx_negative, "--skip_video_composite",
                       "--output", out.parent], out.with_suffix(".log"), cwd=_home("MMAUDIO_HOME", "MMAudio"))
         keys.record(out, k)
@@ -693,11 +1102,11 @@ def sound_shot(story: Story, shot: Shot, keys: Keys) -> Path:
 def build_soundtrack(story: Story, tracks: list[Path], keys: Keys) -> Path:
     """Pad or trim every shot's effects to the exact shot length so the track never drifts off the cuts."""
     out = story.root / "film" / "sfx.wav"
-    k = key_for("soundtrack", [file_digest(t) for t in tracks])
+    lens = [shot_len(story, s) for s in story.shots]
+    k = key_for("soundtrack", [file_digest(t) for t in tracks], *([lens] if story.pace == "voice" else []))
     if keys.stale(out, k):
-        L = f"{shot_seconds():.6f}"
         ins = [a for t in tracks for a in ("-i", t)]
-        g = "".join(f"[{i}:a]apad,atrim=0:{L}[a{i}];" for i in range(len(tracks)))
+        g = "".join(f"[{i}:a]apad,atrim=0:{L:.6f}[a{i}];" for i, L in enumerate(lens))
         g += "".join(f"[a{i}]" for i in range(len(tracks))) + f"concat=n={len(tracks)}:v=0:a=1,loudnorm=I=-16:TP=-1.5[out]"
         ffmpeg(*ins, "-filter_complex", g, "-map", "[out]", "-ar", 44100, "-c:a", "pcm_s16le", out)
         keys.record(out, k)
@@ -848,7 +1257,9 @@ def speak_dialogue(story: Story, keys: Keys, checks: dict, only: set[str] | None
         narr = story.root / "voice" / f"{sid}.wav"
         lead = dialogue_lead(media_seconds(narr) if story.shots[index[sid]].narration and narr.exists() else None,
                              story.narrator.lead if story.narrator else 0.0)
-        starts, over = place_lines(index[sid] * shot_seconds(), [media_seconds(o) for _, o in mine], lead=lead)
+        shot = story.shots[index[sid]]
+        starts, over = place_lines(shot_starts(story)[index[sid]], [media_seconds(o) for _, o in mine], lead=lead,
+                                   length=shot_len(story, shot))
         if over > 0.5:   # a little spill into the next shot is a natural L-cut; more than that won't read
             checks["dialogue_overflow"][sid] = round(over, 2)
         for (l, o), at in zip(mine, starts):
@@ -865,7 +1276,8 @@ def score(story: Story, keys: Keys, checks: dict, total: float) -> Path | None:
     sdir = story.root / "score"
     sdir.mkdir(exist_ok=True)
     seeds = [m.take] if m.take is not None else list(range(1, m.takes + 1))
-    spec = {"out": str(sdir), "duration": round(total + 1.2, 2), "bpm": score_bpm(shot_seconds()), "key": m.key,
+    bpm = score_bpm(shot_seconds()) if story.pace != "voice" else min(140, max(70, score_bpm(total / len(story.shots))))
+    spec = {"out": str(sdir), "duration": round(total + 1.2, 2), "bpm": bpm, "key": m.key,
             "caption": m.caption, "structure": m.structure, "seeds": seeds}
     takes = [sdir / f"take-s{s}.wav" for s in seeds]
     k = key_for("score", spec)
@@ -880,8 +1292,8 @@ def score(story: Story, keys: Keys, checks: dict, total: float) -> Path | None:
     rk = key_for("rank", [file_digest(t) for t in takes], intensity_arc(story))
     if len(takes) > 1 and keys.stale(rank, rk):
         rspec = sdir / "rank-spec.json"
-        rspec.write_text(json.dumps({"shot_len": shot_seconds(), "arc": intensity_arc(story),
-                                     "hit": hit_time(story), "bpm": spec["bpm"]}))
+        rspec.write_text(json.dumps({"shot_len": shot_seconds(), "starts": shot_starts(story), "total": total,
+                                     "arc": intensity_arc(story), "hit": hit_time(story), "bpm": spec["bpm"]}))
         r = subprocess.run([_venv("MMAUDIO_HOME", "MMAudio"), str(ENGINES / "score_rank.py"), str(rspec), str(rank),
                             *map(str, takes)], capture_output=True, text=True)
         if r.returncode != 0:
@@ -942,9 +1354,9 @@ def review_page(story: Story, film: Path, checks: dict) -> Path:
         shutil.copyfile(sheet, rdir / "storyboard.jpg")
     esc = lambda s: (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))  # noqa: E731
     beats = "".join(
-        f"<li><span>{i * shot_seconds() // 60:.0f}:{i * shot_seconds() % 60:04.1f}</span>"
+        f"<li><span>{at // 60:.0f}:{at % 60:04.1f}</span>"
         f"<b>{esc(s.id)}</b> {esc(_beat(s))}</li>"
-        for i, s in enumerate(story.shots))
+        for s, at in zip(story.shots, shot_starts(story)))
     page = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>{esc(story.title)}</title><style>
@@ -971,6 +1383,14 @@ def _stills_ready(story: Story, keys: Keys) -> bool:
     return not missing
 
 
+def _lines_ready(story: Story) -> bool:
+    missing = [s.id for s in story.shots if shot_frames(story, s) is None]
+    if missing:
+        print(f"lines not recorded for {', '.join(missing)}: shots last as long as their lines, "
+              "so run `spike-animate voices` first", file=sys.stderr)
+    return not missing
+
+
 def save_checks(story: Story, part: dict, merge: bool = False) -> None:
     """Merge one step's checks into film/checks.json, so steps can run one at a time. With merge,
     per-shot tables are updated entry by entry (one scene's results keep the other scenes')."""
@@ -988,7 +1408,7 @@ def save_checks(story: Story, part: dict, merge: bool = False) -> None:
 def film_seconds(story: Story) -> float:
     """The picture's length: the shots butt-joined (what build_picture produces)."""
     picture = story.root / "film" / "picture.mp4"
-    return media_seconds(picture) if picture.exists() else len(story.shots) * shot_seconds()
+    return media_seconds(picture) if picture.exists() else film_length(story)
 
 
 def _scene(story: Story, shot_id: str | None) -> list[Shot] | None:
@@ -1010,10 +1430,14 @@ def cmd_video(story: Story, shot_id: str | None = None) -> int:
         if keys.stale(still_path(story, shots[0]), still_key(story, shots[0])):
             print(f"no still for {shot_id} yet: run `spike-animate board --shot {shot_id}` first", file=sys.stderr)
             return 2
+        if shot_frames(story, shots[0]) is None:
+            print(f"{shot_id} lasts as long as its lines: record them first (`spike-animate voices --shot {shot_id}`)",
+                  file=sys.stderr)
+            return 2
         animate_shot(story, shots[0], keys)
         _say(f"Video: {shot_path(story, shots[0])}")
         return 0
-    if not _stills_ready(story, keys):
+    if not _stills_ready(story, keys) or not _lines_ready(story):
         return 2
     for shot in story.shots:
         animate_shot(story, shot, keys)
@@ -1066,7 +1490,7 @@ def scene_path(story: Story, shot: Shot) -> Path:
 def scene_lines(story: Story, shot: Shot, keys: Keys) -> list[tuple[Path, float]]:
     """This scene's narration and dialogue, each with its start time inside the shot."""
     checks: dict = {}
-    start = story.shots.index(shot) * shot_seconds()
+    start = shot_starts(story)[story.shots.index(shot)]
     lines = narrate(story, keys, checks, {shot.id}) + speak_dialogue(story, keys, checks, {shot.id})
     return [(p, round(at - start, 3)) for p, at in lines if p.stem.startswith(shot.id)]
 
@@ -1084,7 +1508,7 @@ def cmd_scene(story: Story, shot_id: str) -> int:
         return 2
     sfx = story.root / "sfx" / f"{shot.id}.flac"
     lines = scene_lines(story, shot, keys)
-    out, L = scene_path(story, shot), shot_seconds()
+    out, L = scene_path(story, shot), shot_len(story, shot)
     lv = story.levels
     k = key_for("scene", file_digest(clip), sfx.exists() and file_digest(sfx), [(file_digest(p), at) for p, at in lines],
                 story.sfx_db, lv.sound, lv.voices)
@@ -1112,12 +1536,12 @@ def cmd_film(story: Story) -> int:
     if not _stills_ready(story, keys):
         return 2
     checks: dict = {}
+    lines = narrate(story, keys, checks) + speak_dialogue(story, keys, checks)   # first: they can set the shot lengths
     for shot in story.shots:
         animate_shot(story, shot, keys)
     picture = build_picture(story, keys)
     total = media_seconds(picture)
     soundtrack = build_soundtrack(story, [sound_shot(story, s, keys) for s in story.shots], keys)
-    lines = narrate(story, keys, checks) + speak_dialogue(story, keys, checks)
     music = score(story, keys, checks, total)
     film = mix(story, keys, picture, soundtrack, music, lines, total)
     checks["length"] = {"picture": round(total, 3), "film": round(media_seconds(film), 3)}
@@ -1158,11 +1582,16 @@ import urllib.request  # noqa: E402
 
 DRAFT_SCHEMA = {
     "type": "object",
-    "required": ["title", "look", "still_style", "characters", "narrator", "music", "shots"],
+    "required": ["title", "look", "still_style", "lighting", "characters", "places", "angles", "narrator", "music", "shots"],
     "properties": {
         "title": {"type": "string"},
         "look": {"type": "string"},
         "still_style": {"type": "string"},
+        "lighting": {"type": "string"},
+        "places": {"type": "array", "items": {"type": "object", "required": ["name", "description"],
+                   "properties": {"name": {"type": "string"}, "description": {"type": "string"}}}},
+        "angles": {"type": "array", "items": {"type": "object", "required": ["name", "frame"],
+                   "properties": {"name": {"type": "string"}, "frame": {"type": "string"}}}},
         "characters": {"type": "array", "items": {"type": "object", "required": ["name", "description", "voice"],
                        "properties": {"name": {"type": "string"}, "description": {"type": "string"},
                                       "voice": {"type": "string"}}}},
@@ -1171,8 +1600,9 @@ DRAFT_SCHEMA = {
         "music": {"type": "object", "required": ["caption", "structure", "key"],
                   "properties": {"caption": {"type": "string"}, "structure": {"type": "string"}, "key": {"type": "string"}}},
         "shots": {"type": "array", "items": {"type": "object",
-                  "required": ["id", "still", "motion", "sfx", "narration", "intensity", "action"],
-                  "properties": {"id": {"type": "string"}, "still": {"type": "string"}, "motion": {"type": "string"},
+                  "required": ["id", "angle", "still", "motion", "sfx", "narration", "intensity", "action"],
+                  "properties": {"id": {"type": "string"}, "angle": {"type": "string"},
+                                 "still": {"type": "string"}, "motion": {"type": "string"},
                                  "sfx": {"type": "string"}, "narration": {"type": "string"},
                                  "intensity": {"type": "number"}, "action": {"type": "boolean"},
                                  "dialogue": {"type": "array", "items": {"type": "object",
@@ -1202,7 +1632,7 @@ def draft_schema(parts: Parts = Parts()) -> dict:
     return s
 
 
-MAX_NARRATION_WORDS = 12   # ~3.5 s of unhurried narration: fits inside a 5 s shot with its lead-in
+MAX_NARRATION_WORDS = 10   # ~3 s of narration: a voice-paced shot is its line plus a breath, at most 5 s
 MAX_DIALOGUE_WORDS = 12    # all the dialogue in one shot, for the same reason
 
 WRITER_EXAMPLE = {
@@ -1210,8 +1640,14 @@ WRITER_EXAMPLE = {
     "look": "2D cartoon animation, soft muted storybook colors, dusky teal pine trees, soft white snow, gentle shading",
     "still_style": "2D cartoon animation still, bold black outlines, flat vibrant colors, simple shapes, "
                    "Saturday-morning cartoon style, snowy pine forest",
+    "lighting": "winter dawn, low pale pink sunlight from the right, long blue shadows on the snow",
+    "places": [{"name": "CLEARING", "description": "a small snowy clearing ringed by dark teal pine trees, a fallen "
+                                                  "log half buried in snow on one side"}],
+    "angles": [{"name": "WIDE", "frame": "wide shot of the clearing from its edge, pines framing both sides"},
+               {"name": "LOG", "frame": "medium shot from low behind the fallen log, looking across the clearing"}],
     "characters": [{"name": "FOX", "description": "a slender red fox with bright orange fur, white chest and muzzle, "
-                                                  "black legs, bushy tail with a white tip, amber eyes",
+                                                  "black legs, bushy tail with a white tip, amber eyes, a frayed "
+                                                  "green scarf around its neck",
                     "voice": "a smooth, low, purring voice, sly and unhurried, a villain who enjoys himself"},
                    {"name": "RAB", "description": "a plump brown rabbit with long ears and a fluffy white tail",
                     "voice": ""}],
@@ -1226,20 +1662,20 @@ WRITER_EXAMPLE = {
                            "[Climax - pounding timpani, brass stabs]\n\n[Outro - low cello drone, fade out]",
               "key": "D minor"},
     "shots": [
-        {"id": "01-establish", "still": "wide shot of FOX walking through a snowy pine forest at dawn, soft pink sky",
+        {"id": "01-establish", "angle": "WIDE", "still": "FOX walking into the CLEARING",
          "motion": "static camera, a slender red fox walks steadily through the snowy pine forest at dawn, mouth closed",
          "sfx": "soft paw footsteps crunching in snow, quiet winter wind", "narration":
          "Deep in the winter woods, the fox was hungry.", "intensity": 0.15, "action": False, "dialogue": []},
-        {"id": "02-reveal", "still": "point-of-view shot through snowy branches of RAB nibbling grass, unaware",
+        {"id": "02-reveal", "angle": "LOG", "still": "RAB nibbling grass in the CLEARING, unaware",
          "motion": "static camera, a brown rabbit nibbles grass, chewing, ears twitching",
          "sfx": "rabbit nibbling, soft rustling, quiet birdsong", "narration": "Breakfast. And it had no idea.",
          "intensity": 0.3, "action": False, "dialogue": []},
-        {"id": "03-taunt", "still": "medium shot of FOX crouched behind a snowy log, grinning, eyes on RAB",
+        {"id": "03-taunt", "angle": "LOG", "still": "FOX crouched behind the log in the CLEARING, grinning",
          "motion": "static camera, a red fox grins and talks quietly, eyes fixed ahead",
          "sfx": "soft wind, a twig creaking", "narration": "",
          "dialogue": [{"speaker": "FOX", "line": "Good morning, little breakfast.", "emotion": "sly, purring"}],
          "intensity": 0.6, "action": False},
-        {"id": "03-pounce", "still": "action shot of FOX leaping through the air to pounce on RAB, snow spraying",
+        {"id": "03-pounce", "angle": "WIDE", "still": "FOX leaping through the air to pounce on RAB in the CLEARING, snow spraying",
          "motion": "a red fox leaps through the air and pounces on a brown rabbit, snow spraying, fast dynamic action",
          "sfx": "fast whoosh of a leap, paws thudding into snow, rabbit squeal", "narration": "",
          "intensity": 1.0, "action": True, "dialogue": []},
@@ -1248,7 +1684,7 @@ WRITER_EXAMPLE = {
 
 
 # The writer's rules for the optional parts, used when the author wants that part.
-NARRATION_RULE = '- "narration" is optional and at most {max_words} words; leave it "" on action shots. Narrate about half\n  the shots at most. The narrator speaks over the film.\n'
+NARRATION_RULE = '- The voice-over carries the film: give most shots a "narration" line of at most {max_words} words,\n  short and punchy like an ad or a trailer ("She built the agent."). Lines follow on from each other;\n  a shot may stay silent ("") for a beat. The last shot holds the closing line.\n'
 DIALOGUE_RULE = '- Characters may talk if the idea calls for it. Give every character who speaks a "voice": how they sound\n  (pitch, pace, texture, personality), e.g. "small, bright, chirpy robot voice, fast and excitable"; leave\n  "voice" "" for characters who never speak. Put spoken lines in a shot\'s "dialogue" list as\n  {{"speaker": NAME, "line": ..., "emotion": ...}}. Keep one speaker per shot and cut between speakers\n  (shot / reverse shot); at most {max_words} words of speech per shot, counting narration and dialogue\n  together (the narrator speaks first, then the character). Frame talking shots as medium shots or over the shoulder and say "talking" in the motion.\n  Reaction shots of the listener, with no dialogue, make conversations read well. Use "dialogue": [] otherwise.\n'
 MUSIC_RULE = '- "music" describes an instrumental score that follows the intensity arc; "structure" is 3-6 section tags\n  like "[Intro - ...]" separated by blank lines; "key" like "D minor" or "C major".\n'
 
@@ -1294,14 +1730,25 @@ IDEA: {idea}
 names, and use the author's own dialogue lines word for word where they fit; split a long line across shots.)
 {ref}
 How the film is made, so write for it:
-- Every shot is a single 5 seconds clip animated from one storyboard still. One clear action per shot.
+- Every shot is one short clip animated from one storyboard still, as long as its line plus a breath:
+  2 to 5 seconds (a shot with nothing said lasts 3 s). The whole film runs about 15 to 20 seconds, so every
+  shot must earn its place. One clear action per shot.
 - Stills are rendered by an image model, so each still is a concrete visual description: framing (wide shot,
   close-up, low angle, point-of-view), who, doing what, where, lighting. No camera moves, no time passing.
 - Characters keep the same look only if they are described with the same words every time. So give each
   character a name that is one UPPERCASE word, letters only (FOX, KEEPER, BOLT), and a full visual
   description once, in "characters".
-  In every still, write the UPPERCASE name, never re-describe the character.
-- "motion" says what moves during the 5 seconds, in plain words without the UPPERCASE names; start calm shots
+  In every still, write the UPPERCASE name, never re-describe the character. The description includes the
+  exact clothes and accessories (colours, fabrics, fit), so the outfit stays the same in every shot.
+- "lighting" is one line used in every picture and every motion: time of day, where the light comes from,
+  its colour, the shadows. Keep it the same for the whole film.
+- "places" names each location once, one UPPERCASE word (TERRACE, CLEARING), with a full visual description.
+  Write the place's NAME in every still set there, never re-describe it.
+- "angles" are 2 to 4 camera setups, each one UPPERCASE word with a "frame" (shot size and where the camera
+  stands, e.g. "medium shot across the cafe table, the sea behind"). Every shot picks one "angle"; shots at
+  the same spot reuse the same angle, which keeps the cuts in one place. The still then says who and what,
+  not the framing again.
+- "motion" says what moves during the shot, in plain words without the UPPERCASE names; start calm shots
   with "static camera,". Set "action": true only for fast, violent or acrobatic shots.
   The motion moves only what the still shows: never bring in a prop, person or action the still doesn't
   contain (the video model draws whatever the words suggest, so "as she reads" grows a book; write "her eyes
@@ -1340,6 +1787,16 @@ def lint_draft(d: dict, shots: int, parts: Parts = Parts()) -> list[str]:
     if len(got) != shots:
         problems.append(f"the story needs exactly {shots} shots, it has {len(got)}")
     names = {c["name"]: c["description"] for c in d.get("characters", [])}
+    angles = {a.get("name") for a in d.get("angles", [])}
+    for pl in d.get("places", []):
+        if not re.fullmatch(r"[A-Z]+", pl.get("name", "")):
+            problems.append(f"place name {pl.get('name')} must be one UPPERCASE word, letters only (like TERRACE)")
+        elif pl["name"] in names:
+            problems.append(f"{pl['name']} is both a character and a place; rename the place")
+    for s in got:
+        if s.get("angle") and s["angle"] not in angles:
+            problems.append(f"shot {s.get('id', '?')} uses angle {s['angle']}, which isn't one of the angles "
+                            f"({', '.join(sorted(a for a in angles if a)) or 'none'}); pick one or add it")
     for s in got:
         sid = s.get("id", "?")
         if not re.fullmatch(r"\d\d-[a-z0-9-]+", sid):
@@ -1389,12 +1846,17 @@ def draft_to_toml(d: dict, idea: str, notes: str = "", style_image: str = "", st
            "# Edit freely, then: spike-animate board story.toml", "",
            f"idea = {q(idea)}", *([f"notes = {q(notes)}"] if notes else []),
            *([f"style_image = {q(style_image)}", f"style = {q(style)}"] if style_image else []),
-           f"title = {q(d['title'])}", "seed = 1024", f"look = {q(d['look'])}", f"still_style = {q(d['still_style'])}",
+           f"title = {q(d['title'])}", "seed = 1024", 'pace = "voice"', f"look = {q(d['look'])}", f"still_style = {q(d['still_style'])}",
+           *([f"lighting = {q(d['lighting'])}"] if d.get("lighting") else []),
            "", "[characters]"]
     out += [f"{c['name']} = {q(c['description'])}" for c in d["characters"] if not c.get("voice")]
     for c in d["characters"]:
         if c.get("voice"):
             out += ["", f"[characters.{c['name']}]", f"look = {q(c['description'])}", f"voice = {q(c['voice'])}"]
+    if d.get("places"):
+        out += ["", "[places]"] + [f"{pl['name']} = {q(pl['description'])}" for pl in d["places"]]
+    for i, a in enumerate(d.get("angles", [])):
+        out += ["", f"[angles.{a['name']}]", f"frame = {q(a['frame'])}", f"seed = {1024 + 1000 * (i + 1)}"]
     if d.get("narrator") and any(s.get("narration") for s in d["shots"]):
         n = d["narrator"]
         out += ["", "[narrator]", f"voice = {q(n['voice'])}", f"sample = {q(n['sample'])}", "lead = 0.5"]
@@ -1403,7 +1865,10 @@ def draft_to_toml(d: dict, idea: str, notes: str = "", style_image: str = "", st
         out += ["", "[music]", f"caption = {q(m['caption'])}", f"key = {q(m['key'])}", "takes = 8", "db = -10",
                 f"structure = {q(m['structure'])}"]
     for s in d["shots"]:
-        out += ["", "[[shot]]", f"id = {q(s['id'])}", f"still = {q(s['still'])}", f"motion = {q(s['motion'])}"]
+        out += ["", "[[shot]]", f"id = {q(s['id'])}"]
+        if s.get("angle"):
+            out.append(f"angle = {q(s['angle'])}")
+        out += [f"still = {q(s['still'])}", f"motion = {q(s['motion'])}"]
         if s.get("action"):
             out.append("anchor = 0   # action shot: pin only the first frame, let it move")
         if s.get("sfx"):
@@ -1495,7 +1960,7 @@ def cmd_new(folder: Path, idea: str, shots: int, model: str, attempts: int = 3, 
     return 0
 
 
-def main(argv: list[str]) -> int:
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="spike-animate", description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name, helptext in [("board", "render the storyboard stills and a contact sheet, then stop for review"),
@@ -1509,13 +1974,24 @@ def main(argv: list[str]) -> int:
         sp.add_argument("story", type=Path)
         if name in ("board", "video", "sound", "voices"):
             sp.add_argument("--shot", help="work on this one scene only")
+    ck = sub.add_parser("check", help="check pictures against the film bible with the local vision model")
+    ck.add_argument("story", type=Path)
+    ck.add_argument("--shot")
+    lk = sub.add_parser("look", help="draw a character sheet or a place picture that scenes are drawn from")
+    lk.add_argument("story", type=Path)
+    lk.add_argument("name")
+    lk.add_argument("--seeds", help="draw these versions instead, e.g. 7,42,99")
+    vc = sub.add_parser("voice", help="design a voice (narrator or a character) before any line is recorded")
+    vc.add_argument("story", type=Path)
+    vc.add_argument("name")
+    vc.add_argument("--takes", type=int, help="make this many more takes to choose from")
     sc = sub.add_parser("scene", help="preview one scene: its clip with its own sound and lines")
     sc.add_argument("story", type=Path)
     sc.add_argument("shot")
     nw = sub.add_parser("new", help="draft story.toml for a new film from a one-line idea (local model)")
     nw.add_argument("folder", type=Path)
     nw.add_argument("idea")
-    nw.add_argument("--shots", type=int, default=8)
+    nw.add_argument("--shots", type=int, default=6)
     nw.add_argument("--notes", default="", help="reference material for the writer: names, looks, setting, tone")
     nw.add_argument("--style-image", type=Path, help="a picture whose style the film should copy")
     nw.add_argument("--model", default=os.environ.get("SPIKE_WRITER_MODEL", "gemma4:26b"))
@@ -1526,7 +2002,11 @@ def main(argv: list[str]) -> int:
     rt.add_argument("story", type=Path)
     rt.add_argument("shot")
     rt.add_argument("--seeds", required=True, help="comma-separated, e.g. 7,42,99")
-    a = ap.parse_args(argv)
+    return ap
+
+
+def main(argv: list[str]) -> int:
+    a = build_parser().parse_args(argv)
     try:
         if a.cmd == "new":
             return cmd_new(a.folder, a.idea, a.shots, a.model, notes=a.notes, style_image=a.style_image,
@@ -1536,6 +2016,12 @@ def main(argv: list[str]) -> int:
             return cmd_board(story, a.shot)
         if a.cmd == "scene":
             return cmd_scene(story, a.shot)
+        if a.cmd == "check":
+            return cmd_check(story, a.shot)
+        if a.cmd == "voice":
+            return cmd_voice(story, a.name, a.takes)
+        if a.cmd == "look":
+            return cmd_look(story, a.name, [int(s) for s in a.seeds.split(",") if s.strip()] if a.seeds else None)
         if a.cmd == "retake":
             return cmd_retake(story, a.shot, [int(s) for s in a.seeds.split(",") if s.strip()])
         if a.cmd in ("video", "sound", "voices"):

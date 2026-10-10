@@ -1,7 +1,8 @@
 """Rank score takes by how well they follow the film: per-shot loudness against the story's
 intensity arc, a hit at the story's peak, and a tempo that stays locked to the edit.
 usage: score_rank.py SPEC.json OUT.json TAKE.wav [TAKE.wav ...]
-SPEC: {"shot_len", "arc": [per-shot intensity], "hit": seconds, "bpm"}
+SPEC: {"shot_len", "starts" (optional: each shot's start, for shots of different lengths), "total",
+       "arc": [per-shot intensity], "hit": seconds, "bpm"}
 Writes OUT.json: [{"take", "score", "arc_r", "hit", "tempo", "shot_db"}], best first.
 Needs librosa (MMAudio's venv has it)."""
 import json
@@ -13,14 +14,15 @@ import numpy as np
 
 spec = json.loads(Path(sys.argv[1]).read_text())
 shot, arc, hit_at, bpm = spec["shot_len"], np.array(spec["arc"], float), spec["hit"], spec["bpm"]
+starts = spec.get("starts") or [i * shot for i in range(len(arc))]
+bounds = list(zip(starts, starts[1:] + [spec.get("total", starts[-1] + shot)]))
 
 rows = []
 for path in sys.argv[3:]:
     y, sr = librosa.load(path, sr=22050, mono=True)
     rms = librosa.feature.rms(y=y, hop_length=512)[0]
     t = librosa.times_like(rms, sr=sr, hop_length=512)
-    db = np.array([20 * np.log10(np.sqrt(np.mean(rms[(t >= i * shot) & (t < (i + 1) * shot)] ** 2)) + 1e-9)
-                   for i in range(len(arc))])
+    db = np.array([20 * np.log10(np.sqrt(np.mean(rms[(t >= a) & (t < b)] ** 2)) + 1e-9) for a, b in bounds])
     arc_r = float(np.corrcoef(db, arc)[0, 1]) if arc.std() > 0 else 0.0
     onset = librosa.onset.onset_strength(y=y, sr=sr, hop_length=512)
     win = (t >= hit_at - 0.3) & (t <= hit_at + 0.5)

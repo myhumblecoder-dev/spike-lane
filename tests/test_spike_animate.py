@@ -231,3 +231,127 @@ def test_mix_graph_sets_each_layer_to_its_level_without_renormalizing():
     bed = sa.mix_filtergraph(narration_ms=[], total=10.0, sfx_db=-4, music_db=-10,
                              levels=sa.Levels(sound=20, music=20, voices=50), master_db=3)
     assert "loudnorm" not in bed and "alimiter" in bed and "sidechaincompress" not in bed
+
+
+# --- the film bible: lighting, places and camera angles shared by every shot ---------------
+
+BIBLE = '''title = "Morning"
+look = "cel animation"
+still_style = "cel animation still"
+lighting = "sunrise, warm low pink-gold light from the left"
+
+[characters.ELENA]
+look = "a young woman in a cream linen shirt with rolled sleeves"
+voice = "soft"
+
+[places]
+TERRACE = "a whitewashed cafe terrace on a white sand beach"
+
+[angles.ACROSS]
+frame = "medium shot across the cafe table, the sea behind"
+seed = 3002
+
+[[shot]]
+id = "01-sit"
+angle = "ACROSS"
+still = "ELENA sitting at a table on the TERRACE"
+motion = "she sips her coffee, mouth closed"
+
+[[shot]]
+id = "02-wide"
+still = "wide shot of the TERRACE at dawn"
+motion = "static camera, waves roll in"
+seed = 7
+'''
+
+
+def test_the_film_bible_goes_into_every_picture_and_motion(tmp_path):
+    story = sa.load_story(write_story(tmp_path, BIBLE))
+    sit, wide = story.shots
+    assert sa.still_prompt(story, sit) == (
+        "medium shot across the cafe table, the sea behind, "
+        "a young woman in a cream linen shirt with rolled sleeves sitting at a table on "
+        "a whitewashed cafe terrace on a white sand beach, "
+        "sunrise, warm low pink-gold light from the left, cel animation still")
+    assert sa.motion_prompt(story, sit) == "cel animation, sunrise, warm low pink-gold light from the left, she sips her coffee, mouth closed"
+    assert sit.seed == 3002 and wide.seed == 7                 # an angle keeps its seed; a shot can still set its own
+    assert sa.still_prompt(story, wide).startswith("wide shot of a whitewashed cafe terrace")   # no "the a ..."
+    assert sa.expand("ZAP and the ZAP", {"ZAP": "the small robot"}) == "the small robot and the small robot"
+
+
+def test_stories_without_a_bible_keep_their_prompts(story):
+    shot = story.shots[0]
+    assert sa.still_prompt(story, shot) == f"{sa.expand(shot.still, story.characters)}, {story.still_style}"
+    assert sa.motion_prompt(story, shot) == f"{story.look}, {sa.expand(shot.motion, story.characters)}"
+
+
+def test_the_bible_names_must_make_sense(tmp_path):
+    with pytest.raises(sa.StoryError, match="angle 'CLOSE'"):
+        sa.load_story(write_story(tmp_path, BIBLE.replace('angle = "ACROSS"', 'angle = "CLOSE"')))
+    with pytest.raises(sa.StoryError, match="ELENA"):
+        sa.load_story(write_story(tmp_path, BIBLE.replace("TERRACE =", "ELENA =")))
+    with pytest.raises(sa.StoryError, match="frame"):
+        sa.load_story(write_story(tmp_path, BIBLE.replace('frame = "medium shot across the cafe table, the sea behind"\n', "")))
+
+
+def test_names_in_an_angle_frame_are_filled_in_too(tmp_path):
+    text = BIBLE.replace('frame = "medium shot across the cafe table, the sea behind"', 'frame = "medium shot across a table on the TERRACE"')
+    story = sa.load_story(write_story(tmp_path, text))
+    assert sa.still_prompt(story, story.shots[0]).startswith("medium shot across a table on a whitewashed cafe terrace")
+
+
+# --- pace: shots as long as their lines ------------------------------------------------------
+
+VOICE_PACED = STORY.replace('seed = 1024\n', 'seed = 1024\npace = "voice"\n', 1)
+
+
+def tone(path: Path, secs: float) -> None:
+    import subprocess
+    path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", f"sine=frequency=300:duration={secs}",
+                    "-ac", "1", "-ar", "24000", str(path)], check=True)
+
+
+def test_a_clip_length_is_a_frame_count_the_video_model_can_make():
+    assert sa.wan_frames(3.0) == 73              # 72 frames, up to the next 4n+1
+    assert sa.wan_frames(0.5) == 49              # never shorter than about 2 s
+    assert sa.wan_frames(9.0) == 121             # never longer than the model's 5 s
+    assert all((sa.wan_frames(s) - 1) % 4 == 0 for s in (2.1, 2.6, 3.3, 4.4))
+
+
+def test_without_a_pace_every_shot_stays_five_seconds(story):
+    assert story.pace == "fixed"
+    assert [sa.shot_frames(story, s) for s in story.shots] == [121, 121, 121]
+
+
+def test_a_voice_paced_shot_lasts_its_line_and_a_breath(tmp_path):
+    story = sa.load_story(write_story(tmp_path, VOICE_PACED))
+    first, silent, last = story.shots
+    assert sa.shot_frames(story, first) is None                  # its line isn't recorded yet
+    tone(tmp_path / "voice" / "01-establish.wav", 2.0)
+    assert sa.shot_frames(story, first) == sa.wan_frames(0.5 + 2.0 + sa.TAIL)   # lead, line, breath
+    assert sa.shot_frames(story, silent) == sa.wan_frames(sa.SILENT_SECONDS)
+
+
+def test_a_voice_paced_shot_can_be_given_its_own_length(tmp_path):
+    text = VOICE_PACED.replace('id = "02-pounce"\n', 'id = "02-pounce"\nseconds = 4.2\n', 1)
+    story = sa.load_story(write_story(tmp_path, text))
+    assert sa.shot_frames(story, story.shots[1]) == sa.wan_frames(4.2)
+
+
+def test_a_bad_pace_or_length_is_refused(tmp_path):
+    with pytest.raises(sa.StoryError, match="pace"):
+        sa.load_story(write_story(tmp_path, STORY.replace('seed = 1024\n', 'seed = 1024\npace = "fast"\n', 1)))
+    with pytest.raises(sa.StoryError, match="seconds"):
+        sa.load_story(write_story(tmp_path, VOICE_PACED.replace('id = "02-pounce"\n', 'id = "02-pounce"\nseconds = 9\n', 1)))
+
+
+def test_voice_paced_lines_start_where_their_shots_start(tmp_path):
+    story = sa.load_story(write_story(tmp_path, VOICE_PACED))
+    tone(tmp_path / "voice" / "01-establish.wav", 2.0)
+    tone(tmp_path / "voice" / "03-stalk.wav", 1.0)
+    lens = [sa.shot_frames(story, s) / sa.FPS for s in story.shots]
+    assert sa.shot_starts(story) == pytest.approx([0, lens[0], lens[0] + lens[1]])
+    assert sa.narration_offsets(story) == [("01-establish", pytest.approx(0.5)),
+                                           ("03-stalk", pytest.approx(lens[0] + lens[1] + 0.5))]
+    assert sa.film_length(story) == pytest.approx(sum(lens))

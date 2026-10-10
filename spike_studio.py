@@ -108,6 +108,44 @@ def _doc(folder: Path) -> dict:
     return tomllib.loads((Path(folder) / "story.toml").read_text())
 
 
+def add_scene(folder: Path, after: str | None, still: str, motion: str) -> tuple[list[str], str | None]:
+    """Put a new scene right after `after` (or last), with an id no scene has used; return its id."""
+    still, motion = (still or "").strip(), (motion or "").strip() or "static camera"
+    if not still:
+        return ["a scene needs a picture description"], None
+    doc = _doc(folder)
+    shots = doc.setdefault("shot", [])
+    ids = [x.get("id") for x in shots]
+    at = ids.index(after) + 1 if after in ids else len(shots)
+    base = f"{at + 1:02d}-{_slug(' '.join(still.split()[:3]))[:24].strip('-') or 'scene'}"
+    sid, n = base, 2
+    used = set(ids) | {k.split(":")[1] for k in _saved(folder) if k.startswith("scene:")}
+    while sid in used:
+        sid, n = f"{base}-{n}", n + 1
+    shots.insert(at, {"id": sid, "still": still, "motion": motion, "intensity": 0.5})
+    errors = save_story(folder, doc=doc)
+    return (errors, None) if errors else ([], sid)
+
+
+def remove_scene(folder: Path, shot_id: str) -> list[str]:
+    """Take a scene out of the story, and forget what was approved in it; its files stay on disk."""
+    doc = _doc(folder)
+    shots = doc.get("shot", [])
+    if not any(x.get("id") == shot_id for x in shots):
+        return [f"no scene '{shot_id}' in the story"]
+    if len(shots) == 1:
+        return ["it's the only scene; a film needs at least one"]
+    doc["shot"] = [x for x in shots if x.get("id") != shot_id]
+    errors = save_story(folder, doc=doc)
+    if errors:
+        return errors
+    saved = {k: v for k, v in _saved(folder).items() if not k.startswith(f"scene:{shot_id}:")}
+    f = _approvals_file(folder)
+    if f.exists():
+        f.write_text(json.dumps(saved, indent=1))
+    return []
+
+
 def pick_seed(folder: Path, shot_id: str, seed: int) -> list[str]:
     doc = _doc(folder)
     shot = next((s for s in doc.get("shot", []) if s.get("id") == shot_id), None)
@@ -130,7 +168,7 @@ def pick_take(folder: Path, take: int | None) -> list[str]:
 
 def _current_retakes(folder: Path, story, shot) -> list[tuple[int, Path]]:
     """This shot's retakes drawn from its current description (older ones would redraw differently)."""
-    want = sa.still_prompt(story, shot) if story else None
+    want = sa.render_prompt(story, shot)[0] if story else None
     found = []
     for p in (Path(folder) / "board" / "retakes").glob(f"{shot.id if story else shot}-s*.png"):
         m = re.fullmatch(rf"{re.escape(shot.id if story else shot)}-s(\d+)\.png", p.name)
@@ -169,6 +207,54 @@ def _takes(folder: Path, story, shot) -> list[tuple[int, Path]]:
         if m and keys.keys.get(keys._rel(p)) == sa.shot_key(story, shot, int(m.group(1))):
             found.append((int(m.group(1)), p))
     return sorted(found)
+
+
+def _look_takes(folder: Path, story, name: str) -> list[tuple[int, Path]]:
+    keys, found = sa.Keys(folder), []
+    for p in (Path(folder) / "looks" / "takes").glob(f"{name}-s*.png"):
+        m = re.fullmatch(rf"{re.escape(name)}-s(\d+)\.png", p.name)
+        if m and keys.keys.get(keys._rel(p)) == sa.look_key(story, name, int(m.group(1))):
+            found.append((int(m.group(1)), p))
+    return sorted(found)
+
+
+def use_look(folder: Path, name: str, seed: int) -> list[str]:
+    """Keep another version of a character sheet or place picture: no redrawing."""
+    folder = Path(folder)
+    story = sa.load_story(folder / "story.toml")
+    if name not in sa.look_names(story):
+        return [f"no character or place called '{name}'"]
+    src = dict(_look_takes(folder, story, name)).get(int(seed))
+    if src is None:
+        return [f"no version {seed} of {name} for its current description"]
+    doc = _doc(folder)
+    doc.setdefault("looks", {})[name] = int(seed)
+    errors = save_story(folder, doc=doc)
+    if errors:
+        return errors
+    story = sa.load_story(folder / "story.toml")
+    out = sa.look_path(story, name)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src, out)
+    sa.Keys(folder).record(out, sa.look_key(story, name))
+    return []
+
+
+def use_voice(folder: Path, name: str, n: int) -> list[str]:
+    """Choose one take of a voice: every line is then cloned from it."""
+    folder = Path(folder)
+    story = sa.load_story(folder / "story.toml")
+    if name not in sa.voice_names(story):
+        return [f"'{name}' has no voice in the story"]
+    keys = sa.Keys(folder)
+    src = dict(sa.voice_takes(story, name, keys)).get(int(n))
+    if src is None:
+        return [f"no take {n} of {name}'s voice for its current description"]
+    card = sa.card_path(story, name)
+    card.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src, card)
+    keys.record(card, sa.card_key(story, name))
+    return []
 
 
 def new_take(folder: Path, shot_id: str) -> list[str]:
@@ -227,8 +313,15 @@ def use_take(folder: Path, shot_id: str, seed: int) -> list[str]:
 
 SCENE_PARTS = ("picture", "video", "sound", "voices", "preview")
 PART_NAMES = {"picture": "picture", "video": "motion", "sound": "sound", "voices": "lines", "preview": "preview"}
-STEP_PART = {"board": "picture", "retake": "picture", "video": "video", "sound": "sound", "voices": "voices",
+VOICE_FIRST = ("picture", "voices", "video", "sound", "preview")   # pace = "voice": the lines set the shot's length
+LOOK_STEPS = ("look", "look_takes")
+STEP_PART = {"board": "picture", "retake": "picture", "check": "picture", "video": "video", "sound": "sound", "voices": "voices",
              "scene": "preview"}
+
+
+def scene_parts(story) -> tuple[str, ...]:
+    """A scene's parts in the order they're made and approved."""
+    return VOICE_FIRST if story is not None and story.pace == "voice" else SCENE_PARTS
 
 
 def _scene_outputs(folder: Path, story, shot, keys) -> dict[str, list[Path] | None]:
@@ -313,6 +406,20 @@ def _steps(folder: Path, doc: dict | None, story) -> list[dict]:
         return approved
 
     ok = add("story", "Story", [] if story else None, True)
+    story_ok = ok
+    if story:   # every character sheet and place picture, in any order, before the scenes
+        keys0 = sa.Keys(folder)
+        looks_ok = ok
+        for name in sa.look_names(story):
+            out = sa.look_path(story, name)
+            files = [out] if not keys0.stale(out, sa.look_key(story, name)) else None
+            looks_ok = add(f"look:{name}", f"Look of {name}", files, ok, look=name) and looks_ok
+        for name in sa.voice_names(story):   # voices too: chosen once, used by every line
+            card = sa.card_path(story, name)
+            files = [card] if not keys0.stale(card, sa.card_key(story, name)) else None
+            looks_ok = add(f"voice:{name}", f"Voice of {'the narrator' if name == 'narrator' else name}", files, ok,
+                           voice=name) and looks_ok
+        ok = looks_ok
     shots = story.shots if story else [{"id": s.get("id", "")} for s in (doc or {}).get("shot", [])]
     keys = sa.Keys(folder) if story else None
     all_done, every_file = ok, []
@@ -322,9 +429,9 @@ def _steps(folder: Path, doc: dict | None, story) -> list[dict]:
         outs = _scene_outputs(folder, story, shot, keys) if story else {p: None for p in SCENE_PARTS}
         # a scene opens once the one before it is finished, and stays open once work in it was approved
         started = any(saved.get(f"scene:{sid}:{p}") for p in SCENE_PARTS)
-        open_ = ok and (prev_complete or started)
+        open_ = (ok and prev_complete) or (story_ok and started)
         upstream, part_ok = [], open_
-        for part in SCENE_PARTS:
+        for part in scene_parts(story):
             files = outs[part]
             part_ok = add(f"scene:{sid}:{part}", f"Scene {i + 1} {PART_NAMES[part]}", files, part_ok, upstream,
                           scene=sid, part=part)
@@ -378,6 +485,10 @@ def gate(folder: Path, step: str, params: dict | None = None) -> str | None:
         me = by.get(f"scene:{shot}:{STEP_PART[step]}")
         if me is None:
             return f"no shot '{shot}' in the story"
+    elif step in ("look", "voice"):
+        me = by.get(f"{step}:{(params or {}).get('name')}")
+        if me is None:
+            return f"no character or place called '{(params or {}).get('name')}'"
     elif step in ("music", "film"):
         me = by[step]
     elif step in STEP_PART:            # a whole-film step: only needs the story
@@ -391,6 +502,23 @@ def gate(folder: Path, step: str, params: dict | None = None) -> str | None:
         return None
     before = next(x for x in steps if not x["approved"])
     return f"approve {before['name']} first"
+
+
+# --- deleting a film ------------------------------------------------------------------
+
+TRASH = Path.home() / ".Trash"
+
+
+def trash_film(folder: Path) -> list[str]:
+    """Move a film's folder, with everything it made, to the Trash (Finder's Put Back still works)."""
+    folder = Path(folder)
+    if not folder.is_dir():
+        return [f"no film at {folder}"]
+    dest, n = TRASH / folder.name, 2
+    while dest.exists():
+        dest, n = TRASH / f"{folder.name} {n}", n + 1
+    shutil.move(str(folder), str(dest))
+    return []
 
 
 # --- what a film looks like on disk ----------------------------------------------
@@ -420,9 +548,31 @@ def _url(folder: Path, rel: str) -> str | None:
     return f"{rel}?v={int(p.stat().st_mtime)}" if p.is_file() else None
 
 
+def _continuity(folder: Path, story, shot) -> list[str] | None:
+    """What the vision model found wrong with this shot's current picture, if it has looked at it."""
+    if story is None or shot is None:
+        return None
+    out, still = sa.check_path(story, shot), sa.still_path(story, shot)
+    if not still.exists() or not sa.continuity_facts(story, shot):
+        return None
+    k = sa.key_for("check", sa.file_digest(still), sa.continuity_prompt(story, shot))
+    if sa.Keys(folder).stale(out, k):
+        return None
+    try:
+        return json.loads(out.read_text())["misses"]
+    except (OSError, ValueError, KeyError):
+        return None
+
+
 def _heard(wav: Path) -> str | None:
     f = wav.with_suffix(".heard.txt")
     return f.read_text().strip() if f.is_file() else None
+
+
+def _seconds(story, shot) -> float | None:
+    """How long the scene lasts; None while it waits for its lines (voice pace)."""
+    n = sa.shot_frames(story, shot) if story and shot else None
+    return n / sa.FPS if n else None
 
 
 def film_state(folder: Path) -> dict:
@@ -432,7 +582,8 @@ def film_state(folder: Path) -> dict:
     state = {"name": folder.name, "title": folder.name, "toml": "", "doc": None, "errors": [], "shots": [],
              "voices": {}, "score": {"takes": [], "pinned": None, "chosen": None}, "checks": {}, "film": None,
              "board": _url(folder, "board/contact-sheet.jpg"), "stage": "story", "idea": "", "notes": "",
-             "references": sorted(str(p.relative_to(folder)) for p in (folder / "reference").glob("*") if p.is_file())}
+             "references": sorted(str(p.relative_to(folder)) for p in (folder / "reference").glob("*") if p.is_file()),
+             "parts": list(SCENE_PARTS)}
     if not sf.exists():
         state["errors"] = ["no story yet"]
         state["steps"] = [{k: v for k, v in x.items() if k != "fingerprint"} for x in _steps(folder, None, None)]
@@ -477,7 +628,9 @@ def film_state(folder: Path) -> dict:
             "takes": [{"seed": seed, "url": _url(folder, str(p.relative_to(folder)))}
                       for seed, p in (_takes(folder, story, shot_obj) if shot_obj else [])],
             "video_seed": shot_obj.video_seed if shot_obj else None,
-            "end": s.get("end"), "fill": s.get("fill", "slow"),
+            "end": s.get("end"), "fill": s.get("fill", "slow"), "seconds": _seconds(story, shot_obj),
+            "continuity": _continuity(folder, story, shot_obj),
+            "checkable": bool(story and shot_obj and sa.continuity_facts(story, shot_obj)), "angle": s.get("angle", ""),
             "full": _url(folder, f"shots/{sid}-full.mp4") or _url(folder, f"shots/{sid}.mp4"),
         })
     voices = {"narrator": _url(folder, "voice/card.wav")} if "narrator" in doc else {}
@@ -485,6 +638,30 @@ def film_state(folder: Path) -> dict:
         if isinstance(c, dict) and c.get("voice"):
             voices[name] = _url(folder, f"voice/cards/{name}.wav")
     state["voices"] = voices
+    state["looks"], state["voice_looks"] = [], []
+    if story:
+        keys_v = sa.Keys(folder)
+        for name in sa.voice_names(story):
+            card = sa.card_path(story, name)
+            takes = sa.voice_takes(story, name, keys_v)
+            digest = sa.file_digest(card) if card.exists() else None
+            voice, sample = sa._voice_desc(story, name)
+            state["voice_looks"].append({
+                "name": name, "voice": voice, "sample": sample, "url": _url(folder, str(card.relative_to(folder))),
+                "fresh": not keys_v.stale(card, sa.card_key(story, name)),
+                "takes": [{"n": n, "url": _url(folder, str(p.relative_to(folder)))} for n, p in takes],
+                "in_use": next((n for n, p in takes if digest and sa.file_digest(p) == digest), None)})
+        keys_l = sa.Keys(folder)
+        for name in sa.look_names(story):
+            ref = sa.look_reference(story, name)
+            state["looks"].append({
+                "name": name, "kind": "character" if name in story.characters else "place",
+                "text": story.characters.get(name) or story.places.get(name, ""),
+                "url": _url(folder, f"looks/{name}.png"), "seed": sa.look_seed(story, name),
+                "fresh": not keys_l.stale(sa.look_path(story, name), sa.look_key(story, name)),
+                "reference": _url(folder, str(ref.relative_to(folder))) if ref else None,
+                "takes": [{"seed": s, "url": _url(folder, str(p.relative_to(folder)))} for s, p in _look_takes(folder, story, name)],
+            })
     rank_file = folder / "score" / "rank.json"
     ranking = {}
     if rank_file.exists():
@@ -507,6 +684,7 @@ def film_state(folder: Path) -> dict:
                       "chosen": int(m.group(1)) if chosen and (m := re.search(r"take-s(\d+)", chosen)) else None}
     state["film"] = _url(folder, f"film/{_slug(doc.get('title', '')) or 'film'}.mp4")
     state["steps"] = [{k: v for k, v in x.items() if k != "fingerprint"} for x in _steps(folder, doc, story)]
+    state["parts"] = list(scene_parts(story))
     sh = state["shots"]
     state["stage"] = ("film" if state["film"] else "shots" if any(x["clip"] for x in sh)
                       else "board" if any(x["still"] for x in sh) else "story")
@@ -535,13 +713,34 @@ def step_argv(folder: Path, step: str, params: dict) -> list[str]:
     """The spike-animate arguments for one step, checked: anything odd is a ValueError, never a command."""
     folder = Path(folder)
     story = str(folder / "story.toml")
-    if step in ("board", "video", "sound", "voices", "scene") and (params.get("shot") or step == "scene"):
+    if step in ("board", "video", "sound", "voices", "scene", "check") and (params.get("shot") or step in ("scene", "check")):
         ids = [s.get("id") for s in _doc(folder).get("shot", [])]
         if params.get("shot") not in ids:
             raise ValueError(f"no shot '{params.get('shot')}' in the story")
         return ["scene", story, params["shot"]] if step == "scene" else [step, story, "--shot", params["shot"]]
     if step in ("board", "video", "sound", "voices", "music", "film", "status"):
         return [step, story]
+    if step == "voice":
+        if params.get("name") not in sa.voice_names(sa.load_story(folder / "story.toml")):
+            raise ValueError(f"'{params.get('name')}' has no voice in the story")
+        argv = ["voice", story, params["name"]]
+        if params.get("takes"):
+            n = int(params["takes"])
+            if not 1 <= n <= 4:
+                raise ValueError("make 1 to 4 takes")
+            argv += ["--takes", str(n)]
+        return argv
+    if step == "look":
+        names = sa.look_names(sa.load_story(folder / "story.toml"))
+        if params.get("name") not in names:
+            raise ValueError(f"no character or place called '{params.get('name')}'")
+        argv = ["look", story, params["name"]]
+        if params.get("seeds"):
+            seeds = [int(str(x).strip()) for x in params["seeds"]]
+            if not 1 <= len(seeds) <= 6 or any(s < 0 for s in seeds):
+                raise ValueError("give 1 to 6 seeds")
+            argv += ["--seeds", ",".join(map(str, seeds))]
+        return argv
     if step == "retake":
         ids = [s.get("id") for s in _doc(folder).get("shot", [])]
         if params.get("shot") not in ids:
@@ -553,7 +752,7 @@ def step_argv(folder: Path, step: str, params: dict) -> list[str]:
     if step == "new":
         idea = str(params.get("idea", "")).strip().lstrip("-").strip()
         notes = str(params.get("notes", "")).strip().lstrip("-").strip()
-        shots = int(params.get("shots", 8))
+        shots = int(params.get("shots", 6))
         if not idea:
             raise ValueError("the idea is empty")
         if not 3 <= shots <= 16:
@@ -731,6 +930,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):   # noqa: N802
         self._route("POST")
 
+    def do_DELETE(self):  # noqa: N802
+        self._route("DELETE")
+
     def do_PUT(self):    # noqa: N802
         self._route("PUT")
 
@@ -782,11 +984,25 @@ class Handler(BaseHTTPRequestHandler):
         if folder is None:
             return self._json(404, {"errors": ["no such film"]})
         action = rest[1] if len(rest) > 1 else ""
+        if method == "DELETE" and not action:
+            if (jobs.status(folder) or {}).get("running"):
+                return self._json(409, {"errors": ["a step is running for this film; stop it first"]})
+            errors = trash_film(folder)
+            return self._json(400, {"errors": errors}) if errors else self._json(200, {"trashed": folder.name})
         if method == "GET" and not action:
             return self._json(200, self._state(folder))
         if method == "PUT" and action == "story":
             p = json.loads(self._body() or b"{}")
             errors = save_story(folder, doc=p.get("doc"), toml=p.get("toml"))
+            return self._json(400, {"errors": errors}) if errors else self._json(200, self._state(folder))
+        if action == "scenes" and method in ("POST", "DELETE"):
+            if (jobs.status(folder) or {}).get("running"):
+                return self._json(409, {"errors": ["a step is running for this film; wait for it or stop it first"]})
+            if method == "POST":
+                p = json.loads(self._body() or b"{}")
+                errors, sid = add_scene(folder, p.get("after"), p.get("still", ""), p.get("motion", ""))
+                return self._json(400, {"errors": errors}) if errors else self._json(200, {"added": sid, "film": self._state(folder)})
+            errors = remove_scene(folder, rest[2] if len(rest) > 2 else "")
             return self._json(400, {"errors": errors}) if errors else self._json(200, self._state(folder))
         if method == "POST" and action == "run":
             p = json.loads(self._body() or b"{}")
@@ -816,8 +1032,13 @@ class Handler(BaseHTTPRequestHandler):
         if method == "POST" and action == "use":
             p = json.loads(self._body() or b"{}")
             try:
-                use = use_take if p.get("kind") == "motion" else use_retake
-                errors = use(folder, str(p["shot"]), int(p["seed"]))
+                if p.get("kind") == "look":
+                    errors = use_look(folder, str(p["name"]), int(p["seed"]))
+                elif p.get("kind") == "voice":
+                    errors = use_voice(folder, str(p["name"]), int(p["take"]))
+                else:
+                    use = use_take if p.get("kind") == "motion" else use_retake
+                    errors = use(folder, str(p["shot"]), int(p["seed"]))
             except (KeyError, ValueError, TypeError, sa.StoryError) as e:
                 errors = [f"bad request: {e}"]
             return self._json(400, {"errors": errors}) if errors else self._json(200, self._state(folder))

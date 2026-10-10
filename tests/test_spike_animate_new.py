@@ -314,3 +314,114 @@ def test_motion_may_only_move_what_the_still_shows_and_silent_faces_stay_closed(
     rules = sa.writer_prompt("a student studies at a cafe", shots=6).split("Example of the format")[0]
     assert "only what the still shows" in rules            # "as she reads" grew a book out of a laptop edge
     assert "mouth closed" in rules                          # the video model makes idle faces talk
+
+
+# --- continuity: does a picture match the film bible? ---------------------------------------
+
+BIBLE_STORY = '''title = "Morning"
+look = "cel animation"
+still_style = "cel animation still"
+lighting = "sunrise, warm low pink-gold light from the left"
+
+[characters.ELENA]
+look = "a young woman in a cream linen shirt with rolled sleeves"
+voice = "soft"
+
+[places]
+TERRACE = "a whitewashed cafe terrace on a white sand beach"
+
+[[shot]]
+id = "01-sit"
+still = "ELENA sitting at a table on the TERRACE"
+motion = "she sips her coffee, mouth closed"
+'''
+
+
+def test_check_compares_a_picture_with_the_film_bible(ollama, tmp_path):
+    film = tmp_path / "morning"
+    (film / "board").mkdir(parents=True)
+    (film / "story.toml").write_text(BIBLE_STORY)
+    (film / "board" / "01-sit.png").write_bytes(b"\x89PNG a picture")
+    FakeOllama.replies = [{"misses": ["ELENA's shirt is blue, not cream linen"]}]
+    r = subprocess.run([str(ANIMATE), "check", "story.toml", "--shot", "01-sit"], capture_output=True, text=True,
+                       env=ollama, cwd=film)
+    assert r.returncode == 0, r.stderr
+    req = FakeOllama.requests[0]
+    assert req["images"] and req["think"] is False and FakeOllama.holders == ["writer"]
+    for fact in ("cream linen shirt", "pink-gold light", "whitewashed cafe terrace"):
+        assert fact in req["prompt"]
+    saved = json.loads((film / "board" / "01-sit.check.json").read_text())
+    assert saved["misses"] == ["ELENA's shirt is blue, not cream linen"]
+    assert "blue" in r.stdout
+    # the same picture is not checked twice
+    r = subprocess.run([str(ANIMATE), "check", "story.toml", "--shot", "01-sit"], capture_output=True, text=True,
+                       env=ollama, cwd=film)
+    assert r.returncode == 0 and len(FakeOllama.requests) == 1
+
+
+def test_the_check_asks_only_about_what_the_shot_shows(tmp_path):
+    p = tmp_path / "story.toml"
+    p.write_text(BIBLE_STORY.replace('lighting = "sunrise, warm low pink-gold light from the left"\n', "")
+                 + '\n[[shot]]\nid = "02-sea"\nstill = "the empty TERRACE"\nmotion = "waves"\n')
+    story = sa.load_story(p)
+    sit, sea = story.shots
+    assert "cream linen shirt" in sa.continuity_prompt(story, sit) and "Lighting" not in sa.continuity_prompt(story, sit)
+    assert "cream linen shirt" not in sa.continuity_prompt(story, sea)        # ELENA isn't in this shot
+    assert "whitewashed cafe terrace" in sa.continuity_prompt(story, sea)
+
+
+def bible_draft():
+    d = draft()
+    d["lighting"] = "stormy dusk, cold blue light, the lamp's warm glow from the right"
+    d["places"] = [{"name": "TOWER", "description": "a white lighthouse on black rocks above a grey sea"}]
+    d["angles"] = [{"name": "WIDE", "frame": "wide shot from the cliff path, the tower on the left"},
+                   {"name": "LAMP", "frame": "medium shot inside the lamp room, the window behind"}]
+    d["shots"][0]["angle"], d["shots"][1]["angle"], d["shots"][2]["angle"] = "LAMP", "WIDE", "LAMP"
+    d["shots"][1]["still"] = "GULL tumbling through a storm toward the TOWER"
+    return d
+
+
+def test_the_writer_drafts_a_film_bible(tmp_path):
+    rules = sa.writer_prompt("a keeper and a gull", shots=3).split("Example of the format")[0]
+    assert '"lighting"' in rules and '"places"' in rules and '"angles"' in rules
+    assert "clothes" in rules                                          # wardrobe goes in the character's look
+    schema = sa.draft_schema()
+    assert {"lighting", "places", "angles"} <= set(schema["required"])
+    p = tmp_path / "story.toml"
+    p.write_text(sa.draft_to_toml(bible_draft(), idea="x"))
+    story = sa.load_story(p)
+    assert story.lighting.startswith("stormy dusk") and story.places["TOWER"].startswith("a white lighthouse")
+    assert [s.angle for s in story.shots] == ["LAMP", "WIDE", "LAMP"]
+    lamp = [s.seed for s in story.shots if s.angle == "LAMP"]
+    assert len(set(lamp)) == 1                                         # one angle, one seed
+    assert story.angles["WIDE"].seed != story.angles["LAMP"].seed
+
+
+def test_lint_catches_an_unknown_angle_or_place_name():
+    d = bible_draft()
+    d["shots"][0]["angle"] = "CLOSEUP"
+    d["places"].append({"name": "Cliff-Top", "description": "a cliff"})
+    problems = sa.lint_draft(d, 3)
+    assert any("01-light" in p and "CLOSEUP" in p for p in problems)
+    assert any("Cliff-Top" in p for p in problems)
+    assert not sa.lint_draft(bible_draft(), 3)
+
+
+# --- voice pace: short films cut to their lines -----------------------------------------------
+
+def test_a_drafted_story_is_paced_by_its_voice_over(tmp_path):
+    p = tmp_path / "story.toml"
+    p.write_text(sa.draft_to_toml(draft(), idea="a lonely lighthouse keeper befriends a seagull"))
+    assert sa.load_story(p).pace == "voice"
+
+
+def test_the_writer_cuts_to_the_lines_and_keeps_them_short():
+    p = sa.writer_prompt("a robot learns to paint", shots=6)
+    assert "as long as its line" in p and "15 to 20 seconds" in p
+    assert f"at most {sa.MAX_NARRATION_WORDS} words" in p and sa.MAX_NARRATION_WORDS <= 10
+    assert "half the shots" not in p                       # the voice-over carries the film now
+
+
+def test_a_new_film_has_six_shots_unless_asked(tmp_path):
+    args = sa.build_parser().parse_args(["new", str(tmp_path), "an idea"])
+    assert args.shots == 6

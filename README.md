@@ -59,6 +59,8 @@ spike-animate film story.toml                     # whatever is left, then mix �
 spike-animate status story.toml
 # or one scene at a time: board|video|sound|voices --shot 03-reveal, then
 spike-animate scene story.toml 03-reveal          # preview: that clip + its own sound and lines → scenes/03-reveal.mp4
+spike-animate look story.toml ELENA [--seeds 7,9]   # character sheet / place picture → looks/ (keep a version: [looks] ELENA = 7)
+spike-animate check story.toml --shot 03-reveal   # does the picture match the film bible?
 # per shot: motion_seed = N (a new take; all takes kept in shots/takes/), end = 4.2 + fill = "slow"|"hold" (trim)
 ```
 
@@ -70,8 +72,10 @@ spike-animate scene story.toml 03-reveal          # preview: that clip + its own
 | Narration | Qwen3-TTS 1.7B: VoiceDesign once, Base clones it per line; Parakeet checks every line | ~1 min | small |
 | Score | ACE-Step 1.5 turbo (`engines/score_gen.py`), ranked by `engines/score_rank.py` | ~2 min | 15.7 GB |
 
-Rules it enforces: every shot is 121 frames at 24 fps (5.04 s); the score runs at 95 BPM so each
-shot is two bars; stills whose stored prompt doesn't match the story are rejected; only outputs whose
+Rules it enforces: with `pace = "voice"` (what `new` writes) each shot lasts its own lines plus a 0.5 s
+breath, 49–121 frames at 24 fps (about 2–5 s; a silent shot 3 s, or `seconds = N` on the shot), so a
+scene's lines are recorded before its motion and the cuts land on the voice-over; films without a pace
+keep 121-frame (5.04 s) shots, where the score runs at 95 BPM so each shot is two bars; stills whose stored prompt doesn't match the story are rejected; only outputs whose
 inputs changed are re-rendered (`.spike-animate/keys.json`).
 
 Needs `~/FastVideo` + `~/wan-models/FastMetal-5B-QAD`, `~/MMAudio` (own venv), `~/voice` (venv with
@@ -96,7 +100,7 @@ mode = "clone"   # default: one designed voice per character, every line cloned 
                  # "scene": MOSS-TTSD performs all the dialogue in one pass (natural turn-taking,
                  #          minutes per scene, ~23-31 GB: runs alone in the lane)
 ```
-A shot may have narration then dialogue; keep all its speech to 12 words so it fits 5 s. Mouths are
+A shot may have narration then dialogue; keep all its speech to 10–12 words so it fits a 5 s shot. Mouths are
 not lip-synced: stage talking shots medium/over-the-shoulder and cut to listeners' reactions.
 Every line is checked with speech-to-text (`film/checks.json` → `dialogue`).
 
@@ -105,17 +109,26 @@ Every line is checked with speech-to-text (`film/checks.json` → `dialogue`).
 A web UI over spike-animate, made for an iPhone. A film starts from your story (one line or the whole thing,
 dialogue kept word for word), optional reference notes and an optional style picture. Then it goes step by step,
 and each step must be approved before the next one unlocks:
-1. **Story:** edit it as a form or as raw TOML. A new film can leave out the narrator, dialogue or music.
-2. **Scenes, one at a time and in order.** Each scene has five parts, each approved before the next opens:
+1. **Story:** edit it as a form or as raw TOML. A new film can leave out the narrator, dialogue or music. The
+   **film bible** is shared by every shot: `lighting`, `[places]` (a NAME in a still is replaced by its description,
+   like characters) and `[angles.X] frame/seed` (camera setups shots pick with `angle = "X"`).
+2. **Look:** a character sheet for every character and a picture of every place, each approved. A character can
+   be drawn from an uploaded picture (`reference/NAME.jpg`). Scene pictures are then drawn by FLUX.2 klein 4B from
+   the looks they show (`mflux-generate-flux2-edit`, ~10 GB, ~30-50 s), so faces, clothes and places carry over;
+   a new version of a look reopens only the scenes that show it. Each new picture is also checked against the
+   bible by the local gemma4 vision model (`spike-animate check`); its notes are hints, not a gate.
+3. **Scenes, one at a time and in order.** Each scene has five parts, each approved before the next opens:
    **Picture** (draw, redraw, three more versions, Use) → **Motion** (animate; "Animate again" makes a new take with a
-   new seed and every take is kept with **Use**; **Trim the end** cuts before a glitch and fills the 5 s back by
+   new seed and every take is kept with **Use**; **Trim the end** cuts before a glitch and fills the shot back by
    slowing the rest down or holding its last frame, without animating again; edit the motion, Calm/Action) →
    **Sound** (effects against the clip) → **Lines** (narration and dialogue for this scene only, with what
    speech-to-text heard; add, edit, remove, record) → **Preview** (the clip with its own sound and lines at the
    film's loudness). Parts with nothing to make are skipped. Changing a scene reopens that scene from the
    changed part on and leaves every other scene alone.
-3. **Music:** once all scenes are finished; listen to the ranked takes and pick one.
-4. **Film:** the mix and its checks, plus a Loudness card: sound effects, music and voices each have a level (default 20 / 20 / 50%, where 100% is the old -16 LUFS mix), saved as `[mix] sound = 20, music = 20, voices = 50` in story.toml. Changing them re-mixes in seconds.
+   Add a scene (＋ at the end of the scene strip, or *Add a scene after this one*) or remove one from the
+   Scenes tab: the other scenes keep their approvals, and a removed scene's files stay on disk.
+4. **Music:** once all scenes are finished; listen to the ranked takes and pick one.
+5. **Film:** the mix and its checks, plus a Loudness card: sound effects, music and voices each have a level (default 20 / 20 / 50%, where 100% is the old -16 LUFS mix), saved as `[mix] sound = 20, music = 20, voices = 50` in story.toml. Changing them re-mixes in seconds.
 
 An approval is a fingerprint of that part's files and the earlier parts of the same scene
 (`.spike-animate/approved.json`). A part only counts as made when it matches the story now: edit a line and

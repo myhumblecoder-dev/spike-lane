@@ -15,6 +15,8 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+import spike_animate as sa  # noqa: E402
+
 ANIMATE = ROOT / "bin" / "spike-animate"
 FFMPEG = shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
 pytestmark = pytest.mark.skipif(not Path(FFMPEG).exists(), reason="needs ffmpeg")
@@ -40,16 +42,21 @@ if me.startswith("mflux"):
     ff("-f", "lavfi", "-i", f"color=c=white:s={w}x{h}", "-frames:v", "1", out)
     prompt = "" if os.environ.get("FAKE_LOSE_PROMPT") and os.environ["FAKE_LOSE_PROMPT"] in out else flag("--prompt")
     with open(out, "ab") as f:
-        f.write(json.dumps({"mflux_version": "fake", "prompt": prompt}).encode())
+        f.write(json.dumps({"mflux_version": "fake", "prompt": prompt, "seed": flag("--seed")}).encode())   # like mflux
 elif me == "python" and args and args[0].endswith("colormatch.py"):
     ff("-i", args[-2], "-c", "copy", args[-1])
+elif me == "python" and args and args[0].endswith("wan22_i2v.py") and os.environ.get("FAKE_OOM_ONCE") \
+        and not Path(os.environ["FAKE_OOM_ONCE"]).exists():
+    Path(os.environ["FAKE_OOM_ONCE"]).write_text("x")      # the first run runs out of memory, like a busy Mac
+    print("RuntimeError: MPS backend out of memory (MPS allocated: 8.61 GiB, other allocations: 39.00 GiB)")
+    sys.exit(1)
 elif me == "python" and args and args[0].endswith("wan22_i2v.py"):
     import hashlib  # like the real model, a different prompt or seed gives a different picture
     c = hashlib.sha256((flag("--prompt") + flag("--seed", "")).encode()).hexdigest()[:6]
     y, u, v = 16 + int(c[:2], 16) // 2, int(c[2:4], 16), int(c[4:6], 16)
     box = f"geq=lum='if(between(X\\,T*120\\,T*120+60)*between(Y\\,40\\,100)\\,235\\,{y})':cb={u}:cr={v}"
     ff("-f", "lavfi", "-i", "color=c=black:size=832x448:rate=24", "-vf", box,   # a box moves across, so frames differ
-       "-frames:v", "121", "-pix_fmt", "yuv420p", flag("--output-path"))
+       "-frames:v", flag("--num-frames", "121"), "-pix_fmt", "yuv420p", flag("--output-path"))
 elif me == "python" and args and args[0] == "demo.py":
     out = Path(flag("--output")); out.mkdir(parents=True, exist_ok=True)
     tone(out / (Path(flag("--video")).stem + ".flac"), float(flag("--duration")) - 0.03)  # MMAudio runs short
@@ -134,7 +141,7 @@ def env(tmp_path, monkeypatch):
     bins = tmp_path / "fakebin"
     homes = {"FASTVIDEO_HOME": tmp_path / "FastVideo", "MMAUDIO_HOME": tmp_path / "MMAudio",
              "VOICE_HOME": tmp_path / "voice", "ACESTEP_HOME": tmp_path / "ACE-Step"}
-    targets = [bins / "mflux-generate-z-image-turbo"]
+    targets = [bins / "mflux-generate-z-image-turbo", bins / "mflux-generate-flux2-edit"]
     targets += [h / ".venv" / "bin" / "python" for h in homes.values()]
     targets += [homes["VOICE_HOME"] / ".venv" / "bin" / n for n in ("mlx_audio.tts.generate", "mlx_audio.stt.generate")]
     for t in targets:
@@ -149,7 +156,8 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("SPIKE_LANE_DIR", str(tmp_path / "lane"))
     e = os.environ.copy()
     e.update({k: str(v) for k, v in homes.items()})
-    e.update(FAKE_LOG=str(tmp_path / "log.jsonl"), IMAGE_MODEL=str(tmp_path / "zi"), WAN5B_MODEL=str(tmp_path / "wan5b"),
+    e.update(OLLAMA_HOST="http://127.0.0.1:9",   # nothing listens: the continuity check is skipped, never the real model
+             FAKE_LOG=str(tmp_path / "log.jsonl"), IMAGE_MODEL=str(tmp_path / "zi"), WAN5B_MODEL=str(tmp_path / "wan5b"),
              PATH=f"{bins}:{Path(FFMPEG).parent}:/usr/bin:/bin")  # no ollama: eviction no-ops
     return film, e, tmp_path / "log.jsonl"
 
@@ -640,3 +648,199 @@ def test_shots_made_before_takes_existed_are_not_animated_again(env):
     log.unlink()
     assert run(env, "video", "story.toml", "--shot", "01-walk").returncode == 0
     assert not wan(log)
+
+
+def test_a_picture_is_still_drawn_when_the_continuity_check_cannot_run(env):
+    film, _, _ = env
+    text = (film / "story.toml").read_text().replace('title = ', 'lighting = "winter dusk, cold blue light"\ntitle = ', 1)
+    (film / "story.toml").write_text(text)
+    r = run(env, "board", "story.toml", "--shot", "01-walk")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (film / "board" / "01-walk.png").exists()
+    assert "continuity check skipped" in r.stdout
+
+
+# --- the Look: character sheets and place pictures, then scenes drawn from them --------------
+
+def with_place(film):
+    text = (film / "story.toml").read_text().replace(
+        '[narrator]', '[places]\nWOODS = "a snowy pine forest at dusk"\n\n[narrator]', 1)
+    (film / "story.toml").write_text(text.replace('still = "FOX walking in snow"', 'still = "FOX walking through the WOODS"'))
+
+
+def tool(c):
+    return c["tool"]
+
+
+def test_look_draws_a_character_sheet_and_a_place_picture(env):
+    film, _, log = env
+    with_place(film)
+    for name in ("FOX", "WOODS"):
+        r = run(env, "look", "story.toml", name)
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert (film / "looks" / f"{name}.png").exists()
+    fox, woods = calls(log, "mflux-generate-z-image-turbo")
+    assert "character sheet" in flag(fox["args"], "--prompt") and "a slender red fox" in flag(fox["args"], "--prompt")
+    assert "a snowy pine forest at dusk" in flag(woods["args"], "--prompt") and "no people" in flag(woods["args"], "--prompt")
+    assert fox["holder"] == "image"
+    log.unlink()
+    assert run(env, "look", "story.toml", "FOX").returncode == 0
+    assert not log.exists()                                          # nothing changed: nothing drawn
+
+
+def test_a_character_sheet_is_drawn_from_an_uploaded_picture(env):
+    film, _, log = env
+    (film / "reference" / "FOX.png").write_bytes(b"\x89PNG the author's fox")
+    r = run(env, "look", "story.toml", "FOX")
+    assert r.returncode == 0, r.stdout + r.stderr
+    [c] = calls(log)
+    assert tool(c) == "mflux-generate-flux2-edit"
+    assert flag(c["args"], "--image-paths") == str(film / "reference" / "FOX.png")
+    assert "a slender red fox" in flag(c["args"], "--prompt")
+
+
+def test_look_can_draw_more_versions(env):
+    film, _, _ = env
+    r = run(env, "look", "story.toml", "FOX", "--seeds", "7,9")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert sorted(p.name for p in (film / "looks" / "takes").glob("FOX-s*.png")) == ["FOX-s7.png", "FOX-s9.png"]
+
+
+def test_scene_pictures_are_drawn_from_the_looks(env):
+    film, _, log = env
+    with_place(film)
+    assert run(env, "look", "story.toml", "FOX").returncode == 0
+    assert run(env, "look", "story.toml", "WOODS").returncode == 0
+    log.unlink()
+    r = run(env, "board", "story.toml", "--shot", "01-walk")
+    assert r.returncode == 0, r.stdout + r.stderr
+    [c] = [c for c in calls(log) if tool(c).startswith("mflux")]
+    assert tool(c) == "mflux-generate-flux2-edit"
+    assert c["args"][c["args"].index("--image-paths") + 1:c["args"].index("--image-paths") + 3] == \
+        [str(film / "looks" / "FOX.png"), str(film / "looks" / "WOODS.png")]
+    prompt = flag(c["args"], "--prompt")
+    assert "image 1" in prompt and "image 2" in prompt and "a slender red fox walking through" in prompt
+    log.unlink()
+    assert run(env, "board", "story.toml", "--shot", "01-walk").returncode == 0
+    assert not [c for c in calls(log) if tool(c).startswith("mflux")]        # up to date
+    assert run(env, "look", "story.toml", "FOX", "--seeds", "5").returncode == 0
+    text = (film / "story.toml").read_text().replace("[places]", "[looks]\nFOX = 5\n\n[places]", 1)
+    (film / "story.toml").write_text(text)                                     # use another version of the fox
+    assert run(env, "look", "story.toml", "FOX").returncode == 0
+    log.unlink()
+    assert run(env, "board", "story.toml", "--shot", "01-walk").returncode == 0
+    assert [tool(c) for c in calls(log) if tool(c).startswith("mflux")] == ["mflux-generate-flux2-edit"]   # redrawn
+
+
+# --- reference pictures for one scene, and voices chosen up front -----------------------------
+
+def test_a_scene_can_be_drawn_with_its_own_reference_picture(env):
+    film, _, log = env
+    (film / "reference" / "01-walk-1.png").write_bytes(b"\x89PNG a screenshot")
+    text = (film / "story.toml").read_text().replace(
+        'id = "01-walk"\n', 'id = "01-walk"\npictures = [{ file = "reference/01-walk-1.png", note = "what the sign in the snow shows" }]\n', 1)
+    (film / "story.toml").write_text(text)
+    r = run(env, "board", "story.toml", "--shot", "01-walk")
+    assert r.returncode == 0, r.stdout + r.stderr
+    [c] = [c for c in calls(log) if c["tool"].startswith("mflux")]
+    assert c["tool"] == "mflux-generate-flux2-edit"
+    assert flag(c["args"], "--image-paths") == str(film / "reference" / "01-walk-1.png")
+    assert "image 1 is what the sign in the snow shows" in flag(c["args"], "--prompt")
+
+
+def test_a_missing_scene_picture_is_named(env):
+    film, _, _ = env
+    text = (film / "story.toml").read_text().replace(
+        'id = "01-walk"\n', 'id = "01-walk"\npictures = [{ file = "reference/gone.png", note = "x" }]\n', 1)
+    (film / "story.toml").write_text(text)
+    r = run(env, "board", "story.toml", "--shot", "01-walk")
+    assert r.returncode != 0 and "reference/gone.png" in r.stderr
+
+
+def test_voices_are_designed_and_chosen_before_any_line(env):
+    film, _, log = env
+    r = run(env, "voice", "story.toml", "narrator")
+    assert r.returncode == 0, r.stdout + r.stderr
+    [c] = calls(log, "mlx_audio.tts.generate")
+    assert "VoiceDesign" in flag(c["args"], "--model") and flag(c["args"], "--instruct") == "a deep warm storyteller"
+    assert (film / "voice" / "card.wav").exists() and (film / "voice" / "takes" / "narrator-1.wav").exists()
+    log.unlink()
+    assert run(env, "voice", "story.toml", "narrator", "--takes", "2").returncode == 0
+    assert len(calls(log, "mlx_audio.tts.generate")) == 2
+    assert sorted(p.name for p in (film / "voice" / "takes").glob("narrator-*.wav")) == \
+        ["narrator-1.wav", "narrator-2.wav", "narrator-3.wav"]
+    log.unlink()
+    assert run(env, "voices", "story.toml", "--shot", "01-walk").returncode == 0
+    said = [flag(c["args"], "--text") for c in calls(log, "mlx_audio.tts.generate")]
+    assert said == ["The fox was hungry."]                      # the chosen voice is reused, not designed again
+    assert run(env, "voice", "story.toml", "NOBODY").returncode == 2
+
+
+def test_a_voice_made_before_takes_existed_becomes_take_one(env):
+    film, _, _ = env
+    assert run(env, "voices", "story.toml", "--shot", "01-walk").returncode == 0   # designs the narrator on the way
+    shutil.rmtree(film / "voice" / "takes", ignore_errors=True)
+    card = (film / "voice" / "card.wav").read_bytes()
+    assert run(env, "voice", "story.toml", "narrator", "--takes", "1").returncode == 0
+    assert (film / "voice" / "takes" / "narrator-1.wav").read_bytes() == card
+    assert (film / "voice" / "takes" / "narrator-2.wav").exists()
+
+
+def test_a_step_that_runs_out_of_memory_is_tried_once_more(env):
+    film, e, log = env
+    assert run(env, "board", "story.toml", "--shot", "01-walk").returncode == 0
+    log.unlink()
+    e.update(FAKE_OOM_ONCE=str(film.parent / "oom-once"), SPIKE_OOM_PAUSE="0")
+    r = run(env, "video", "story.toml", "--shot", "01-walk")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert len(wan(log)) == 2 and "out of memory" in r.stdout
+
+
+# --- voice pace: every shot as long as its lines ----------------------------------------------
+
+def voice_paced(env):
+    film, _, _ = env
+    (film / "story.toml").write_text(STORY.replace('seed = 1024\n', 'seed = 1024\npace = "voice"\n', 1))
+    return film
+
+
+def test_a_voice_paced_shot_waits_for_its_line_then_lasts_as_long_as_it(env):
+    film, _, log = env
+    voice_paced(env)
+    assert run(env, "board", "story.toml", "--shot", "01-walk").returncode == 0
+    r = run(env, "video", "story.toml", "--shot", "01-walk")
+    assert r.returncode == 2 and "record" in r.stderr and not wan(log)       # the line sets the length
+    assert run(env, "voices", "story.toml", "--shot", "01-walk").returncode == 0
+    r = run(env, "video", "story.toml", "--shot", "01-walk")
+    assert r.returncode == 0, r.stdout + r.stderr
+    want = sa.wan_frames(0.5 + 2.0 + sa.TAIL)                                  # lead, the 2 s line, a breath
+    assert flag(wan(log)[-1]["args"], "--num-frames") == str(want)
+    assert frames(film / "shots" / "01-walk.mp4") == want
+
+
+def test_a_voice_paced_film_is_as_long_as_its_shots(env):
+    film, _, log = env
+    voice_paced(env)
+    set_shot(film, "02-pounce", "seconds = 4.2")
+    assert run(env, "board", "story.toml").returncode == 0
+    assert run(env, "voices", "story.toml").returncode == 0
+    r = run(env, "film", "story.toml")
+    assert r.returncode == 0, r.stdout + r.stderr
+    lens = [sa.wan_frames(0.5 + 2.0 + sa.TAIL) / 24, sa.wan_frames(4.2) / 24, sa.wan_frames(sa.SILENT_SECONDS) / 24]
+    assert duration(film / "film" / "picture.mp4") == pytest.approx(sum(lens), abs=0.08)
+    assert duration(film / "film" / "sfx.wav") == pytest.approx(sum(lens), abs=0.08)
+    sfx = [float(flag(c["args"], "--duration")) for c in calls(log, "python") if c["args"][0] == "demo.py"]
+    assert sfx == pytest.approx(lens, abs=0.01)                               # effects as long as each shot
+    spec = json.loads((film / "score" / "spec.json").read_text())
+    assert spec["duration"] == pytest.approx(sum(lens) + 1.2, abs=0.08)
+    assert duration(film / "film" / "fox-hunt.mp4") == pytest.approx(sum(lens), abs=0.1)
+
+
+def test_a_voice_paced_scene_preview_is_its_shot_long(env):
+    film, _, _ = env
+    voice_paced(env)
+    assert run(env, "board", "story.toml", "--shot", "01-walk").returncode == 0
+    for step in ("voices", "video", "sound"):
+        assert run(env, step, "story.toml", "--shot", "01-walk").returncode == 0, step
+    assert run(env, "scene", "story.toml", "01-walk").returncode == 0
+    assert duration(film / "scenes" / "01-walk.mp4") == pytest.approx(sa.wan_frames(3.0) / 24, abs=0.06)
