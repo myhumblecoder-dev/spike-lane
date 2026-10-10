@@ -1022,3 +1022,15 @@ def test_each_scene_shows_how_long_it_lasts(tmp_path):
     assert st.film_state(folder)["shots"][0]["seconds"] == pytest.approx(sa.wan_frames(0.5 + 2.0 + sa.TAIL) / 24)
     fixed = write_story(tmp_path / "fixed").parent
     assert [s["seconds"] for s in st.film_state(fixed)["shots"]] == pytest.approx([121 / 24] * 3)
+
+
+def test_the_finish_settings_save_with_the_story(tmp_path):
+    folder = write_story(tmp_path / "bolt").parent
+    doc = tomllib.loads((folder / "story.toml").read_text())
+    doc.update(captions=False, end_card={"text": "Put your agent to work.", "sub": "BotGuild.ai"},
+               grade={"warmth": 0.15, "saturation": 1.1})
+    doc["shot"][0]["caption"] = "Quiet."
+    assert st.save_story(folder, doc=doc) == []
+    story = sa.load_story(folder / "story.toml")
+    assert story.captions is False and story.end_card == sa.EndCard("Put your agent to work.", "BotGuild.ai")
+    assert story.grade == sa.Grade(warmth=0.15, saturation=1.1) and story.shots[0].caption == "Quiet."

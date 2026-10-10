@@ -72,6 +72,17 @@ spike-animate check story.toml --shot 03-reveal   # does the picture match the f
 | Narration | Qwen3-TTS 1.7B: VoiceDesign once, Base clones it per line; Parakeet checks every line | ~1 min | small |
 | Score | ACE-Step 1.5 turbo (`engines/score_gen.py`), ranked by `engines/score_rank.py` | ~2 min | 15.7 GB |
 
+Finishing: the film is put together at 1280×720 (the 832×448 clips scaled up), with captions burned in
+(each shot's `caption`, or its narration; `captions = false` turns them off), an optional `[end_card]`
+(`text`, `sub`, `hold` seconds the last frame holds) and one `[grade]` (`warmth`, `saturation`,
+`contrast`) over every shot. The words are drawn by `engines/titles.py` (Pillow), since this ffmpeg has no
+text filters. None of this redoes a scene; the studio sets it on the Film tab (Finish).
+A shot can also show a real picture on a screen in it: `screen = { picture = "reference/page.png",
+corners = [[x, y] ×4] }` (top-left, top-right, bottom-right, bottom-left, 0–1 on the shot's still; `top`
+skips part of the picture first). `engines/screen.py` (OpenCV) crops the picture to the screen's shape from
+its top, like a browser, and warps it onto the corners at the finished size, so its words stay sharp. In the
+studio: the scene's Picture step, **Real screen**, then tap the 4 corners.
+
 Rules it enforces: with `pace = "voice"` (what `new` writes) each shot lasts its own lines plus a 0.5 s
 breath, 49–121 frames at 24 fps (about 2–5 s; a silent shot 3 s, or `seconds = N` on the shot), so a
 scene's lines are recorded before its motion and the cuts land on the voice-over; films without a pace

@@ -970,6 +970,7 @@ function picturePart(s, st) {
       : h("div", { class: "empty-media" }, "Not drawn yet"),
     continuityNote(s),
     scenePictures(s),
+    s.still ? screenEditor(s) : null,
     inlineEdit("Picture description", s.still_text, (v) => saveShot(s.id, (x) => { x.still = v; }, "Saved; draw it again to see it"), 3),
     h("div", { class: "row" }, runBtn(s.still && s.still_fresh !== false ? "Draw again" : "Draw", "board", ex, !st.done),
       h("button", { class: "btn small", disabled: busy() || !!S.film.errors.length || locked("retake", ex), onclick: () => run("retake", { shot: s.id, seeds: seeds() }) }, "3 more versions"),
@@ -1004,6 +1005,70 @@ function scenePictures(s) {
         h("span", { class: "small", style: "flex:1;min-width:0" }, pic.note),
         h("button", { class: "btn small ghost danger", "aria-label": "Remove picture", onclick: () => saveShot(s.id, (x) => { x.pictures.splice(k, 1); if (!x.pictures.length) delete x.pictures; }, "Removed").catch((e) => toast(e.message, true)) }, "✕"))),
       h("div", { class: "row" }, h("div", { style: "flex:1;min-width:0" }, note), h("button", { class: "btn small", onclick: () => file.click() }, "Add picture"), file)));
+}
+
+// A real picture laid onto a screen in the scene (a web page on the laptop), so its words stay readable.
+// Tap the screen's 4 corners on the picture; it is warped onto them when the film is put together.
+function screenEditor(s) {
+  const doc = S.film.doc.shot.find((x) => x.id === s.id) || {};
+  const cur = doc.screen || null;
+  const pics = [...new Set([...(doc.pictures || []).map((p) => p.file), ...(S.film.references || [])])].filter((f) => /\.(png|jpe?g)$/i.test(f));
+  let pts = cur ? cur.corners.map(([x, y]) => [x, y]) : [];
+  const sel = h("select", {}, h("option", { value: "" }, "Choose a picture…"), pics.map((f) => h("option", { value: f }, f.replace(/^reference\//, ""))));
+  sel.value = cur?.picture || pics.find((f) => (doc.pictures || []).some((p) => p.file === f)) || "";
+  const top = h("input", { type: "number", min: 0, max: 0.5, step: 0.01, value: cur?.top || 0, style: "width:6rem" });
+  const NS = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(NS, "svg");
+  svg.setAttribute("viewBox", "0 0 1 1"); svg.setAttribute("preserveAspectRatio", "none");
+  svg.style.cssText = "position:absolute;inset:0;width:100%;height:100%;pointer-events:none";
+  const order = (q) => {    // top-left, top-right, bottom-right, bottom-left, whatever order they were tapped in
+    const byY = [...q].sort((a, b) => a[1] - b[1]);
+    const [tl, tr] = byY.slice(0, 2).sort((a, b) => a[0] - b[0]), [bl, br] = byY.slice(2).sort((a, b) => a[0] - b[0]);
+    return [tl, tr, br, bl];
+  };
+  const draw = () => {
+    svg.replaceChildren();
+    const q = pts.length === 4 ? order(pts) : pts;
+    if (q.length > 1) {
+      const poly = document.createElementNS(NS, "polygon");
+      poly.setAttribute("points", q.map(([x, y]) => `${x},${y}`).join(" "));
+      poly.setAttribute("style", `fill:${q.length === 4 ? "rgba(70,200,180,.25)" : "none"};stroke:#46c8b4;stroke-width:.004`);
+      svg.append(poly);
+    }
+    for (const [x, y] of q) {
+      const c = document.createElementNS(NS, "circle");
+      c.setAttribute("cx", x); c.setAttribute("cy", y); c.setAttribute("r", ".008"); c.setAttribute("style", "fill:#fff;stroke:#111;stroke-width:.003");
+      svg.append(c);
+    }
+    hint.textContent = pts.length < 4 ? `Tap corner ${pts.length + 1} of 4 of the screen` : "Screen marked. Save it, or start over.";
+    save.disabled = pts.length !== 4 || !sel.value;
+  };
+  const img = h("img", { src: media(s.still), alt: "Tap the screen's corners", style: "width:100%;display:block;border-radius:8px;cursor:crosshair" });
+  img.addEventListener("click", (e) => {
+    if (pts.length === 4) pts = [];
+    const r = img.getBoundingClientRect();
+    pts.push([+((e.clientX - r.left) / r.width).toFixed(4), +((e.clientY - r.top) / r.height).toFixed(4)]);
+    draw();
+  });
+  const hint = h("span", { class: "small dim" });
+  const save = h("button", { class: "btn small", onclick: () => saveShot(s.id, (x) => {
+    x.screen = { picture: sel.value, corners: order(pts), ...(Number(top.value) ? { top: Number(top.value) } : {}) };
+  }, "Screen saved; it shows in the film").catch((e) => toast(e.message, true)) }, "Save screen");
+  sel.addEventListener("change", draw);
+  const el = h("details", { class: "sec", open: cur ? true : null },
+    h("summary", {}, h("span", { class: "sum-title" }, "Real screen"), h("span", { class: "sum-sub" }, cur ? cur.picture.replace(/^reference\//, "") : "none")),
+    h("div", { class: "body" },
+      h("p", { class: "small dim" }, "Lay a real picture (a web page, an app) onto a screen in this scene, so its words are sharp and readable. Add the picture above, choose it here, then tap the screen's 4 corners."),
+      h("label", { class: "f" }, h("span", {}, "Picture"), sel),
+      h("div", { style: "position:relative" }, img, svg),
+      h("div", { class: "row" }, hint, h("span", { class: "spacer" }),
+        h("button", { class: "btn small ghost", onclick: () => { pts = []; draw(); } }, "Start over")),
+      h("label", { class: "row", style: "gap:10px" }, h("span", { class: "small" }, "Skip from the top"), top,
+        h("span", { class: "small faint" }, "0–0.5 of the picture, e.g. a phone's address bar")),
+      h("div", { class: "row" }, cur ? h("button", { class: "btn small ghost danger", onclick: () => saveShot(s.id, (x) => { delete x.screen; }, "Screen removed").catch((e) => toast(e.message, true)) }, "Remove screen") : null,
+        h("span", { class: "spacer" }), save)));
+  draw();
+  return el;
 }
 
 function continuityNote(s) {
@@ -1102,6 +1167,11 @@ function linesPart(s, st) {
       s.narration ? heard(s.narration_heard) : null,
       inlineEdit("Narration (leave empty for none)", s.narration, (v) => saveShot(s.id, (x) => { if (v.trim()) x.narration = v.trim(); else delete x.narration; }, "Saved; record again to hear it"), 1)));
   }
+  if (doc.captions !== false) {
+    const own = (doc.shot.find((x) => x.id === s.id) || {}).caption;
+    out.push(inlineEdit("On-screen caption (empty for none; the narration if never set)", own ?? s.narration ?? "",
+      (v) => saveShot(s.id, (x) => { if (v.trim() === (x.narration || "").trim()) delete x.caption; else x.caption = v.trim(); }, "Caption saved; it shows in the film"), 1));
+  }
   const voiced = Object.entries(doc.characters || {}).filter(([, c]) => typeof c === "object" && c.voice).map(([n]) => n);
   (s.dialogue || []).forEach((l, k) => {
     out.push(h("div", { class: "line" }, h("div", { class: "row" }, h("span", { class: "who" }, l.speaker), l.emotion ? h("span", { class: "small faint" }, l.emotion) : null,
@@ -1191,6 +1261,40 @@ function levelsCard() {
     h("div", { class: "row" }, h("span", { class: "spacer" }), save));
 }
 
+// Captions, the end card and one grade: applied when the film is put together, so no scene is redone.
+function finishCard() {
+  const f = S.film, doc = f.doc || {};
+  const mixNow = stepOf("film").unlocked && !busy();
+  const cap = h("input", { type: "checkbox", checked: doc.captions !== false });
+  const text = h("input", { type: "text", value: doc.end_card?.text || "", placeholder: "e.g. Put your agent to work." });
+  const sub = h("input", { type: "text", value: doc.end_card?.sub || "", placeholder: "e.g. BotGuild.ai" });
+  const g = { warmth: 0, saturation: 1, contrast: 1, ...(doc.grade || {}) };
+  const slider = (k, name, min, max, step) => {
+    const out = h("span", { class: "mono small", style: "min-width:3.5em;text-align:right" }, String(g[k]));
+    const r = h("input", { type: "range", min, max, step, value: g[k], "aria-label": name,
+      oninput: (e) => { g[k] = Number(e.target.value); out.textContent = String(g[k]); } });
+    return h("label", { class: "row", style: "gap:12px" }, h("span", { style: "min-width:8em" }, name), r, out);
+  };
+  const save = h("button", { class: "btn small", onclick: async () => {
+    try {
+      await saveDoc((d) => {
+        if (cap.checked) delete d.captions; else d.captions = false;
+        if (text.value.trim()) d.end_card = { ...(d.end_card || {}), text: text.value.trim(), sub: sub.value.trim() }; else delete d.end_card;
+        const grade = Object.fromEntries(Object.entries(g).filter(([k, v]) => v !== { warmth: 0, saturation: 1, contrast: 1 }[k]));
+        if (Object.keys(grade).length) d.grade = grade; else delete d.grade;
+      }, mixNow ? "Saved; putting the film together again" : "Saved; it applies when the film is put together");
+      if (mixNow) run("film");
+    } catch (e) { toast(e.message, true); }
+  } }, mixNow ? "Save and make the film again" : "Save");
+  return h("div", { class: "card stack", style: "gap:10px" }, h("h3", { style: "margin:0" }, "Finish"),
+    h("span", { class: "small dim" }, "Words on screen and one colour grade over every scene. Changing these never redoes a scene."),
+    h("label", { class: "row", style: "gap:10px" }, cap, h("span", {}, "Captions: each scene's narration, or its own caption (set in its Lines)")),
+    h("label", { class: "f" }, h("span", {}, "End card", h("span", { class: "faint" }, "over the last scene, which then holds")), text),
+    h("label", { class: "f" }, h("span", {}, "Second line", h("span", { class: "faint" }, "smaller, e.g. the website")), sub),
+    slider("warmth", "Warmth", -0.5, 0.5, 0.05), slider("saturation", "Colour", 0.5, 1.6, 0.05), slider("contrast", "Contrast", 0.8, 1.3, 0.01),
+    h("div", { class: "row" }, h("span", { class: "spacer" }), save));
+}
+
 function filmTab() {
   const f = S.film, c = f.checks || {};
   const allLines = [...Object.values(c.narration || {}), ...Object.values(c.dialogue || {})];
@@ -1211,6 +1315,7 @@ function filmTab() {
         c.length ? h("span", { class: "chip" }, `${c.length.film} s`) : null,
         f.score.chosen != null ? h("span", { class: "chip" }, `music take ${f.score.chosen}`) : null)) : null,
     levelsCard(),
+    finishCard(),
     f.board ? h("div", {}, h("h2", {}, "Storyboard"), h("img", { src: media(f.board), alt: "Storyboard", loading: "lazy" })) : null,
     gateBar("film", runBtn(f.film ? "Mix again" : "Mix the film", "film", {}, !f.film)));
 }

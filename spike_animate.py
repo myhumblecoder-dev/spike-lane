@@ -20,6 +20,7 @@ import json
 import math
 import re
 import tomllib
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -30,7 +31,9 @@ TAIL = 0.5                      # voice pace: a breath after a shot's last line 
 SILENT_SECONDS = 3.0            # voice pace: a shot with nothing said
 PACES = ("fixed", "voice")
 STILL_SIZE = (1248, 720)        # storyboard stills (Z-Image)
-FIRST_FRAME_SIZE = (1248, 672)  # cartoon first frame for real-clip shots: the video's 832x448 aspect
+FIRST_FRAME_SIZE = (1248, 672)
+FINISH_SIZE = (1280, 720)       # the finished film: the 832x448 clips scaled up to fill it, words drawn at this size
+TITLE_FONT = os.environ.get("TITLE_FONT", "/System/Library/Fonts/Supplemental/Arial Bold.ttf")  # cartoon first frame for real-clip shots: the video's 832x448 aspect
 
 
 class StoryError(ValueError):
@@ -43,6 +46,17 @@ class Reference:
     start: float = 0.0
     sigma: float = 0.88          # noise added to the real clip: lower keeps more real motion
     first_strength: float = 0.4  # how closely the cartoon first frame follows the real one
+
+
+@dataclass
+class Screen:
+    """A real picture (a web page, an app) laid onto a screen in the shot, so its words stay readable.
+    Corners are where the screen is on the shot's still, 0-1 across and down: top-left, top-right,
+    bottom-right, bottom-left. The picture is cropped to the screen's shape from its top, like a browser shows a
+    page; `top` skips that much of it first (0-1 of its height), e.g. a phone's address bar."""
+    picture: Path
+    corners: list[tuple[float, float]]
+    top: float = 0.0
 
 
 @dataclass
@@ -65,6 +79,8 @@ class Shot:
     end: float | None = None         # use the motion only up to here (seconds) ...
     fill: str = "slow"               # ... then "slow" it down to fill the shot, or "hold" its last frame
     seconds: float | None = None     # voice pace: this shot's own length instead of its lines'
+    caption: str | None = None       # on-screen words; None shows the narration, "" shows nothing
+    screen: Screen | None = None
 
     @property
     def video_seed(self) -> int:
@@ -122,6 +138,30 @@ class Angle:
 
 
 @dataclass
+class EndCard:
+    """The closing words, over the last shot, whose last frame then holds for `hold` seconds."""
+    text: str
+    sub: str = ""
+    hold: float = 1.5
+
+
+@dataclass
+class Grade:
+    """One colour grade over every shot, so the film reads as one light."""
+    warmth: float = 0.0          # -1 cooler .. 1 warmer
+    saturation: float = 1.0
+    contrast: float = 1.0
+
+
+@dataclass
+class Title:
+    text: str
+    kind: str        # "caption" (lower third) or "end" (the end card, centred)
+    start: float
+    end: float
+
+
+@dataclass
 class Story:
     path: Path
     title: str
@@ -142,6 +182,9 @@ class Story:
     angles: dict[str, Angle] = field(default_factory=dict)      # and camera setups shots share
     look_seeds: dict[str, int] = field(default_factory=dict)    # the version of each character sheet / place picture
     pace: str = "fixed"                                         # "fixed": 5 s shots; "voice": as long as their lines
+    captions: bool = True                                       # burn the narration (or each shot's caption) in
+    end_card: EndCard | None = None
+    grade: Grade = field(default_factory=Grade)
 
     @property
     def names(self) -> dict[str, str]:
@@ -222,6 +265,20 @@ def load_story(path: Path) -> Story:
                 raise StoryError(f"shot {sid}: reference picture {pic['file']} is missing")
             pictures.append((f, str(pic.get("note", "")).strip() or "a reference for this scene"))
         shot_seed = int(s["seed"]) if "seed" in s else (angles[angle].seed if angle and angles[angle].seed is not None else seed)
+        screen = None
+        if "screen" in s:
+            sc = s["screen"]
+            pic = (path.parent / _need(sc, "picture", f"shot {sid} screen")).resolve()
+            if not pic.is_file():
+                raise StoryError(f"shot {sid}: screen picture {sc['picture']} is missing")
+            corners = [(float(x), float(y)) for x, y in sc.get("corners", [])]
+            if len(corners) != 4 or not all(-0.2 <= v <= 1.2 for c in corners for v in c):
+                raise StoryError(f"shot {sid}: a screen needs 4 corners (top-left, top-right, bottom-right, "
+                                 "bottom-left), each 0-1 across and down the picture")
+            top = float(sc.get("top", 0.0))
+            if not 0 <= top < 0.9:
+                raise StoryError(f"shot {sid}: a screen's top must be between 0 and 0.9")
+            screen = Screen(pic, corners, top)
         secs = float(s["seconds"]) if "seconds" in s else None
         if secs is not None and not MIN_FRAMES / FPS <= secs <= shot_seconds():
             raise StoryError(f"shot {sid}: seconds must be between {MIN_FRAMES / FPS:.2f} and {shot_seconds():.2f}")
@@ -236,7 +293,8 @@ def load_story(path: Path) -> Story:
                           colormatch=bool(s.get("colormatch", ref is None)), reference=ref,
                           still_style=s.get("still_style", ""), dialogue=_lines(s, sid, characters, voices),
                           motion_seed=int(s["motion_seed"]) if "motion_seed" in s else None, end=end,
-                          fill=s.get("fill", "slow"), angle=angle, pictures=pictures, seconds=secs))
+                          fill=s.get("fill", "slow"), angle=angle, pictures=pictures, seconds=secs,
+                          caption=str(s["caption"]).strip() if "caption" in s else None, screen=screen))
     narrator = None
     if "narrator" in d:
         n = d["narrator"]
@@ -261,7 +319,20 @@ def load_story(path: Path) -> Story:
     pace = d.get("pace", "fixed")
     if pace not in PACES:
         raise StoryError(f"pace must be one of {', '.join(PACES)}, not '{pace}'")
-    return Story(pace=pace, levels=Levels(**lv), lighting=d.get("lighting", ""), places=places, angles=angles, look_seeds=look_seeds, path=path, title=_need(d, "title", "the story"), seed=seed, look=_need(d, "look", "the story"),
+    end_card = None
+    if "end_card" in d:
+        e = d["end_card"]
+        end_card = EndCard(text=_need(e, "text", "[end_card]"), sub=str(e.get("sub", "")), hold=float(e.get("hold", 1.5)))
+        if not 0 <= end_card.hold <= 5:
+            raise StoryError("[end_card] hold must be between 0 and 5 seconds")
+    gd = d.get("grade", {})
+    grade = Grade(warmth=float(gd.get("warmth", 0.0)), saturation=float(gd.get("saturation", 1.0)),
+                  contrast=float(gd.get("contrast", 1.0)))
+    if not -1 <= grade.warmth <= 1:
+        raise StoryError("[grade] warmth must be between -1 and 1")
+    if not 0 <= grade.saturation <= 3 or not 0.5 <= grade.contrast <= 2:
+        raise StoryError("[grade] saturation must be 0-3 and contrast 0.5-2")
+    return Story(grade=grade, pace=pace, captions=bool(d.get("captions", True)), end_card=end_card, levels=Levels(**lv), lighting=d.get("lighting", ""), places=places, angles=angles, look_seeds=look_seeds, path=path, title=_need(d, "title", "the story"), seed=seed, look=_need(d, "look", "the story"),
                  still_style=_need(d, "still_style", "the story"), characters=characters,
                  shots=shots, narrator=narrator, music=music, voices=voices, dialogue_mode=mode,
                  sfx_negative=sound.get("negative", Story.sfx_negative), sfx_db=float(sound.get("db", -4.0)))
@@ -356,7 +427,29 @@ def shot_starts(story: Story) -> list[float]:
 
 
 def film_length(story: Story) -> float:
-    return sum(shot_len(story, s) for s in story.shots)
+    """The whole film: every shot, then the end card's held last frame."""
+    return sum(shot_len(story, s) for s in story.shots) + (story.end_card.hold if story.end_card else 0.0)
+
+
+def caption_text(story: Story, shot: Shot) -> str:
+    if not story.captions:
+        return ""
+    return shot.narration.strip() if shot.caption is None else shot.caption
+
+
+def title_plan(story: Story) -> list[Title]:
+    """Every caption over its shot, and the end card from the last shot's lead-in to the end."""
+    starts, last = shot_starts(story), len(story.shots) - 1
+    out = []
+    for i, (s, at) in enumerate(zip(story.shots, starts)):
+        if i == last and story.end_card:
+            break
+        if text := caption_text(story, s):
+            out.append(Title(text, "caption", at, at + shot_len(story, s)))
+    if story.end_card:
+        e, lead = story.end_card, story.narrator.lead if story.narrator else 0.5
+        out.append(Title(e.text + (f"\n{e.sub}" if e.sub else ""), "end", starts[last] + lead, film_length(story)))
+    return out
 
 
 def score_bpm(shot_len: float, beats: int = 8) -> int:
@@ -1078,6 +1171,114 @@ def build_picture(story: Story, keys: Keys) -> Path:
     return out
 
 
+def _cover(pt: tuple[float, float], src: tuple[int, int], dst: tuple[int, int]) -> tuple[float, float]:
+    """Where a pixel of `src` lands when it is scaled to cover `dst` and centre-cropped."""
+    k = max(dst[0] / src[0], dst[1] / src[1])
+    return pt[0] * k - (src[0] * k - dst[0]) / 2, pt[1] * k - (src[1] * k - dst[1]) / 2
+
+
+def still_to_finish(pt: tuple[float, float], still: tuple[int, int], clip: tuple[int, int],
+                    finish: tuple[int, int]) -> tuple[float, float]:
+    """A point on the still (0-1) in the finished film's pixels: the clip crops the still, the film crops the clip."""
+    return _cover(_cover((pt[0] * still[0], pt[1] * still[1]), still, clip), clip, finish)
+
+
+def grade_filter(story: Story) -> str:
+    """ffmpeg filters for the film's grade ("" when it is neutral)."""
+    g, out = story.grade, []
+    if g.saturation != 1 or g.contrast != 1:
+        out.append(f"eq=saturation={g.saturation:g}:contrast={g.contrast:g}")
+    if g.warmth:
+        w = g.warmth
+        out.append(f"colorbalance=rs={w / 2:g}:rm={w:g}:rh={w / 2:g}:bs={-w / 2:g}:bm={-w:g}:bh={-w / 2:g}")
+    return ",".join(out)
+
+
+def render_titles(story: Story, keys: Keys, plan: list[Title]) -> list[Path]:
+    """One transparent picture per title, drawn by the title engine (this ffmpeg has no text filters)."""
+    tdir = story.root / "film" / "titles"
+    outs = [tdir / f"{i:02d}-{t.kind}.png" for i, t in enumerate(plan, 1)]
+    spec = {"size": list(FINISH_SIZE), "font": TITLE_FONT,
+            "items": [{"text": t.text, "kind": t.kind, "out": str(o)} for t, o in zip(plan, outs)]}
+    k = key_for("titles", spec)
+    if any(keys.stale(o, k) for o in outs):
+        _say(f"titles ({len(plan)}) …")
+        tdir.mkdir(parents=True, exist_ok=True)
+        (tdir / "spec.json").write_text(json.dumps(spec, indent=1))
+        r = subprocess.run([_venv("MMAUDIO_HOME", "MMAudio"), str(ENGINES / "titles.py"), str(tdir / "spec.json")],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            raise StageError(f"drawing the titles failed: {r.stderr.strip()[-300:]}")
+        for o in outs:
+            keys.record(o, k)
+    return outs
+
+
+def render_screens(story: Story, keys: Keys, clip: tuple[int, int]) -> list[tuple[Path, float, float]]:
+    """Each shot's screen picture warped onto its corners at the finished size, with the shot's time span."""
+    shots = [(s, at) for s, at in zip(story.shots, shot_starts(story)) if s.screen]
+    if not shots:
+        return []
+    sdir = story.root / "film" / "screens"
+    outs = [sdir / f"{s.id}.png" for s, _ in shots]
+    spec = {"size": list(FINISH_SIZE), "items": [
+        {"picture": str(s.screen.picture), "out": str(o), "top": s.screen.top,
+         "corners": [list(still_to_finish(c, STILL_SIZE, clip, FINISH_SIZE)) for c in s.screen.corners]}
+        for (s, _), o in zip(shots, outs)]}
+    k = key_for("screens", spec, [file_digest(s.screen.picture) for s, _ in shots])
+    if any(keys.stale(o, k) for o in outs):
+        _say(f"screens ({len(shots)}) …")
+        sdir.mkdir(parents=True, exist_ok=True)
+        (sdir / "spec.json").write_text(json.dumps(spec, indent=1))
+        r = subprocess.run([_venv("FASTVIDEO_HOME", "FastVideo"), str(ENGINES / "screen.py"), str(sdir / "spec.json")],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            raise StageError(f"laying the screen pictures failed: {r.stderr.strip()[-300:]}")
+        for o in outs:
+            keys.record(o, k)
+    return [(o, at, at + shot_len(story, s)) for (s, at), o in zip(shots, outs)]
+
+
+def video_size(path: Path) -> tuple[int, int]:
+    r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v", "-show_entries", "stream=width,height",
+                        "-of", "csv=p=0", str(path)], capture_output=True, text=True)
+    try:
+        w, h = r.stdout.strip().split(",")[:2]
+        return int(w), int(h)
+    except ValueError:
+        raise StageError(f"cannot read the size of {path}") from None
+
+
+def finish_picture(story: Story, keys: Keys, picture: Path) -> Path:
+    """The picture at the finished size: graded, real screens laid on, then captions and the end card over
+    it, the last frame held for the card."""
+    out = story.root / "film" / "finished.mp4"
+    plan = title_plan(story)
+    layers = render_screens(story, keys, video_size(picture))      # screens first, words on top
+    pngs = render_titles(story, keys, plan) if plan else []
+    layers += [(png, t.start, t.end) for t, png in zip(plan, pngs)]
+    hold = story.end_card.hold if story.end_card else 0.0
+    k = key_for("finish", file_digest(picture), [(file_digest(p), a, b) for p, a, b in layers], hold, FINISH_SIZE,
+                grade_filter(story))
+    if keys.stale(out, k):
+        _say("finish: size" + (", screens and titles" if layers else "") + " …")
+        w, h = FINISH_SIZE
+        g = f"[0:v]scale={w}:{h}:force_original_aspect_ratio=increase:flags=lanczos,crop={w}:{h},setsar=1"
+        g += f",{grade_filter(story)}" if grade_filter(story) else ""
+        g += (f",tpad=stop_mode=clone:stop_duration={hold:g}" if hold else "") + "[v0];"
+        ins = ["-i", picture]
+        for i, (png, a, b) in enumerate(layers, 1):
+            ins += ["-loop", 1, "-framerate", FPS, "-t", f"{b - a:.3f}", "-i", png]
+            fade = "fade=in:st=0:d=0.2:alpha=1," if png.parent.name == "titles" else ""
+            g += (f"[{i}:v]format=rgba,{fade}setpts=PTS-STARTPTS+{a:.3f}/TB[t{i}];"
+                  f"[v{i - 1}][t{i}]overlay=eof_action=pass:format=auto[v{i}];")
+        g = g.rstrip(";")
+        ffmpeg(*ins, "-filter_complex", g, "-map", f"[v{len(layers)}]", "-c:v", "libx264", "-crf", 17,
+               "-pix_fmt", "yuv420p", "-r", FPS, out)
+        keys.record(out, k)
+    return out
+
+
 def sfx_path(story: Story, shot: Shot) -> Path:
     return story.root / "sfx" / f"{shot.id}.flac"
 
@@ -1408,7 +1609,8 @@ def save_checks(story: Story, part: dict, merge: bool = False) -> None:
 def film_seconds(story: Story) -> float:
     """The picture's length: the shots butt-joined (what build_picture produces)."""
     picture = story.root / "film" / "picture.mp4"
-    return media_seconds(picture) if picture.exists() else film_length(story)
+    hold = story.end_card.hold if story.end_card else 0.0
+    return media_seconds(picture) + hold if picture.exists() else film_length(story)
 
 
 def _scene(story: Story, shot_id: str | None) -> list[Shot] | None:
@@ -1539,7 +1741,7 @@ def cmd_film(story: Story) -> int:
     lines = narrate(story, keys, checks) + speak_dialogue(story, keys, checks)   # first: they can set the shot lengths
     for shot in story.shots:
         animate_shot(story, shot, keys)
-    picture = build_picture(story, keys)
+    picture = finish_picture(story, keys, build_picture(story, keys))
     total = media_seconds(picture)
     soundtrack = build_soundtrack(story, [sound_shot(story, s, keys) for s in story.shots], keys)
     music = score(story, keys, checks, total)
@@ -1582,12 +1784,15 @@ import urllib.request  # noqa: E402
 
 DRAFT_SCHEMA = {
     "type": "object",
-    "required": ["title", "look", "still_style", "lighting", "characters", "places", "angles", "narrator", "music", "shots"],
+    "required": ["title", "look", "still_style", "lighting", "characters", "places", "angles", "narrator", "music",
+                 "end_card", "shots"],
     "properties": {
         "title": {"type": "string"},
         "look": {"type": "string"},
         "still_style": {"type": "string"},
         "lighting": {"type": "string"},
+        "end_card": {"type": "object", "required": ["text", "sub"],
+                     "properties": {"text": {"type": "string"}, "sub": {"type": "string"}}},
         "places": {"type": "array", "items": {"type": "object", "required": ["name", "description"],
                    "properties": {"name": {"type": "string"}, "description": {"type": "string"}}}},
         "angles": {"type": "array", "items": {"type": "object", "required": ["name", "frame"],
@@ -1600,8 +1805,8 @@ DRAFT_SCHEMA = {
         "music": {"type": "object", "required": ["caption", "structure", "key"],
                   "properties": {"caption": {"type": "string"}, "structure": {"type": "string"}, "key": {"type": "string"}}},
         "shots": {"type": "array", "items": {"type": "object",
-                  "required": ["id", "angle", "still", "motion", "sfx", "narration", "intensity", "action"],
-                  "properties": {"id": {"type": "string"}, "angle": {"type": "string"},
+                  "required": ["id", "angle", "still", "motion", "sfx", "narration", "caption", "intensity", "action"],
+                  "properties": {"id": {"type": "string"}, "angle": {"type": "string"}, "caption": {"type": "string"},
                                  "still": {"type": "string"}, "motion": {"type": "string"},
                                  "sfx": {"type": "string"}, "narration": {"type": "string"},
                                  "intensity": {"type": "number"}, "action": {"type": "boolean"},
@@ -1634,6 +1839,7 @@ def draft_schema(parts: Parts = Parts()) -> dict:
 
 MAX_NARRATION_WORDS = 10   # ~3 s of narration: a voice-paced shot is its line plus a breath, at most 5 s
 MAX_DIALOGUE_WORDS = 12    # all the dialogue in one shot, for the same reason
+MAX_CAPTION_WORDS = 6      # on-screen words: read at a glance
 
 WRITER_EXAMPLE = {
     "title": "Fox Hunt",
@@ -1661,23 +1867,24 @@ WRITER_EXAMPLE = {
               "structure": "[Intro - hushed celesta, snowy forest]\n\n[Build - tremolo strings, creeping suspense]\n\n"
                            "[Climax - pounding timpani, brass stabs]\n\n[Outro - low cello drone, fade out]",
               "key": "D minor"},
+    "end_card": {"text": "", "sub": ""},
     "shots": [
         {"id": "01-establish", "angle": "WIDE", "still": "FOX walking into the CLEARING",
          "motion": "static camera, a slender red fox walks steadily through the snowy pine forest at dawn, mouth closed",
          "sfx": "soft paw footsteps crunching in snow, quiet winter wind", "narration":
-         "Deep in the winter woods, the fox was hungry.", "intensity": 0.15, "action": False, "dialogue": []},
+         "Deep in the winter woods, the fox was hungry.", "caption": "The fox was hungry.", "intensity": 0.15, "action": False, "dialogue": []},
         {"id": "02-reveal", "angle": "LOG", "still": "RAB nibbling grass in the CLEARING, unaware",
          "motion": "static camera, a brown rabbit nibbles grass, chewing, ears twitching",
          "sfx": "rabbit nibbling, soft rustling, quiet birdsong", "narration": "Breakfast. And it had no idea.",
-         "intensity": 0.3, "action": False, "dialogue": []},
+         "caption": "Breakfast.", "intensity": 0.3, "action": False, "dialogue": []},
         {"id": "03-taunt", "angle": "LOG", "still": "FOX crouched behind the log in the CLEARING, grinning",
          "motion": "static camera, a red fox grins and talks quietly, eyes fixed ahead",
-         "sfx": "soft wind, a twig creaking", "narration": "",
+         "sfx": "soft wind, a twig creaking", "narration": "", "caption": "",
          "dialogue": [{"speaker": "FOX", "line": "Good morning, little breakfast.", "emotion": "sly, purring"}],
          "intensity": 0.6, "action": False},
         {"id": "03-pounce", "angle": "WIDE", "still": "FOX leaping through the air to pounce on RAB in the CLEARING, snow spraying",
          "motion": "a red fox leaps through the air and pounces on a brown rabbit, snow spraying, fast dynamic action",
-         "sfx": "fast whoosh of a leap, paws thudding into snow, rabbit squeal", "narration": "",
+         "sfx": "fast whoosh of a leap, paws thudding into snow, rabbit squeal", "narration": "", "caption": "",
          "intensity": 1.0, "action": True, "dialogue": []},
     ],
 }
@@ -1755,6 +1962,10 @@ How the film is made, so write for it:
   follow the laptop screen"). A character who doesn't speak in the shot keeps their mouth closed: add
   "mouth closed" to the motion, or the video model animates their lips.
 - "sfx" lists the sounds of that shot (no music, no speech).
+- "caption" is the words burned in on screen over the shot: at most {MAX_CAPTION_WORDS} words, a shorter, punchier echo of
+  its line ("Built the agent.", "Now make it earn."), or "" for none.
+- "end_card" is the closing words over the last shot, e.g. for an ad the tagline and the website:
+  {{"text": "Put your agent to work.", "sub": "BotGuild.ai"}}. Use {{"text": "", "sub": ""}} when the film needs none.
 {narration_rule}{dialogue_rule}- "intensity" is the story's energy in that shot, from 0 (calm) to 1 (peak). Build to one peak near the end.
 {looks}
 {music_rule}- Shot ids look like 01-name, 02-name, ... in order.
@@ -1801,6 +2012,9 @@ def lint_draft(d: dict, shots: int, parts: Parts = Parts()) -> list[str]:
         sid = s.get("id", "?")
         if not re.fullmatch(r"\d\d-[a-z0-9-]+", sid):
             problems.append(f"shot id '{sid}' must look like 01-name (two digits, a dash, lowercase words)")
+        cw = len(s.get("caption", "").split())
+        if cw > MAX_CAPTION_WORDS:
+            problems.append(f"shot {sid} caption has {cw} words; keep it to {MAX_CAPTION_WORDS} or fewer")
         words = len(s.get("narration", "").split())
         if words > MAX_NARRATION_WORDS:
             problems.append(f"shot {sid} narration has {words} words; keep it to {MAX_NARRATION_WORDS} or fewer so it fits a 5 second shot")
@@ -1864,6 +2078,9 @@ def draft_to_toml(d: dict, idea: str, notes: str = "", style_image: str = "", st
         m = d["music"]
         out += ["", "[music]", f"caption = {q(m['caption'])}", f"key = {q(m['key'])}", "takes = 8", "db = -10",
                 f"structure = {q(m['structure'])}"]
+    e = d.get("end_card") or {}
+    if e.get("text", "").strip():
+        out += ["", "[end_card]", f"text = {q(e['text'].strip())}", f"sub = {q(e.get('sub', '').strip())}"]
     for s in d["shots"]:
         out += ["", "[[shot]]", f"id = {q(s['id'])}"]
         if s.get("angle"):
@@ -1875,6 +2092,8 @@ def draft_to_toml(d: dict, idea: str, notes: str = "", style_image: str = "", st
             out.append(f"sfx = {q(s['sfx'])}")
         if s.get("narration"):
             out.append(f"narration = {q(s['narration'])}")
+        if s.get("caption", "").strip() or ("caption" in s and s.get("narration")):
+            out.append(f"caption = {q(s['caption'].strip())}")
         if s.get("dialogue"):
             out.append("dialogue = [" + ", ".join(
                 f"{{ speaker = {q(x['speaker'])}, line = {q(x['line'])}, emotion = {q(x.get('emotion', ''))} }}"

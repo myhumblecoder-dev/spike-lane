@@ -355,3 +355,97 @@ def test_voice_paced_lines_start_where_their_shots_start(tmp_path):
     assert sa.narration_offsets(story) == [("01-establish", pytest.approx(0.5)),
                                            ("03-stalk", pytest.approx(lens[0] + lens[1] + 0.5))]
     assert sa.film_length(story) == pytest.approx(sum(lens))
+
+
+# --- titles: captions and the end card --------------------------------------------------------
+
+def test_captions_are_on_and_show_the_narration_unless_a_shot_has_its_own(tmp_path):
+    text = STORY.replace('id = "03-stalk"\n', 'id = "03-stalk"\ncaption = "Closer."\n', 1)
+    story = sa.load_story(write_story(tmp_path, text))
+    assert story.captions is True
+    assert [sa.caption_text(story, s) for s in story.shots] == ["Deep in the winter woods, the fox was hungry.", "", "Closer."]
+    hidden = sa.load_story(write_story(tmp_path, text.replace('id = "01-establish"\n', 'id = "01-establish"\ncaption = ""\n', 1)))
+    assert sa.caption_text(hidden, hidden.shots[0]) == ""                   # an empty caption hides the line
+    off = sa.load_story(write_story(tmp_path, text.replace('seed = 1024\n', 'seed = 1024\ncaptions = false\n', 1)))
+    assert [sa.caption_text(off, s) for s in off.shots] == ["", "", ""]
+
+
+END = '\n[end_card]\ntext = "Put your agent to work."\nsub = "BotGuild.ai"\n'
+
+
+def test_the_end_card_holds_the_last_frame_and_replaces_the_last_caption(tmp_path):
+    story = sa.load_story(write_story(tmp_path, STORY.replace("\n[[shot]]", END + "\n[[shot]]", 1)))
+    assert story.end_card == sa.EndCard(text="Put your agent to work.", sub="BotGuild.ai", hold=1.5)
+    L = sa.SHOT_FRAMES / sa.FPS
+    assert sa.film_length(story) == pytest.approx(3 * L + 1.5)
+    plan = sa.title_plan(story)
+    assert plan == [
+        sa.Title("Deep in the winter woods, the fox was hungry.", "caption", 0.0, pytest.approx(L)),
+        sa.Title("Put your agent to work.\nBotGuild.ai", "end", pytest.approx(2 * L + 0.5), pytest.approx(3 * L + 1.5)),
+    ]
+
+
+def test_without_an_end_card_the_last_caption_stays(story):
+    plan = sa.title_plan(story)
+    L = sa.SHOT_FRAMES / sa.FPS
+    assert [(t.text, t.kind) for t in plan] == [("Deep in the winter woods, the fox was hungry.", "caption"),
+                                                ("Slowly. Closer.", "caption")]
+    assert (plan[1].start, plan[1].end) == (pytest.approx(2 * L), pytest.approx(3 * L))
+    assert sa.film_length(story) == pytest.approx(3 * L)
+
+
+def test_a_film_wide_grade_is_neutral_unless_set(story, tmp_path):
+    assert sa.grade_filter(story) == ""
+    text = STORY + "\n[grade]\nwarmth = 0.1\nsaturation = 1.2\ncontrast = 1.05\n"
+    graded = sa.load_story(write_story(tmp_path, text))
+    assert graded.grade == sa.Grade(warmth=0.1, saturation=1.2, contrast=1.05)
+    f = sa.grade_filter(graded)
+    assert "saturation=1.2" in f and "contrast=1.05" in f and "rm=0.1" in f and "bm=-0.1" in f
+    with pytest.raises(sa.StoryError, match="warmth"):
+        sa.load_story(write_story(tmp_path, STORY + "\n[grade]\nwarmth = 2\n"))
+
+
+# --- screens: a real picture laid onto a screen in the shot ------------------------------------
+
+SCREEN = 'screen = { picture = "reference/page.png", corners = [[0.3, 0.2], [0.7, 0.2], [0.7, 0.6], [0.3, 0.6]] }\n'
+
+
+def test_a_shot_can_show_a_real_picture_on_a_screen(tmp_path):
+    (tmp_path / "reference").mkdir()
+    (tmp_path / "reference" / "page.png").write_bytes(b"x")
+    story = sa.load_story(write_story(tmp_path, STORY.replace('id = "02-pounce"\n', 'id = "02-pounce"\n' + SCREEN, 1)))
+    s = story.shots[1].screen
+    assert s.picture == (tmp_path / "reference" / "page.png").resolve()
+    assert s.corners == [(0.3, 0.2), (0.7, 0.2), (0.7, 0.6), (0.3, 0.6)]
+    assert story.shots[0].screen is None
+
+
+def test_a_screen_needs_its_picture_and_four_corners(tmp_path):
+    with pytest.raises(sa.StoryError, match="page.png"):
+        sa.load_story(write_story(tmp_path, STORY.replace('id = "02-pounce"\n', 'id = "02-pounce"\n' + SCREEN, 1)))
+    (tmp_path / "reference").mkdir()
+    (tmp_path / "reference" / "page.png").write_bytes(b"x")
+    three = SCREEN.replace(", [0.3, 0.6]]", "]")
+    with pytest.raises(sa.StoryError, match="4 corners"):
+        sa.load_story(write_story(tmp_path, STORY.replace('id = "02-pounce"\n', 'id = "02-pounce"\n' + three, 1)))
+
+
+def test_a_point_on_the_still_lands_where_the_finished_film_shows_it():
+    # the still is cropped to the clip (cover, centre), and the clip to the finished film the same way
+    still, clip, fin = (1248, 720), (832, 448), (1280, 720)
+    assert sa.still_to_finish((0.5, 0.5), still, clip, fin) == pytest.approx((640, 360))
+    x, y = sa.still_to_finish((0.0, 0.0), still, clip, fin)
+    s1 = 832 / 1248                                       # still → clip: widths match, 16 px cropped top and bottom
+    y_clip = (0 * 720 * s1 - (720 * s1 - 448) / 2)
+    s2 = 720 / 448                                        # clip → film: heights match, sides cropped
+    assert (x, y) == pytest.approx((0 - (832 * s2 - 1280) / 2, y_clip * s2))
+
+
+def test_a_screen_picture_can_skip_its_top(tmp_path):
+    (tmp_path / "reference").mkdir()
+    (tmp_path / "reference" / "page.png").write_bytes(b"x")
+    text = STORY.replace('id = "02-pounce"\n', 'id = "02-pounce"\n' + SCREEN.replace("] }", "], top = 0.05 }"), 1)
+    story = sa.load_story(write_story(tmp_path, text))
+    assert story.shots[1].screen.top == 0.05
+    plain = sa.load_story(write_story(tmp_path, STORY.replace('id = "02-pounce"\n', 'id = "02-pounce"\n' + SCREEN, 1)))
+    assert plain.shots[1].screen.top == 0.0

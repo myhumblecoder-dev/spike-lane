@@ -425,3 +425,36 @@ def test_the_writer_cuts_to_the_lines_and_keeps_them_short():
 def test_a_new_film_has_six_shots_unless_asked(tmp_path):
     args = sa.build_parser().parse_args(["new", str(tmp_path), "an idea"])
     assert args.shots == 6
+
+
+# --- captions and the end card ----------------------------------------------------------------
+
+def test_a_draft_keeps_its_captions_and_end_card(tmp_path):
+    d = draft(end_card={"text": "Keep the light burning.", "sub": "lighthouse.org"})
+    d["shots"][0]["caption"] = "Lamp lit."
+    d["shots"][1]["caption"] = ""
+    d["shots"][2]["caption"] = ""                                  # no caption over a narrated shot
+    p = tmp_path / "story.toml"
+    p.write_text(sa.draft_to_toml(d, idea="a keeper and a gull"))
+    story = sa.load_story(p)
+    assert [sa.caption_text(story, s) for s in story.shots] == ["Lamp lit.", "", ""]
+    assert story.end_card == sa.EndCard("Keep the light burning.", "lighthouse.org")
+
+
+def test_a_draft_without_an_end_card_has_none(tmp_path):
+    p = tmp_path / "story.toml"
+    p.write_text(sa.draft_to_toml(draft(end_card={"text": "", "sub": ""}), idea="a keeper and a gull"))
+    assert sa.load_story(p).end_card is None
+
+
+def test_the_writer_asks_for_short_captions_and_an_end_card():
+    p = sa.writer_prompt("an ad for a bakery", shots=6)
+    assert '"caption"' in p and f"at most {sa.MAX_CAPTION_WORDS} words" in p and '"end_card"' in p
+    schema = sa.draft_schema()
+    assert "end_card" in schema["required"] and "caption" in schema["properties"]["shots"]["items"]["required"]
+
+
+def test_lint_keeps_captions_short():
+    d = draft()
+    d["shots"][0]["caption"] = "one two three four five six seven eight"
+    assert any("caption" in x for x in sa.lint_draft(d, 3))

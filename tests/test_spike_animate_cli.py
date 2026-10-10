@@ -64,6 +64,21 @@ elif me == "python" and args and args[0].endswith("score_gen.py"):
     spec = json.loads(Path(args[1]).read_text())
     for s in spec["seeds"]:
         tone(Path(spec["out"]) / f"take-s{s}.wav", spec["duration"])
+elif me == "python" and args and args[0].endswith("titles.py"):
+    spec = json.loads(Path(args[1]).read_text())   # a white bar where the words would be
+    w, h = spec["size"]
+    for it in spec["items"]:
+        a = f"if(between(X\\,{w // 6}\\,{w * 5 // 6})*between(Y\\,{int(h * 0.82)}\\,{int(h * 0.9)})\\,255\\,0)"
+        ff("-f", "lavfi", "-i", f"color=c=white:s={w}x{h},format=rgba", "-vf", f"geq=r=255:g=255:b=255:a='{a}'",
+           "-frames:v", "1", it["out"])
+elif me == "python" and args and args[0].endswith("screen.py"):
+    spec = json.loads(Path(args[1]).read_text())   # white where the screen's corners say
+    w, h = spec["size"]
+    for it in spec["items"]:
+        xs, ys = [int(c[0]) for c in it["corners"]], [int(c[1]) for c in it["corners"]]
+        a = f"if(between(X\\,{min(xs)}\\,{max(xs)})*between(Y\\,{min(ys)}\\,{max(ys)})\\,255\\,0)"
+        ff("-f", "lavfi", "-i", f"color=c=white:s={w}x{h},format=rgba", "-vf", f"geq=r=255:g=255:b=255:a='{a}'",
+           "-frames:v", "1", it["out"])
 elif me == "python" and args and args[0].endswith("score_rank.py"):
     takes = args[3:]
     Path(args[2]).write_text(json.dumps([{"take": t, "score": 1.0 - i / 10} for i, t in enumerate(takes)]))
@@ -844,3 +859,120 @@ def test_a_voice_paced_scene_preview_is_its_shot_long(env):
         assert run(env, step, "story.toml", "--shot", "01-walk").returncode == 0, step
     assert run(env, "scene", "story.toml", "01-walk").returncode == 0
     assert duration(film / "scenes" / "01-walk.mp4") == pytest.approx(sa.wan_frames(3.0) / 24, abs=0.06)
+
+
+# --- titles: captions, the end card, and the finished size ------------------------------------
+
+END_CARD = '\n[end_card]\ntext = "Put your agent to work."\nsub = "BotGuild.ai"\n'
+
+
+def size(path):
+    out = subprocess.run([str(Path(FFMPEG).with_name("ffprobe")), "-v", "error", "-select_streams", "v",
+                          "-show_entries", "stream=width,height", "-of", "csv=p=0", str(path)],
+                         capture_output=True, text=True, check=True).stdout.strip()
+    return tuple(int(x) for x in out.split(","))
+
+
+def bar(path, t):
+    """How bright the caption band of the frame at `t` is (0-255)."""
+    out = subprocess.run([FFMPEG, "-v", "error", "-ss", str(t), "-i", str(path), "-frames:v", "1", "-vf",
+                          "crop=iw*2/3:ih/14:iw/6:ih*0.83,scale=1:1,format=gray", "-f", "rawvideo", "-"],
+                         capture_output=True, check=True).stdout
+    return out[0]
+
+
+def test_the_film_is_finished_at_720p_with_captions_and_an_end_card(env):
+    film, _, log = env
+    (film / "story.toml").write_text(STORY.replace("\n[[shot]]", END_CARD + "\n[[shot]]", 1))
+    assert run(env, "board", "story.toml").returncode == 0
+    r = run(env, "film", "story.toml")
+    assert r.returncode == 0, r.stdout + r.stderr
+    spec = json.loads((film / "film" / "titles" / "spec.json").read_text())
+    assert spec["size"] == [1280, 720]
+    assert [i["text"] for i in spec["items"]] == ["The fox was hungry.", "Put your agent to work.\nBotGuild.ai"]
+    out = film / "film" / "fox-hunt.mp4"
+    L = 121 / 24
+    assert size(out) == (1280, 720)
+    assert duration(out) == pytest.approx(3 * L + 1.5, abs=0.1)              # the last frame holds for the card
+    assert bar(out, 1.0) > 220 and bar(out, L + 1.0) < 160                    # a caption over shot 1 only
+                                                                              # (the stand-in video is at most 143)
+    assert bar(out, 3 * L + 1.0) > 220                                        # the end card, over the held frame
+
+
+def test_without_captions_the_film_is_still_finished_at_720p(env):
+    film, _, log = env
+    (film / "story.toml").write_text(STORY.replace("seed = 1024\n", "seed = 1024\ncaptions = false\n", 1))
+    assert run(env, "board", "story.toml").returncode == 0
+    r = run(env, "film", "story.toml")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not [c for c in calls(log, "python") if c["args"][0].endswith("titles.py")]
+    out = film / "film" / "fox-hunt.mp4"
+    assert size(out) == (1280, 720) and bar(out, 1.0) < 160
+    assert duration(out) == pytest.approx(3 * 121 / 24, abs=0.1)
+
+
+@pytest.mark.skipif(not (Path.home() / "MMAudio" / ".venv" / "bin" / "python").exists(), reason="needs Pillow's venv")
+def test_the_title_engine_draws_readable_words(tmp_path):
+    spec = {"size": [1280, 720], "font": sa.TITLE_FONT, "items": [
+        {"text": "Built the agent.", "kind": "caption", "out": str(tmp_path / "c.png")},
+        {"text": "Put your agent to work.\nBotGuild.ai", "kind": "end", "out": str(tmp_path / "e.png")}]}
+    (tmp_path / "spec.json").write_text(json.dumps(spec))
+    subprocess.run([str(Path.home() / "MMAudio" / ".venv" / "bin" / "python"), str(ROOT / "engines" / "titles.py"),
+                    str(tmp_path / "spec.json")], check=True)
+    for name, rows in (("c.png", (0.75, 0.95)), ("e.png", (0.35, 0.65))):
+        alpha = subprocess.run([FFMPEG, "-v", "error", "-i", str(tmp_path / name), "-vf", "alphaextract,format=gray",
+                                "-f", "rawvideo", "-"], capture_output=True, check=True).stdout
+        ink = [i // 1280 / 720 for i, a in enumerate(alpha) if a > 128]
+        assert ink and rows[0] <= min(ink) and max(ink) <= rows[1], name     # words, where they belong
+
+
+def rgb(path, t):
+    out = subprocess.run([FFMPEG, "-v", "error", "-ss", str(t), "-i", str(path), "-frames:v", "1", "-vf",
+                          "scale=1:1,format=rgb24", "-f", "rawvideo", "-"], capture_output=True, check=True).stdout
+    return tuple(out[:3])
+
+
+def test_a_warmer_grade_refinishes_the_film_without_animating_again(env):
+    film, _, log = env
+    assert run(env, "board", "story.toml").returncode == 0
+    assert run(env, "film", "story.toml").returncode == 0
+    before = rgb(film / "film" / "fox-hunt.mp4", 1.0)
+    log.unlink()
+    (film / "story.toml").write_text(STORY + "\n[grade]\nwarmth = 0.3\n")
+    r = run(env, "film", "story.toml")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not wan(log)
+    after = rgb(film / "film" / "fox-hunt.mp4", 1.0)
+    assert after[0] - after[2] > before[0] - before[2] + 10                    # redder, less blue
+
+
+# --- screens ------------------------------------------------------------------------------------
+
+def patch(path, t, box):
+    """How bright a box (x, y, w, h in film pixels) of the frame at `t` is."""
+    x, y, w, h = box
+    out = subprocess.run([FFMPEG, "-v", "error", "-ss", str(t), "-i", str(path), "-frames:v", "1", "-vf",
+                          f"crop={w}:{h}:{x}:{y},scale=1:1,format=gray", "-f", "rawvideo", "-"],
+                         capture_output=True, check=True).stdout
+    return out[0]
+
+
+def test_a_real_picture_is_laid_onto_the_screen_in_its_shot(env):
+    film, _, log = env
+    subprocess.run([FFMPEG, "-v", "error", "-f", "lavfi", "-i", "color=c=gray:s=640x400", "-frames:v", "1",
+                    str(film / "reference" / "page.png")], check=True)
+    corners = [[0.3, 0.2], [0.7, 0.2], [0.7, 0.6], [0.3, 0.6]]
+    (film / "story.toml").write_text(STORY.replace("seed = 1024\n", "seed = 1024\ncaptions = false\n", 1))
+    set_shot(film, "02-pounce", f'screen = {{ picture = "reference/page.png", corners = {corners} }}')
+    assert run(env, "board", "story.toml").returncode == 0
+    r = run(env, "film", "story.toml")
+    assert r.returncode == 0, r.stdout + r.stderr
+    spec = json.loads((film / "film" / "screens" / "spec.json").read_text())
+    want = [sa.still_to_finish(tuple(c), sa.STILL_SIZE, (832, 448), sa.FINISH_SIZE) for c in corners]
+    assert spec["items"][0]["corners"] == [pytest.approx(list(c)) for c in want]
+    assert spec["items"][0]["top"] == 0.0
+    out, L = film / "film" / "fox-hunt.mp4", 121 / 24
+    (x0, y0), (x1, y1) = want[0], want[2]
+    box = (int(x0) + 10, int(y0) + 10, int(x1 - x0) - 20, int(y1 - y0) - 20)
+    assert patch(out, L + 1.0, box) > 220                       # the picture, over shot 2
+    assert patch(out, 1.0, box) < 160 and patch(out, 2 * L + 1.0, box) < 160   # and only there
