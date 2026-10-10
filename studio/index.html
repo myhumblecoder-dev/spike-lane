@@ -274,13 +274,16 @@ async function home() {
   const [narrOn, narrBox] = part("Narrator", "a voice telling the story");
   const [talkOn, talkBox] = part("Characters talk", "dialogue in their own voices");
   const [musicOn, musicBox] = part("Music", "a score under the whole film");
+  const lookSel = h("select", { "aria-label": "Look without a style picture" },
+    h("option", { value: "keyart" }, "Rich key art: detailed, cinematic light"), h("option", { value: "flat" }, "Flat cartoon: bold outlines, flat colours"));
+  const lookBox = h("label", { class: "f" }, h("span", {}, "Look", h("span", { class: "faint" }, "when there's no style picture")), lookSel);
   const go = h("button", { class: "btn primary", onclick: async () => {
     if (!idea.value.trim()) return toast("Write the story or idea first", true);
     go.disabled = true;
     try {
       const r = await api("POST", "/api/films", { title: title.value.trim() || idea.value.trim().slice(0, 40) });
       const params = { step: "new", idea: idea.value, notes: notes.value, shots: +shots.value || 6,
-        narrator: narrOn.checked, dialogue: talkOn.checked, music: musicOn.checked };
+        narrator: narrOn.checked, dialogue: talkOn.checked, music: musicOn.checked, look: lookSel.value };
       const file = styleIn.files[0];
       if (file) {
         toast("Uploading the style picture…");
@@ -300,6 +303,7 @@ async function home() {
       h("label", { class: "f" }, h("span", {}, "Your story"), idea),
       h("label", { class: "f" }, h("span", {}, "Reference notes"), notes),
       h("div", { class: "f" }, h("span", { class: "small dim" }, "Style picture"), styleBox),
+      lookBox,
       h("div", { class: "f" }, h("span", { class: "small dim" }, "In this film"), h("div", { class: "row", style: "gap:16px;flex-wrap:wrap" }, narrBox, talkBox, musicBox)),
       h("div", { class: "grid2" }, h("label", { class: "f" }, h("span", {}, "Title (optional)"), title),
         h("label", { class: "f" }, h("span", {}, "Shots", h("span", { class: "faint" }, "5 s each")), shots)),
@@ -768,7 +772,10 @@ function lookTab() {
 
 function lookCard(lk) {
   const st = stepOf(`look:${lk.name}`), ex = { name: lk.name };
-  const seeds = () => [0, 1, 2].map(() => Math.floor(Math.random() * 9000) + 100);
+  const seeds = () => [0, 1, 2, 3, 4].map(() => Math.floor(Math.random() * 9000) + 100);
+  const rank = Object.fromEntries((s.ranking || []).map((r, i) => [r.seed, { ...r, best: i === 0 && s.ranking.length > 1 }]));
+  const order = (r) => (rank[r.seed] ? -rank[r.seed].score : 1);
+  const mine = rank[s.seed];
   const upload = h("input", { type: "file", accept: "image/png,image/jpeg", hidden: true, onchange: async () => {
     const file = upload.files[0]; if (!file) return;
     const ext = (file.name.match(/\.(png|jpe?g)$/i) || [".png"])[0].toLowerCase();
@@ -973,12 +980,18 @@ function picturePart(s, st) {
     s.still ? screenEditor(s) : null,
     inlineEdit("Picture description", s.still_text, (v) => saveShot(s.id, (x) => { x.still = v; }, "Saved; draw it again to see it"), 3),
     h("div", { class: "row" }, runBtn(s.still && s.still_fresh !== false ? "Draw again" : "Draw", "board", ex, !st.done),
-      h("button", { class: "btn small", disabled: busy() || !!S.film.errors.length || locked("retake", ex), onclick: () => run("retake", { shot: s.id, seeds: seeds() }) }, "3 more versions"),
+      h("button", { class: "btn small", disabled: busy() || !!S.film.errors.length || locked("retake", ex), onclick: () => run("retake", { shot: s.id, seeds: seeds(), rank: true }) }, "5 more versions, ranked"),
       h("span", { class: "spacer" }), h("span", { class: "chip" }, `seed ${s.seed}`)),
-    s.retakes.length ? h("div", {}, h("h3", { style: "margin:4px 0 6px" }, `Other versions (${s.retakes.length})`), h("div", { class: "retakes" }, s.retakes.slice(-9).reverse().map((r) =>
+    mine ? h("p", { class: "small dim", style: "margin:0" }, `This picture: ${mine.score}/10`, mine.faults.length ? ` · ${mine.faults.join("; ")}` : "",
+      rank[s.seed]?.best ? h("span", { class: "chip ok", style: "margin-left:6px" }, "best") : null) : null,
+    s.retakes.length ? h("div", {}, h("h3", { style: "margin:4px 0 6px" }, `Other versions (${s.retakes.length})`, s.ranking?.length ? h("span", { class: "faint small", style: "margin-left:8px" }, "best first, scored by the local model") : null),
+      h("div", { class: "retakes" }, s.retakes.slice(-12).reverse().sort((a, b) => order(a) - order(b)).slice(0, 9).map((r) =>
       h("figure", {}, h("a", { href: media(r.url), target: "_blank" }, h("img", { class: "thumb", src: media(r.url), alt: `seed ${r.seed}`, loading: "lazy" })),
-        h("figcaption", {}, r.seed, r.seed === s.seed && s.still_fresh !== false ? h("span", { class: "chip acc" }, "in use") :
-          h("button", { class: "btn small ghost", disabled: busy(), onclick: () => useRetake(s.id, r.seed) }, "Use")))))) : null,
+        h("figcaption", { title: rank[r.seed]?.faults?.join("; ") || "" }, r.seed,
+          rank[r.seed] ? h("span", { class: "chip" + (rank[r.seed].best ? " ok" : "") }, rank[r.seed].best ? `best ${rank[r.seed].score}` : `${rank[r.seed].score}/10`) : null,
+          r.seed === s.seed && s.still_fresh !== false ? h("span", { class: "chip acc" }, "in use") :
+          h("button", { class: "btn small ghost", disabled: busy(), onclick: () => useRetake(s.id, r.seed) }, "Use")),
+        rank[r.seed]?.faults?.length ? h("p", { class: "small faint", style: "margin:2px 0 0;line-height:1.3" }, rank[r.seed].faults.slice(0, 2).join("; ")) : null)))) : null,
   ];
 }
 

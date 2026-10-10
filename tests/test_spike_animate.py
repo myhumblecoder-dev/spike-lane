@@ -449,3 +449,13 @@ def test_a_screen_picture_can_skip_its_top(tmp_path):
     assert story.shots[1].screen.top == 0.05
     plain = sa.load_story(write_story(tmp_path, STORY.replace('id = "02-pounce"\n', 'id = "02-pounce"\n' + SCREEN, 1)))
     assert plain.shots[1].screen.top == 0.0
+
+
+# --- quality: the video model's size ----------------------------------------------------------
+
+def test_films_render_video_small_unless_they_ask_for_hd(story, tmp_path):
+    assert story.quality == "sd" and sa.video_dims(story) == (832, 448)
+    hd = sa.load_story(write_story(tmp_path, STORY.replace("seed = 1024\n", 'seed = 1024\nquality = "hd"\n', 1)))
+    assert hd.quality == "hd" and sa.video_dims(hd) == (1280, 704)
+    with pytest.raises(sa.StoryError, match="quality"):
+        sa.load_story(write_story(tmp_path, STORY.replace("seed = 1024\n", 'seed = 1024\nquality = "4k"\n', 1)))

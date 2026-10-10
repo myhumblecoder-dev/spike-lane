@@ -569,6 +569,16 @@ def _heard(wav: Path) -> str | None:
     return f.read_text().strip() if f.is_file() else None
 
 
+def _ranking(folder: Path, story, shot) -> list[dict]:
+    """The scene's picture versions as the vision model scored them, best first (only versions that still exist)."""
+    try:
+        rows = json.loads((Path(folder) / "board" / f"{shot.id}.rank.json").read_text())
+    except (OSError, ValueError, AttributeError):
+        return []
+    have = {seed for seed, _ in sa.versions(story, shot)} if story and shot else set()
+    return [r for r in rows if r.get("seed") in have]
+
+
 def _seconds(story, shot) -> float | None:
     """How long the scene lasts; None while it waits for its lines (voice pace)."""
     n = sa.shot_frames(story, shot) if story and shot else None
@@ -629,6 +639,7 @@ def film_state(folder: Path) -> dict:
                       for seed, p in (_takes(folder, story, shot_obj) if shot_obj else [])],
             "video_seed": shot_obj.video_seed if shot_obj else None,
             "end": s.get("end"), "fill": s.get("fill", "slow"), "seconds": _seconds(story, shot_obj),
+            "ranking": _ranking(folder, story, shot_obj),
             "continuity": _continuity(folder, story, shot_obj),
             "checkable": bool(story and shot_obj and sa.continuity_facts(story, shot_obj)), "angle": s.get("angle", ""),
             "full": _url(folder, f"shots/{sid}-full.mp4") or _url(folder, f"shots/{sid}.mp4"),
@@ -748,7 +759,7 @@ def step_argv(folder: Path, step: str, params: dict) -> list[str]:
         seeds = [int(str(x).strip()) for x in params.get("seeds", [])]
         if not 1 <= len(seeds) <= 6 or any(s < 0 for s in seeds):
             raise ValueError("give 1 to 6 seeds")
-        return ["retake", story, params["shot"], "--seeds", ",".join(map(str, seeds))]
+        return ["retake", story, params["shot"], "--seeds", ",".join(map(str, seeds))] + (["--rank"] if params.get("rank") else [])
     if step == "new":
         idea = str(params.get("idea", "")).strip().lstrip("-").strip()
         notes = str(params.get("notes", "")).strip().lstrip("-").strip()
@@ -764,6 +775,10 @@ def step_argv(folder: Path, step: str, params: dict) -> list[str]:
                 raise ValueError("the style picture must be an uploaded image")
             argv += ["--style-image", str(pic)]
         argv += [f"--no-{part}" for part in ("narrator", "dialogue", "music") if params.get(part, True) is False]
+        if params.get("look"):
+            if params["look"] not in sa.LOOKS:
+                raise ValueError(f"the look must be one of {', '.join(sa.LOOKS)}")
+            argv += ["--look", params["look"]]
         return argv
     raise ValueError(f"unknown step '{step}'")
 

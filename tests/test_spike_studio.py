@@ -1034,3 +1034,37 @@ def test_the_finish_settings_save_with_the_story(tmp_path):
     story = sa.load_story(folder / "story.toml")
     assert story.captions is False and story.end_card == sa.EndCard("Put your agent to work.", "BotGuild.ai")
     assert story.grade == sa.Grade(warmth=0.15, saturation=1.1) and story.shots[0].caption == "Quiet."
+
+
+def test_a_new_film_can_ask_for_a_flat_cartoon_look(tmp_path):
+    argv = st.step_argv(tmp_path / "f", "new", {"idea": "a bakery ad", "look": "flat"})
+    assert argv[argv.index("--look") + 1] == "flat"
+    assert "--look" not in st.step_argv(tmp_path / "f", "new", {"idea": "a bakery ad"})
+    with pytest.raises(ValueError):
+        st.step_argv(tmp_path / "f", "new", {"idea": "a bakery ad", "look": "oil"})
+
+
+# --- ranked versions of a scene's picture -------------------------------------------------------
+
+def test_more_versions_can_be_ranked(tmp_path):
+    folder = write_story(tmp_path / "bolt").parent
+    argv = st.step_argv(folder, "retake", {"shot": "01-heap", "seeds": [1, 2, 3, 4, 5], "rank": True})
+    assert argv[-1] == "--rank"
+    assert "--rank" not in st.step_argv(folder, "retake", {"shot": "01-heap", "seeds": [1, 2, 3]})
+
+
+def test_each_scene_shows_its_versions_best_first(tmp_path):
+    folder = write_story(tmp_path / "bolt").parent
+    render_board(folder)
+    story = sa.load_story(folder / "story.toml")
+    shot = story.shots[0]
+    prompt = sa.render_prompt(story, shot)[0]
+    for seed in (7, 9):
+        fake_still(folder, f"board/retakes/01-heap-s{seed}.png", prompt)
+    (folder / "board" / "01-heap.rank.json").write_text(json.dumps(
+        [{"seed": 9, "score": 9, "faults": []}, {"seed": shot.seed, "score": 6, "faults": ["blurred hands"]},
+         {"seed": 7, "score": 3, "faults": ["no sunset"]}, {"seed": 123, "score": 8, "faults": []}]))   # 123: gone since
+    s = st.film_state(folder)["shots"][0]
+    assert s["ranking"] == [{"seed": 9, "score": 9, "faults": []}, {"seed": shot.seed, "score": 6, "faults": ["blurred hands"]},
+                            {"seed": 7, "score": 3, "faults": ["no sunset"]}]
+    assert st.film_state(folder)["shots"][1]["ranking"] == []

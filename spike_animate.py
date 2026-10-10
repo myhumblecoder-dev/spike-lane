@@ -30,6 +30,8 @@ FPS = 24
 TAIL = 0.5                      # voice pace: a breath after a shot's last line before the cut
 SILENT_SECONDS = 3.0            # voice pace: a shot with nothing said
 PACES = ("fixed", "voice")
+VIDEO_DIMS = {"sd": (832, 448), "hd": (1280, 704)}   # the video model's size: hd is Wan 2.2 5B's own 720p
+UPSCALER = "realesr-general-x4v3.pth"                # sd clips are upscaled to the finished size with it
 STILL_SIZE = (1248, 720)        # storyboard stills (Z-Image)
 FIRST_FRAME_SIZE = (1248, 672)
 FINISH_SIZE = (1280, 720)       # the finished film: the 832x448 clips scaled up to fill it, words drawn at this size
@@ -185,6 +187,7 @@ class Story:
     captions: bool = True                                       # burn the narration (or each shot's caption) in
     end_card: EndCard | None = None
     grade: Grade = field(default_factory=Grade)
+    quality: str = "sd"                                         # "hd": animate at 1280x704 (2-5 min a clip)
 
     @property
     def names(self) -> dict[str, str]:
@@ -332,7 +335,10 @@ def load_story(path: Path) -> Story:
         raise StoryError("[grade] warmth must be between -1 and 1")
     if not 0 <= grade.saturation <= 3 or not 0.5 <= grade.contrast <= 2:
         raise StoryError("[grade] saturation must be 0-3 and contrast 0.5-2")
-    return Story(grade=grade, pace=pace, captions=bool(d.get("captions", True)), end_card=end_card, levels=Levels(**lv), lighting=d.get("lighting", ""), places=places, angles=angles, look_seeds=look_seeds, path=path, title=_need(d, "title", "the story"), seed=seed, look=_need(d, "look", "the story"),
+    quality = d.get("quality", "sd")
+    if quality not in VIDEO_DIMS:
+        raise StoryError(f"quality must be one of {', '.join(VIDEO_DIMS)}, not '{quality}'")
+    return Story(quality=quality, grade=grade, pace=pace, captions=bool(d.get("captions", True)), end_card=end_card, levels=Levels(**lv), lighting=d.get("lighting", ""), places=places, angles=angles, look_seeds=look_seeds, path=path, title=_need(d, "title", "the story"), seed=seed, look=_need(d, "look", "the story"),
                  still_style=_need(d, "still_style", "the story"), characters=characters,
                  shots=shots, narrator=narrator, music=music, voices=voices, dialogue_mode=mode,
                  sfx_negative=sound.get("negative", Story.sfx_negative), sfx_db=float(sound.get("db", -4.0)))
@@ -411,6 +417,10 @@ def shot_frames(story: Story, shot: Shot) -> int | None:
     if said is None:
         return None
     return wan_frames(said + TAIL if said else SILENT_SECONDS)
+
+
+def video_dims(story: Story) -> tuple[int, int]:
+    return VIDEO_DIMS[story.quality]
 
 
 def shot_len(story: Story, shot: Shot) -> float:
@@ -1011,7 +1021,89 @@ def cmd_check(story: Story, shot_id: str | None = None) -> int:
     return 0
 
 
-def cmd_retake(story: Story, shot_id: str, seeds: list[int]) -> int:
+# --- ranking: which version of a scene's picture is best? --------------------------------------
+
+RANK_SCHEMA = {"type": "object", "required": ["score", "faults"],
+               "properties": {"score": {"type": "integer"}, "faults": {"type": "array", "items": {"type": "string"}}}}
+
+
+def rank_prompt(story: Story, shot: Shot) -> str:
+    facts = "\n".join(f"- {f}" for f in continuity_facts(story, shot)) or "- (none)"
+    who = _named(shot.still, story.characters)
+    people = (f"exactly {len(who)} {'person' if len(who) == 1 else 'people'} ({', '.join(who)}), each drawn once"
+              if who else "no people, unless the scene mentions hands or someone")
+    return f"""You judge one storyboard picture for an animated film; several versions of the same scene are drawn
+and the best one is kept. Judge how well it:
+- shows the scene: {shot.still} (the NAMEs are described in the facts);
+- has {people};
+- keeps the film's fixed design (the facts below);
+- reads as a finished illustration: well-formed faces and hands, no extra or missing limbs, no garbled
+  lettering, no smears or broken shapes, a clear composition.
+List its faults, each one short sentence ("her left hand has six fingers"); none if it has none.
+Score it by this rubric:
+- 9-10: no faults, or only a tiny one nobody would notice;
+- 7-8: small faults (a detail of the design is off, a slightly odd hand);
+- 4-6: a clear fault (wrong clothes or hair, garbled shapes, the wrong framing);
+- 1-3: broken: a character drawn twice or missing, someone who isn't in the scene, the wrong place.
+
+Facts:
+{facts}
+
+Reply with JSON: {{"score": N, "faults": [...]}}"""
+
+
+def versions(story: Story, shot: Shot) -> list[tuple[int, Path]]:
+    """The scene's picture and every other version drawn from the same description: (seed, file)."""
+    prompt = render_prompt(story, shot)[0]
+    out = [(shot.seed, still_path(story, shot))] if still_path(story, shot).exists() else []
+    for p in sorted((story.root / "board" / "retakes").glob(f"{shot.id}-s*.png")):
+        m = re.fullmatch(rf"{re.escape(shot.id)}-s(\d+)\.png", p.name)
+        if m and int(m[1]) != shot.seed and png_prompt(p) == prompt:
+            out.append((int(m[1]), p))
+    return out
+
+
+def rank_versions(story: Story, shot: Shot, keys: Keys, model: str | None = None) -> list[dict]:
+    """Score every version with the local vision model (each one once), best first; saved beside the board."""
+    import base64
+    import spike_lane
+    prompt, rdir = rank_prompt(story, shot), story.root / "board" / "ranks"
+    rdir.mkdir(parents=True, exist_ok=True)
+    rows, fd = [], None
+    try:
+        for seed, pic in versions(story, shot):
+            out, k = rdir / f"{shot.id}-s{seed}.json", key_for("rank", file_digest(pic), prompt)
+            if keys.stale(out, k):
+                if fd is None:
+                    _say(f"ranking the versions of {shot.id} …")
+                    fd = spike_lane.acquire("writer", ["spike-animate", "rank", shot.id], wait=None)
+                reply = ollama_generate(prompt, model or os.environ.get("SPIKE_WRITER_MODEL", "gemma4:26b"), RANK_SCHEMA,
+                                        [base64.b64encode(pic.read_bytes()).decode()])
+                faults = [" ".join(str(f).split()) for f in reply.get("faults", []) if str(f).strip()]
+                out.write_text(json.dumps({"score": max(1, min(10, int(reply.get("score", 1)))), "faults": faults}))
+                keys.record(out, k)
+            rows.append({"seed": seed, **json.loads(out.read_text())})
+    finally:
+        if fd is not None:
+            os.close(fd)
+    rows.sort(key=lambda r: -r["score"])        # stable: the scene's own picture wins a tie
+    (story.root / "board" / f"{shot.id}.rank.json").write_text(json.dumps(rows, indent=1))
+    return rows
+
+
+def cmd_rank(story: Story, shot_id: str) -> int:
+    shots = _scene(story, shot_id)
+    if shots is None:
+        return 2
+    rows = rank_versions(story, shots[0], Keys(story.root))
+    for r in rows:
+        _say(f"seed {r['seed']}: {r['score']}/10" + (f" ({'; '.join(r['faults'])})" if r["faults"] else ""))
+    if rows:
+        _say(f"Best: seed {rows[0]['seed']}")
+    return 0
+
+
+def cmd_retake(story: Story, shot_id: str, seeds: list[int], rank: bool = False) -> int:
     shot = next((s for s in story.shots if s.id == shot_id), None)
     if shot is None:
         print(f"no shot '{shot_id}' in the story", file=sys.stderr)
@@ -1027,6 +1119,11 @@ def cmd_retake(story: Story, shot_id: str, seeds: list[int]) -> int:
     contact_sheet(outs, sheet, cols=len(outs))
     _say(f"Retakes: {sheet} (left to right: seeds {', '.join(map(str, seeds))}).\n"
          f"To keep one, set `seed = N` on shot {shot.id} in story.toml and run board again.")
+    if rank:
+        try:
+            cmd_rank(story, shot_id)
+        except StageError as e:   # the versions stand; the ranking is advice
+            _say(f"ranking skipped: {e}")
     return 0
 
 
@@ -1057,6 +1154,8 @@ def shot_key(story: Story, shot: Shot, seed: int | None = None) -> str | None:
              shot.video_seed if seed is None else seed, shot.colormatch]
     if story.pace == "voice":
         parts.append(n)
+    if story.quality != "sd":
+        parts.append(video_dims(story))
     if ref:
         parts += [file_digest(ref.clip), ref.start, ref.sigma, ref.first_strength]
     return key_for(*parts)
@@ -1123,6 +1222,9 @@ def animate_shot(story: Story, shot: Shot, keys: Keys) -> bool:
     cmd = [_venv("FASTVIDEO_HOME", "FastVideo"), ENGINES / "wan22_i2v.py", "--mlx-checkpoint", model,
            "--text-encoder-root", model, "--vae-root", model / "vae", "--prompt", motion_prompt(story, shot),
            "--seed", shot.video_seed, "--num-frames", n, "--output-path", raw]
+    if story.quality != "sd":
+        w, h = video_dims(story)
+        cmd += ["--width", w, "--height", h]
     if ref:
         # Motion from the real clip; look from a cartoon version of the clip's first frame.
         real, first = shot_path(story, shot, "-first-real").with_suffix(".png"), shot_path(story, shot, "-first").with_suffix(".png")
@@ -1158,9 +1260,25 @@ def animate_shot(story: Story, shot: Shot, keys: Keys) -> bool:
     return True
 
 
+def finish_clip(story: Story, shot: Shot, keys: Keys) -> Path:
+    """The shot's clip at the finished size: as it is when it was animated that big, else upscaled once."""
+    clip = shot_path(story, shot)
+    if video_size(clip)[0] >= FINISH_SIZE[0]:
+        return clip
+    out = story.root / "shots" / "hd" / f"{shot.id}.mp4"
+    k = key_for("upscale", file_digest(clip), UPSCALER, FINISH_SIZE)
+    if keys.stale(out, k):
+        _say(f"upscale {shot.id} …")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        heavy("upscale", [_venv("UPSCALE_HOME", "upscale"), ENGINES / "upscale.py", _home("UPSCALE_HOME", "upscale") /
+                          "models" / UPSCALER, clip, out, *FINISH_SIZE], out.with_suffix(".log"))
+        keys.record(out, k)
+    return out
+
+
 def build_picture(story: Story, keys: Keys) -> Path:
     out = story.root / "film" / "picture.mp4"
-    shots = [shot_path(story, s) for s in story.shots]
+    shots = [finish_clip(story, s, keys) for s in story.shots]
     k = key_for("picture", [file_digest(p) for p in shots])
     if keys.stale(out, k):
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -1214,7 +1332,7 @@ def render_titles(story: Story, keys: Keys, plan: list[Title]) -> list[Path]:
     return outs
 
 
-def render_screens(story: Story, keys: Keys, clip: tuple[int, int]) -> list[tuple[Path, float, float]]:
+def render_screens(story: Story, keys: Keys) -> list[tuple[Path, float, float]]:
     """Each shot's screen picture warped onto its corners at the finished size, with the shot's time span."""
     shots = [(s, at) for s, at in zip(story.shots, shot_starts(story)) if s.screen]
     if not shots:
@@ -1223,7 +1341,8 @@ def render_screens(story: Story, keys: Keys, clip: tuple[int, int]) -> list[tupl
     outs = [sdir / f"{s.id}.png" for s, _ in shots]
     spec = {"size": list(FINISH_SIZE), "items": [
         {"picture": str(s.screen.picture), "out": str(o), "top": s.screen.top,
-         "corners": [list(still_to_finish(c, STILL_SIZE, clip, FINISH_SIZE)) for c in s.screen.corners]}
+         "corners": [list(still_to_finish(c, STILL_SIZE, video_size(shot_path(story, s)), FINISH_SIZE))
+                     for c in s.screen.corners]}
         for (s, _), o in zip(shots, outs)]}
     k = key_for("screens", spec, [file_digest(s.screen.picture) for s, _ in shots])
     if any(keys.stale(o, k) for o in outs):
@@ -1254,7 +1373,7 @@ def finish_picture(story: Story, keys: Keys, picture: Path) -> Path:
     it, the last frame held for the card."""
     out = story.root / "film" / "finished.mp4"
     plan = title_plan(story)
-    layers = render_screens(story, keys, video_size(picture))      # screens first, words on top
+    layers = render_screens(story, keys)                            # screens first, words on top
     pngs = render_titles(story, keys, plan) if plan else []
     layers += [(png, t.start, t.end) for t, png in zip(plan, pngs)]
     hold = story.end_card.hold if story.end_card else 0.0
@@ -1896,8 +2015,17 @@ DIALOGUE_RULE = '- Characters may talk if the idea calls for it. Give every char
 MUSIC_RULE = '- "music" describes an instrumental score that follows the intensity arc; "structure" is 3-6 section tags\n  like "[Intro - ...]" separated by blank lines; "key" like "D minor" or "C major".\n'
 
 
-def _example(parts: Parts) -> dict:
+LOOKS = ("keyart", "flat")
+KEYART_LOOK = "anime key art, richly detailed backgrounds, cinematic lighting, vibrant saturated colors, clean linework"
+KEYART_STILL = ("anime key visual illustration, highly detailed background, cinematic lighting, rim light, depth, "
+                "painterly sky, vibrant saturated colors, clean confident linework")
+
+
+def _example(parts: Parts, look: str = "keyart") -> dict:
     ex = json.loads(json.dumps(WRITER_EXAMPLE))
+    if look == "keyart":
+        ex["look"] = f"{KEYART_LOOK}, dusky teal pine trees, soft white snow"
+        ex["still_style"] = f"{KEYART_STILL}, snowy pine forest"
     for name, on in (("narrator", parts.narrator), ("music", parts.music)):
         if not on:
             del ex[name]
@@ -1914,16 +2042,19 @@ def _example(parts: Parts) -> dict:
 
 
 def writer_prompt(idea: str, shots: int, problems: list[str] | None = None, previous: dict | None = None,
-                  notes: str = "", style: str = "", parts: Parts = Parts()) -> str:
+                  notes: str = "", style: str = "", parts: Parts = Parts(), look: str = "keyart") -> str:
     ref = f"\nREFERENCE NOTES from the author (follow them: names, looks, setting, tone, events):\n{notes.strip()}\n" if notes.strip() else ""
     if style.strip():
         ref += (f"\nVISUAL STYLE, read from the author's reference picture:\n{style.strip()}\n"
                 "Write \"look\" and \"still_style\" in this style (keep its medium, palette, linework and texture words), "
                 "not the default cartoon style; end \"still_style\" with the setting.\n")
         looks = '- "look" and "still_style" follow the VISUAL STYLE above.'
-    else:
+    elif look == "flat":
         looks = ('- "look" starts with "2D cartoon animation," then the palette and setting. "still_style" starts with\n'
                  '  "2D cartoon animation still, bold black outlines, flat vibrant colors," then the setting.')
+    else:
+        looks = (f'- "look" starts with "{KEYART_LOOK}," then the palette and setting. "still_style" starts with\n'
+                 f'  "{KEYART_STILL}," then the setting. Every picture is a finished illustration, full of detail.')
     narration_rule = (NARRATION_RULE.format(max_words=MAX_NARRATION_WORDS) if parts.narrator else
                       '- There is no narrator: leave every "narration" "".\n')
     dialogue_rule = (DIALOGUE_RULE.format(max_words=MAX_DIALOGUE_WORDS) if parts.dialogue else
@@ -1949,7 +2080,9 @@ How the film is made, so write for it:
   exact clothes and accessories (colours, fabrics, fit), so the outfit stays the same in every shot.
 - "lighting" is one line used in every picture and every motion: time of day, where the light comes from,
   its colour, the shadows. Keep it the same for the whole film.
-- "places" names each location once, one UPPERCASE word (TERRACE, CLEARING), with a full visual description.
+- "places" names each location once, one UPPERCASE word (TERRACE, CLEARING), with a full visual description
+  and its set dressing: 4 to 6 concrete details that fill the frame (string lights, palm trees, thatched
+  umbrellas, potted flowers), so every shot there looks rich and the same.
   Write the place's NAME in every still set there, never re-describe it.
 - "angles" are 2 to 4 camera setups, each one UPPERCASE word with a "frame" (shot size and where the camera
   stands, e.g. "medium shot across the cafe table, the sea behind"). Every shot picks one "angle"; shots at
@@ -1971,7 +2104,7 @@ How the film is made, so write for it:
 {music_rule}- Shot ids look like 01-name, 02-name, ... in order.
 
 Example of the format and the level of detail (a different film, 4 shots; FOX talks, RAB does not):
-{json.dumps(_example(parts), indent=1)}
+{json.dumps(_example(parts, look), indent=1)}
 
 Write the story for the IDEA as one JSON object in the same format, with exactly {shots} shots."""
     if problems:
@@ -2060,7 +2193,7 @@ def draft_to_toml(d: dict, idea: str, notes: str = "", style_image: str = "", st
            "# Edit freely, then: spike-animate board story.toml", "",
            f"idea = {q(idea)}", *([f"notes = {q(notes)}"] if notes else []),
            *([f"style_image = {q(style_image)}", f"style = {q(style)}"] if style_image else []),
-           f"title = {q(d['title'])}", "seed = 1024", 'pace = "voice"', f"look = {q(d['look'])}", f"still_style = {q(d['still_style'])}",
+           f"title = {q(d['title'])}", "seed = 1024", 'pace = "voice"', 'quality = "hd"', f"look = {q(d['look'])}", f"still_style = {q(d['still_style'])}",
            *([f"lighting = {q(d['lighting'])}"] if d.get("lighting") else []),
            "", "[characters]"]
     out += [f"{c['name']} = {q(c['description'])}" for c in d["characters"] if not c.get("voice")]
@@ -2138,7 +2271,7 @@ def describe_style(image: Path, model: str) -> str:
 
 
 def cmd_new(folder: Path, idea: str, shots: int, model: str, attempts: int = 3, notes: str = "",
-            style_image: Path | None = None, parts: Parts = Parts()) -> int:
+            style_image: Path | None = None, parts: Parts = Parts(), look: str = "keyart") -> int:
     import spike_lane
     story_file = folder / "story.toml"
     if story_file.exists():
@@ -2154,7 +2287,7 @@ def cmd_new(folder: Path, idea: str, shots: int, model: str, attempts: int = 3, 
         problems, d = None, None
         for attempt in range(1, attempts + 1):
             d = ollama_generate(writer_prompt(idea, shots, problems, previous=d if problems else None, notes=notes,
-                                              style=style, parts=parts), model, draft_schema(parts))
+                                              style=style, parts=parts, look=look), model, draft_schema(parts))
             problems = lint_draft(d, shots, parts)
             if not problems:
                 break
@@ -2193,6 +2326,9 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("story", type=Path)
         if name in ("board", "video", "sound", "voices"):
             sp.add_argument("--shot", help="work on this one scene only")
+    rk = sub.add_parser("rank", help="score a scene's picture versions with the local vision model, best first")
+    rk.add_argument("story", type=Path)
+    rk.add_argument("shot")
     ck = sub.add_parser("check", help="check pictures against the film bible with the local vision model")
     ck.add_argument("story", type=Path)
     ck.add_argument("--shot")
@@ -2217,10 +2353,13 @@ def build_parser() -> argparse.ArgumentParser:
     nw.add_argument("--no-narrator", action="store_true", help="no narrator: the story is told by picture and dialogue")
     nw.add_argument("--no-dialogue", action="store_true", help="the characters never speak")
     nw.add_argument("--no-music", action="store_true", help="no score")
+    nw.add_argument("--look", choices=LOOKS, default="keyart",
+                    help="without a style picture: rich anime key art (default) or a flat 2D cartoon")
     rt = sub.add_parser("retake", help="render alternate seeds for one shot's still")
     rt.add_argument("story", type=Path)
     rt.add_argument("shot")
     rt.add_argument("--seeds", required=True, help="comma-separated, e.g. 7,42,99")
+    rt.add_argument("--rank", action="store_true", help="then score every version with the local vision model")
     return ap
 
 
@@ -2229,7 +2368,8 @@ def main(argv: list[str]) -> int:
     try:
         if a.cmd == "new":
             return cmd_new(a.folder, a.idea, a.shots, a.model, notes=a.notes, style_image=a.style_image,
-                           parts=Parts(narrator=not a.no_narrator, dialogue=not a.no_dialogue, music=not a.no_music))
+                           parts=Parts(narrator=not a.no_narrator, dialogue=not a.no_dialogue, music=not a.no_music),
+                           look=a.look)
         story = load_story(a.story)
         if a.cmd == "board":
             return cmd_board(story, a.shot)
@@ -2237,12 +2377,14 @@ def main(argv: list[str]) -> int:
             return cmd_scene(story, a.shot)
         if a.cmd == "check":
             return cmd_check(story, a.shot)
+        if a.cmd == "rank":
+            return cmd_rank(story, a.shot)
         if a.cmd == "voice":
             return cmd_voice(story, a.name, a.takes)
         if a.cmd == "look":
             return cmd_look(story, a.name, [int(s) for s in a.seeds.split(",") if s.strip()] if a.seeds else None)
         if a.cmd == "retake":
-            return cmd_retake(story, a.shot, [int(s) for s in a.seeds.split(",") if s.strip()])
+            return cmd_retake(story, a.shot, [int(s) for s in a.seeds.split(",") if s.strip()], rank=a.rank)
         if a.cmd in ("video", "sound", "voices"):
             return {"video": cmd_video, "sound": cmd_sound, "voices": cmd_voices}[a.cmd](story, a.shot)
         steps = {"film": cmd_film, "music": cmd_music}

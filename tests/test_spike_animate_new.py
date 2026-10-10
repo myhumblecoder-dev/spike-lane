@@ -234,7 +234,9 @@ def test_a_style_from_a_picture_replaces_the_default_cartoon_look():
     p = sa.writer_prompt("a robot learns to paint", shots=6, style=style)
     assert style in p and "VISUAL STYLE" in p
     assert "bold black outlines, flat vibrant colors," not in p.split("Example of the format")[0]
-    assert "bold black outlines, flat vibrant colors," in sa.writer_prompt("x", shots=6).split("Example of the format")[0]
+    assert "bold black outlines, flat vibrant colors," in sa.writer_prompt("x", shots=6, look="flat").split("Example of the format")[0]
+    assert sa.KEYART_STILL in sa.writer_prompt("x", shots=6).split("Example of the format")[0]   # the default now
+    assert sa.KEYART_STILL not in p.split("Example of the format")[0]                              # a picture still wins
 
 
 def test_the_story_remembers_its_style_picture(tmp_path):
@@ -458,3 +460,73 @@ def test_lint_keeps_captions_short():
     d = draft()
     d["shots"][0]["caption"] = "one two three four five six seven eight"
     assert any("caption" in x for x in sa.lint_draft(d, 3))
+
+
+def test_a_drafted_story_renders_in_hd(tmp_path):
+    p = tmp_path / "story.toml"
+    p.write_text(sa.draft_to_toml(draft(), idea="a keeper and a gull"))
+    assert sa.load_story(p).quality == "hd"
+
+
+# --- the default look: key art, or a flat cartoon ----------------------------------------------
+
+def test_without_a_style_picture_the_writer_asks_for_key_art():
+    p = sa.writer_prompt("an ad for a bakery", shots=6)
+    assert "anime key art" in p and "flat vibrant colors" not in p
+    flat = sa.writer_prompt("an ad for a bakery", shots=6, look="flat")
+    assert "flat vibrant colors" in flat and "anime key art" not in flat
+
+
+def test_the_writer_dresses_each_place():
+    assert "set dressing" in sa.writer_prompt("an ad for a bakery", shots=6)
+
+
+def test_new_can_ask_for_a_flat_cartoon():
+    assert sa.build_parser().parse_args(["new", "f", "idea"]).look == "keyart"
+    assert sa.build_parser().parse_args(["new", "f", "idea", "--look", "flat"]).look == "flat"
+
+
+# --- ranking a scene's picture versions ----------------------------------------------------------
+
+def picture(path: Path, prompt: str, tag: str) -> None:
+    """A picture with its prompt stored the way mflux stores it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"\x89PNG " + tag.encode() + json.dumps({"mflux_version": "x", "prompt": prompt}).encode())
+
+
+def test_rank_orders_a_scenes_versions_best_first(ollama, tmp_path):
+    film = tmp_path / "morning"
+    film.mkdir()
+    (film / "story.toml").write_text(BIBLE_STORY)
+    story = sa.load_story(film / "story.toml")
+    shot = story.shots[0]
+    prompt = sa.render_prompt(story, shot)[0]
+    picture(film / "board" / "01-sit.png", prompt, "current")
+    picture(film / "board" / "retakes" / "01-sit-s7.png", prompt, "seven")
+    picture(film / "board" / "retakes" / "01-sit-s9.png", prompt, "nine")
+    picture(film / "board" / "retakes" / "01-sit-s5.png", "an older description", "old")    # not this picture any more
+    FakeOllama.replies = [{"score": 6, "faults": ["hands are blurred"]}, {"score": 4, "faults": ["no terrace"]},
+                          {"score": 9, "faults": []}]
+    r = subprocess.run([str(ANIMATE), "rank", "story.toml", "01-sit"], capture_output=True, text=True, env=ollama, cwd=film)
+    assert r.returncode == 0, r.stderr
+    assert len(FakeOllama.requests) == 3 and all(len(q["images"]) == 1 for q in FakeOllama.requests)
+    q = FakeOllama.requests[0]["prompt"]
+    assert "ELENA sitting at a table" in q and "cream linen shirt" in q and "score" in q
+    ranked = json.loads((film / "board" / "01-sit.rank.json").read_text())
+    assert [x["seed"] for x in ranked] == [9, shot.seed, 7]
+    assert ranked[0] == {"seed": 9, "score": 9, "faults": []}
+    assert "seed 9" in r.stdout
+    r = subprocess.run([str(ANIMATE), "rank", "story.toml", "01-sit"], capture_output=True, text=True, env=ollama, cwd=film)
+    assert r.returncode == 0 and len(FakeOllama.requests) == 3                      # each picture is judged once
+
+
+def test_the_ranking_counts_the_people_and_scores_by_a_rubric(tmp_path):
+    (tmp_path / "story.toml").write_text(BIBLE_STORY)
+    story = sa.load_story(tmp_path / "story.toml")
+    q = sa.rank_prompt(story, story.shots[0])
+    assert "exactly 1 person (ELENA)" in q and "drawn twice" in q
+    assert "1-3" in q and "9-10" in q                              # a broken picture can't score well
+    empty = BIBLE_STORY.replace('still = "ELENA sitting at a table on the TERRACE"', 'still = "the empty TERRACE at dawn"')
+    (tmp_path / "story.toml").write_text(empty)
+    story = sa.load_story(tmp_path / "story.toml")
+    assert "no people" in sa.rank_prompt(story, story.shots[0])

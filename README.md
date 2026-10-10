@@ -83,6 +83,15 @@ skips part of the picture first). `engines/screen.py` (OpenCV) crops the picture
 its top, like a browser, and warps it onto the corners at the finished size, so its words stay sharp. In the
 studio: the scene's Picture step, **Real screen**, then tap the 4 corners.
 
+Quality: `quality = "hd"` (what `new` writes) animates at Wan 2.2 5B's own 1280×704 (about 2–5 min a clip,
+peak ~11.5 GB for a full 5 s): far more detail than 832×448, where faces and tattoos wash out. Films
+without it stay 832×448 and each clip is upscaled once with Real-ESRGAN (`realesr-general-x4v3`,
+`engines/upscale.py`, ~15 s a clip) before finishing. Without a style picture the writer asks for rich
+anime key art (`--look flat` for the old flat cartoon) and dresses every place with 4–6 details.
+`retake --rank` (studio: **5 more versions, ranked**) has the local vision model score each version of a
+scene's picture by a rubric (the right people, each once; the bible; clean anatomy and lettering), best
+first; `rank STORY SHOT` scores the versions already drawn.
+
 Rules it enforces: with `pace = "voice"` (what `new` writes) each shot lasts its own lines plus a 0.5 s
 breath, 49–121 frames at 24 fps (about 2–5 s; a silent shot 3 s, or `seconds = N` on the shot), so a
 scene's lines are recorded before its motion and the cuts land on the voice-over; films without a pace

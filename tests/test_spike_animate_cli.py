@@ -55,7 +55,7 @@ elif me == "python" and args and args[0].endswith("wan22_i2v.py"):
     c = hashlib.sha256((flag("--prompt") + flag("--seed", "")).encode()).hexdigest()[:6]
     y, u, v = 16 + int(c[:2], 16) // 2, int(c[2:4], 16), int(c[4:6], 16)
     box = f"geq=lum='if(between(X\\,T*120\\,T*120+60)*between(Y\\,40\\,100)\\,235\\,{y})':cb={u}:cr={v}"
-    ff("-f", "lavfi", "-i", "color=c=black:size=832x448:rate=24", "-vf", box,   # a box moves across, so frames differ
+    ff("-f", "lavfi", "-i", f"color=c=black:size={flag('--width', '832')}x{flag('--height', '448')}:rate=24", "-vf", box,
        "-frames:v", flag("--num-frames", "121"), "-pix_fmt", "yuv420p", flag("--output-path"))
 elif me == "python" and args and args[0] == "demo.py":
     out = Path(flag("--output")); out.mkdir(parents=True, exist_ok=True)
@@ -71,6 +71,9 @@ elif me == "python" and args and args[0].endswith("titles.py"):
         a = f"if(between(X\\,{w // 6}\\,{w * 5 // 6})*between(Y\\,{int(h * 0.82)}\\,{int(h * 0.9)})\\,255\\,0)"
         ff("-f", "lavfi", "-i", f"color=c=white:s={w}x{h},format=rgba", "-vf", f"geq=r=255:g=255:b=255:a='{a}'",
            "-frames:v", "1", it["out"])
+elif me == "python" and args and args[0].endswith("upscale.py"):
+    ff("-i", args[2], "-vf", f"scale={args[4]}:{args[5]}:force_original_aspect_ratio=increase,crop={args[4]}:{args[5]}",
+       "-pix_fmt", "yuv420p", args[3])
 elif me == "python" and args and args[0].endswith("screen.py"):
     spec = json.loads(Path(args[1]).read_text())   # white where the screen's corners say
     w, h = spec["size"]
@@ -155,7 +158,7 @@ start = 0.5
 def env(tmp_path, monkeypatch):
     bins = tmp_path / "fakebin"
     homes = {"FASTVIDEO_HOME": tmp_path / "FastVideo", "MMAUDIO_HOME": tmp_path / "MMAudio",
-             "VOICE_HOME": tmp_path / "voice", "ACESTEP_HOME": tmp_path / "ACE-Step"}
+             "VOICE_HOME": tmp_path / "voice", "ACESTEP_HOME": tmp_path / "ACE-Step", "UPSCALE_HOME": tmp_path / "upscale"}
     targets = [bins / "mflux-generate-z-image-turbo", bins / "mflux-generate-flux2-edit"]
     targets += [h / ".venv" / "bin" / "python" for h in homes.values()]
     targets += [homes["VOICE_HOME"] / ".venv" / "bin" / n for n in ("mlx_audio.tts.generate", "mlx_audio.stt.generate")]
@@ -976,3 +979,34 @@ def test_a_real_picture_is_laid_onto_the_screen_in_its_shot(env):
     box = (int(x0) + 10, int(y0) + 10, int(x1 - x0) - 20, int(y1 - y0) - 20)
     assert patch(out, L + 1.0, box) > 220                       # the picture, over shot 2
     assert patch(out, 1.0, box) < 160 and patch(out, 2 * L + 1.0, box) < 160   # and only there
+
+
+# --- quality ------------------------------------------------------------------------------------
+
+def upscales(log):
+    return [c for c in calls(log, "python") if c["args"][0].endswith("upscale.py")]
+
+
+def test_an_hd_film_animates_at_the_models_full_size_and_needs_no_upscaling(env):
+    film, _, log = env
+    (film / "story.toml").write_text(STORY.replace("seed = 1024\n", 'seed = 1024\nquality = "hd"\n', 1))
+    assert run(env, "board", "story.toml").returncode == 0
+    r = run(env, "film", "story.toml")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert {(flag(c["args"], "--width"), flag(c["args"], "--height")) for c in wan(log)} == {("1280", "704")}
+    assert size(film / "shots" / "01-walk.mp4") == (1280, 704) and not upscales(log)
+    assert size(film / "film" / "fox-hunt.mp4") == (1280, 720)
+
+
+def test_a_small_film_has_each_clip_upscaled_once_before_it_is_finished(env):
+    film, _, log = env
+    assert run(env, "board", "story.toml").returncode == 0
+    assert run(env, "film", "story.toml").returncode == 0
+    ups = upscales(log)
+    assert sorted(Path(c["args"][2]).name for c in ups) == ["01-walk.mp4", "02-pounce.mp4", "03-stalk.mp4"]
+    assert all(c["args"][1].endswith("realesr-general-x4v3.pth") and c["args"][4:6] == ["1280", "720"] for c in ups)
+    assert size(film / "film" / "picture.mp4") == (1280, 720)
+    log.unlink()
+    (film / "story.toml").write_text(STORY.replace("intensity = 0.2", "intensity = 0.3", 1))   # nothing visual
+    assert run(env, "film", "story.toml").returncode == 0
+    assert not upscales(log)
