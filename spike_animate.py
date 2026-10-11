@@ -1030,15 +1030,93 @@ def _report_check(shot: Shot, misses: list[str] | None) -> None:
         _say(f"✓ {shot.id} matches the film bible")
 
 
-def cmd_check(story: Story, shot_id: str | None = None) -> int:
+def cmd_check(story: Story, shot_id: str | None = None, motion: bool = False) -> int:
     shots = _scene(story, shot_id)
     if shots is None:
         return 2
     keys = Keys(story.root)
     for shot in shots:
-        if still_path(story, shot).exists():
+        if motion:
+            _report_motion(shot, check_motion(story, shot, keys))
+        elif still_path(story, shot).exists():
             _report_check(shot, check_still(story, shot, keys))
     return 0
+
+
+# --- the motion check: does anything pass through anything else? -------------------------------
+
+MOTION_FRAMES = 6
+MOTION_SCHEMA = {"type": "object", "required": ["faults"],
+                 "properties": {"faults": {"type": "array", "items": {"type": "string"}}}}
+
+
+def motion_check_prompt(story: Story, shot: Shot) -> str:
+    return f"""These {MOTION_FRAMES} pictures are frames from one shot of an animated film, in order from start to
+end. The shot shows: {expand(shot.still, story.names)}; what moves: {expand(shot.motion, story.names)}.
+Look for mistakes the animation made, the kind a viewer notices:
+- a body part passing through furniture, a person or an object (legs through a table, a hand through a laptop);
+- someone sitting on nothing, or an object floating or sinking into another;
+- a limb, a hand or an object that disappears, appears from nowhere or doubles;
+- an object or a face that changes shape or turns into something else (a mug becoming a paper cup).
+List each mistake as one short sentence saying what happens and when ("her right arm disappears as she
+lowers it"). Ignore the drawing style, the camera moving, and small wobbles. If there are none, return an
+empty list.
+
+Reply with JSON: {{"faults": [...]}}"""
+
+
+def motion_path(story: Story, shot: Shot) -> Path:
+    return story.root / "shots" / f"{shot.id}.motion.json"
+
+
+def motion_key(story: Story, shot: Shot) -> str:
+    return key_for("motion-check", file_digest(shot_path(story, shot)), motion_check_prompt(story, shot))
+
+
+def check_motion(story: Story, shot: Shot, keys: Keys, model: str | None = None) -> list[str] | None:
+    """Ask the local vision model whether this shot's clip has things passing through each other. None for a
+    glide (nothing in the picture moves) or before the clip is made; kept until the clip changes."""
+    import base64
+    clip, out = shot_path(story, shot), motion_path(story, shot)
+    if shot.tier == "still" or not clip.exists():
+        return None
+    prompt, k = motion_check_prompt(story, shot), motion_key(story, shot)
+    if keys.stale(out, k):
+        import spike_lane
+        _say(f"motion check {shot.id} …")
+        frames = out.with_suffix("")
+        frames.mkdir(parents=True, exist_ok=True)
+        secs = media_seconds(clip)
+        pics = []
+        for i in range(MOTION_FRAMES):
+            f = frames / f"{i}.jpg"
+            ffmpeg("-ss", f"{secs * (i + 0.5) / MOTION_FRAMES:.3f}", "-i", clip, "-frames:v", 1, "-vf", "scale=640:-2", f)
+            pics.append(base64.b64encode(f.read_bytes()).decode())
+        fd = spike_lane.acquire("writer", ["spike-animate", "check", "--motion", shot.id], wait=None)
+        try:
+            reply = ollama_generate(prompt, model or os.environ.get("SPIKE_WRITER_MODEL", "gemma4:26b"), MOTION_SCHEMA, pics)
+        finally:
+            os.close(fd)
+        faults = [" ".join(str(m).split()) for m in reply.get("faults", []) if str(m).strip()]
+        out.write_text(json.dumps({"faults": faults}, indent=1))
+        keys.record(out, k)
+    return json.loads(out.read_text())["faults"]
+
+
+def _report_motion(shot: Shot, faults: list[str] | None) -> None:
+    if faults:
+        _say(f"⚠ {shot.id}'s motion has mistakes:\n  " + "\n  ".join(faults))
+    elif faults is not None:
+        _say(f"✓ {shot.id}'s motion looks clean")
+
+
+def check_motions(story: Story, shots: list[Shot], keys: Keys) -> None:
+    """The motion check after animating; it is advice, so a check that can't run never stops the film."""
+    for shot in shots:
+        try:
+            _report_motion(shot, check_motion(story, shot, keys))
+        except StageError as e:
+            _say(f"motion check skipped for {shot.id}: {e}")
 
 
 # --- ranking: which version of a scene's picture is best? --------------------------------------
@@ -1058,12 +1136,15 @@ and the best one is kept. Judge how well it:
 - has {people};
 - keeps the film's fixed design (the facts below);
 - reads as a finished illustration: well-formed faces and hands, no extra or missing limbs, no garbled
-  lettering, no smears or broken shapes, a clear composition.
+  lettering, no smears or broken shapes, a clear composition;
+- makes physical sense: nobody sitting on nothing, no legs or arms passing through a table, chair or each
+  other, nothing floating or cut through, a table either in front of a person or behind them, not both.
 List its faults, each one short sentence ("her left hand has six fingers"); none if it has none.
 Score it by this rubric:
 - 9-10: no faults, or only a tiny one nobody would notice;
 - 7-8: small faults (a detail of the design is off, a slightly odd hand);
-- 4-6: a clear fault (wrong clothes or hair, garbled shapes, the wrong framing);
+- 4-6: a clear fault (wrong clothes or hair, garbled shapes, the wrong framing, legs passing through a
+  table, someone sitting on nothing);
 - 1-3: broken: a character drawn twice or missing, someone who isn't in the scene, the wrong place.
 
 Facts:
@@ -1863,12 +1944,14 @@ def cmd_video(story: Story, shot_id: str | None = None) -> int:
                   file=sys.stderr)
             return 2
         animate_shot(story, shots[0], keys)
+        check_motions(story, shots, keys)
         _say(f"Video: {shot_path(story, shots[0])}")
         return 0
     if not _stills_ready(story, keys) or not _lines_ready(story):
         return 2
     for shot in story.shots:
         animate_shot(story, shot, keys)
+    check_motions(story, story.shots, keys)
     picture = build_picture(story, keys)
     _say(f"Video: {picture} ({media_seconds(picture):.1f} s, no sound yet)")
     return 0
@@ -1967,6 +2050,7 @@ def cmd_film(story: Story) -> int:
     lines = narrate(story, keys, checks) + speak_dialogue(story, keys, checks)   # first: they can set the shot lengths
     for shot in story.shots:
         animate_shot(story, shot, keys)
+    check_motions(story, story.shots, keys)
     picture = finish_picture(story, keys, build_picture(story, keys))
     total = media_seconds(picture)
     soundtrack = build_soundtrack(story, [sound_shot(story, s, keys) for s in story.shots], keys)
@@ -2212,6 +2296,9 @@ How the film is made, so write for it:
   contain (the video model draws whatever the words suggest, so "as she reads" grows a book; write "her eyes
   follow the laptop screen"). A character who doesn't speak in the shot keeps their mouth closed: add
   "mouth closed" to the motion, or the video model animates their lips.
+- Anyone sitting at a table is framed from the waist up, the table's edge in the foreground; never show
+  their legs with the table's or chairs' legs, which the image model tangles. Say what they sit on and where
+  the table is: "ELENA sitting on a chair behind the table, seen from the waist up".
 - "sfx" lists the sounds of that shot (no music, no speech).
 - "caption" is the words burned in on screen over the shot: at most {MAX_CAPTION_WORDS} words, a shorter, punchier echo of
   its line ("Built the agent.", "Now make it earn."), or "" for none.
@@ -2458,6 +2545,7 @@ def build_parser() -> argparse.ArgumentParser:
     ck = sub.add_parser("check", help="check pictures against the film bible with the local vision model")
     ck.add_argument("story", type=Path)
     ck.add_argument("--shot")
+    ck.add_argument("--motion", action="store_true", help="check the scenes' motion for clipping instead")
     lk = sub.add_parser("look", help="draw a character sheet or a place picture that scenes are drawn from")
     lk.add_argument("story", type=Path)
     lk.add_argument("name")
@@ -2502,7 +2590,7 @@ def main(argv: list[str]) -> int:
         if a.cmd == "scene":
             return cmd_scene(story, a.shot)
         if a.cmd == "check":
-            return cmd_check(story, a.shot)
+            return cmd_check(story, a.shot, motion=a.motion)
         if a.cmd == "rank":
             return cmd_rank(story, a.shot)
         if a.cmd == "voice":

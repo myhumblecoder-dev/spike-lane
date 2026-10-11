@@ -99,6 +99,13 @@ finished picture at 1280×720, `camera = "push"` (in, the default), `"pull"`, `"
 still shot's screen is laid on its picture first, so it moves with the glide. The writer makes most shots
 still or subtle and at most 2 full. In the studio: the scene's Motion step, **Movement**.
 
+Clipping: after every animation the local vision model looks at 6 frames across the clip for things passing
+through each other, limbs that vanish or double, and objects that change shape (`check --motion`; kept per
+clip in `shots/ID.motion.json`, shown in the studio's Motion step, advice only). The ranking rubric marks
+down pictures that make no physical sense (someone sitting on nothing, legs through a table), and the
+writer frames anyone seated at a table from the waist up, which is where the image model tangled legs with
+table and chair legs.
+
 Rules it enforces: with `pace = "voice"` (what `new` writes) each shot lasts its own lines plus a 0.5 s
 breath (0.3 s), 49–121 frames at 24 fps (about 2–5 s; a silent shot 3 s, or `seconds = N` on the shot), so a
 scene's lines are recorded before its motion and the cuts land on the voice-over; every recorded line is cut to its words (the voice model's lead-in silence

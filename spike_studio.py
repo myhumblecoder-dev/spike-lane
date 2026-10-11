@@ -315,7 +315,7 @@ SCENE_PARTS = ("picture", "video", "sound", "voices", "preview")
 PART_NAMES = {"picture": "picture", "video": "motion", "sound": "sound", "voices": "lines", "preview": "preview"}
 VOICE_FIRST = ("picture", "voices", "video", "sound", "preview")   # pace = "voice": the lines set the shot's length
 LOOK_STEPS = ("look", "look_takes")
-STEP_PART = {"board": "picture", "retake": "picture", "check": "picture", "video": "video", "sound": "sound", "voices": "voices",
+STEP_PART = {"board": "picture", "retake": "picture", "check": "picture", "video": "video", "motioncheck": "video", "sound": "sound", "voices": "voices",
              "scene": "preview"}
 
 
@@ -564,6 +564,19 @@ def _continuity(folder: Path, story, shot) -> list[str] | None:
         return None
 
 
+def _motion_faults(folder: Path, story, shot) -> list[str] | None:
+    """What the vision model saw go wrong in this shot's current clip (things passing through each other)."""
+    if story is None or shot is None or shot.tier == "still" or not sa.shot_path(story, shot).exists():
+        return None
+    out = sa.motion_path(story, shot)
+    if sa.Keys(folder).stale(out, sa.motion_key(story, shot)):
+        return None
+    try:
+        return json.loads(out.read_text())["faults"]
+    except (OSError, ValueError, KeyError):
+        return None
+
+
 def _heard(wav: Path) -> str | None:
     f = wav.with_suffix(".heard.txt")
     return f.read_text().strip() if f.is_file() else None
@@ -641,6 +654,7 @@ def film_state(folder: Path) -> dict:
             "end": s.get("end"), "fill": s.get("fill", "slow"), "seconds": _seconds(story, shot_obj),
             "ranking": _ranking(folder, story, shot_obj),
             "continuity": _continuity(folder, story, shot_obj),
+            "motion_faults": _motion_faults(folder, story, shot_obj),
             "checkable": bool(story and shot_obj and sa.continuity_facts(story, shot_obj)), "angle": s.get("angle", ""),
             "full": _url(folder, f"shots/{sid}-full.mp4") or _url(folder, f"shots/{sid}.mp4"),
         })
@@ -724,10 +738,13 @@ def step_argv(folder: Path, step: str, params: dict) -> list[str]:
     """The spike-animate arguments for one step, checked: anything odd is a ValueError, never a command."""
     folder = Path(folder)
     story = str(folder / "story.toml")
-    if step in ("board", "video", "sound", "voices", "scene", "check") and (params.get("shot") or step in ("scene", "check")):
+    if step in ("board", "video", "sound", "voices", "scene", "check", "motioncheck") and \
+            (params.get("shot") or step in ("scene", "check", "motioncheck")):
         ids = [s.get("id") for s in _doc(folder).get("shot", [])]
         if params.get("shot") not in ids:
             raise ValueError(f"no shot '{params.get('shot')}' in the story")
+        if step == "motioncheck":
+            return ["check", story, "--shot", params["shot"], "--motion"]
         return ["scene", story, params["shot"]] if step == "scene" else [step, story, "--shot", params["shot"]]
     if step in ("board", "video", "sound", "voices", "music", "film", "status"):
         return [step, story]

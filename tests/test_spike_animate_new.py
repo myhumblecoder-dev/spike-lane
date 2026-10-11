@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socketserver
 import subprocess
 import sys
@@ -568,3 +569,61 @@ def test_a_drafted_narrator_comes_in_quickly_after_each_cut(tmp_path):
     p = tmp_path / "story.toml"
     p.write_text(sa.draft_to_toml(draft(), idea="a keeper and a gull"))
     assert sa.load_story(p).narrator.lead == sa.DRAFT_LEAD and sa.DRAFT_LEAD <= 0.25
+
+
+# --- clipping: things passing through each other ----------------------------------------------------
+
+def clip(path: Path, seconds: float = 2.0) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run([shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+                    f"testsrc=size=320x176:rate=24", "-t", str(seconds), "-pix_fmt", "yuv420p", str(path)], check=True)
+
+
+def with_ffmpeg(e: dict) -> dict:
+    return {**e, "PATH": f"{Path(shutil.which('ffmpeg') or '/opt/homebrew/bin/ffmpeg').parent}:{e['PATH']}"}
+
+
+def test_the_motion_check_looks_across_a_clip_for_things_passing_through_each_other(ollama, tmp_path):
+    film = tmp_path / "morning"
+    film.mkdir()
+    (film / "story.toml").write_text(BIBLE_STORY)
+    clip(film / "shots" / "01-sit.mp4")
+    FakeOllama.replies = [{"faults": ["her right arm disappears as she lowers it"]}]
+    e = with_ffmpeg(ollama)
+    r = subprocess.run([str(ANIMATE), "check", "story.toml", "--shot", "01-sit", "--motion"], capture_output=True,
+                       text=True, env=e, cwd=film)
+    assert r.returncode == 0, r.stderr
+    [req] = FakeOllama.requests
+    assert len(req["images"]) == sa.MOTION_FRAMES and FakeOllama.holders == ["writer"]   # frames across the clip, in order
+    assert "she sips her coffee" in req["prompt"] and "through" in req["prompt"] and "disappear" in req["prompt"]
+    assert json.loads((film / "shots" / "01-sit.motion.json").read_text()) == {"faults": ["her right arm disappears as she lowers it"]}
+    assert "her right arm disappears" in r.stdout
+    r = subprocess.run([str(ANIMATE), "check", "story.toml", "--shot", "01-sit", "--motion"], capture_output=True,
+                       text=True, env=e, cwd=film)
+    assert r.returncode == 0 and len(FakeOllama.requests) == 1                       # a clip is judged once
+    clip(film / "shots" / "01-sit.mp4", 3.0)                                          # a new take is judged again
+    FakeOllama.replies = [{"faults": []}]
+    r = subprocess.run([str(ANIMATE), "check", "story.toml", "--shot", "01-sit", "--motion"], capture_output=True,
+                       text=True, env=e, cwd=film)
+    assert len(FakeOllama.requests) == 2 and "✓" in r.stdout
+
+
+def test_a_glide_has_no_motion_to_check(ollama, tmp_path):
+    film = tmp_path / "morning"
+    film.mkdir()
+    (film / "story.toml").write_text(BIBLE_STORY.replace('motion = "she sips', 'tier = "still"\nmotion = "she sips'))
+    clip(film / "shots" / "01-sit.mp4")
+    r = subprocess.run([str(ANIMATE), "check", "story.toml", "--shot", "01-sit", "--motion"], capture_output=True,
+                       text=True, env=with_ffmpeg(ollama), cwd=film)
+    assert r.returncode == 0 and not FakeOllama.requests
+
+
+def test_the_ranking_marks_down_things_passing_through_each_other(tmp_path):
+    (tmp_path / "story.toml").write_text(BIBLE_STORY)
+    q = sa.rank_prompt(sa.load_story(tmp_path / "story.toml"), sa.load_story(tmp_path / "story.toml").shots[0])
+    assert "passing through" in q and "sitting on nothing" in q
+
+
+def test_the_writer_frames_people_at_tables_from_the_waist_up():
+    p = sa.writer_prompt("an ad for a bakery", shots=6)
+    assert "waist up" in p and "sitting on a chair" in p

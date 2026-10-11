@@ -1164,3 +1164,15 @@ def test_narration_is_recorded_without_the_voice_models_lead_in_silence(env):
     assert run(env, "voices", "story.toml").returncode == 0
     wav = film / "voice" / "01-walk.wav"
     assert silence_at_start(wav) < 0.1 and sa.media_seconds(wav) < 2.4
+
+
+def test_every_animated_scene_gets_a_motion_check_that_never_stops_the_film(env):
+    film, _, log = env
+    set_shot(film, "02-pounce", 'tier = "still"')
+    assert run(env, "board", "story.toml").returncode == 0
+    r = run(env, "video", "story.toml", "--shot", "01-walk")
+    assert r.returncode == 0 and "motion check skipped for 01-walk" in r.stdout     # no model here: advice only
+    r = run(env, "film", "story.toml")
+    assert r.returncode == 0, r.stdout + r.stderr
+    checked = {l.split("motion check skipped for ")[1].split(":")[0] for l in r.stdout.splitlines() if "motion check skipped" in l}
+    assert checked == {"01-walk", "03-stalk"}                                    # a glide has no motion to check

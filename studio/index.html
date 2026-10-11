@@ -1096,6 +1096,20 @@ function continuityNote(s) {
     h("span", { class: "small faint" }, "Draw again, try other versions, or change the description; the local model checks each new picture."));
 }
 
+// What the local model saw go wrong in the motion: legs through a table, a vanishing arm, a cup changing shape.
+function motionNote(s, st) {
+  const doc = S.film.doc.shot.find((x) => x.id === s.id) || {};
+  if (!s.clip || !st.done || doc.tier === "still") return null;
+  const again = h("button", { class: "btn small ghost", disabled: busy() || locked("motioncheck", { shot: s.id }), onclick: () => run("motioncheck", { shot: s.id }) },
+    s.motion_faults == null ? "Check it" : "Check again");
+  if (s.motion_faults == null) return h("div", { class: "row" }, h("span", { class: "small dim" }, "Motion not checked for mistakes yet."), h("span", { class: "spacer" }), again);
+  if (!s.motion_faults.length) return h("div", { class: "row" }, h("span", { class: "chip ok" }, "✓ No mistakes seen in the motion"), h("span", { class: "spacer" }), again);
+  return h("div", { class: "card stack", style: "gap:6px;border-color:color-mix(in srgb, var(--bad) 45%, var(--line))" },
+    h("div", { class: "row" }, h("b", {}, "Mistakes in the motion"), h("span", { class: "spacer" }), again),
+    h("ul", { style: "margin:0;padding-left:1.2em" }, s.motion_faults.map((m) => h("li", { class: "small" }, m))),
+    h("span", { class: "small faint" }, "Animate again for a new take, trim before the mistake, or redraw the picture if it starts there."));
+}
+
 function motionPart(s, st) {
   const doc = S.film.doc.shot.find((x) => x.id === s.id) || {};
   const tier = doc.tier || "full", camera = doc.camera || "push";
@@ -1111,6 +1125,7 @@ function motionPart(s, st) {
     s.clip ? h("div", { class: st.done ? "" : "stale" }, h("video", { src: media(s.clip), poster: s.still ? media(s.still) : null, controls: true, playsinline: true, muted: true, loop: true, preload: "metadata" }))
       : h("div", { class: "empty-media" }, "Not animated yet"),
     s.seconds && S.film.doc.pace === "voice" ? h("p", { class: "small dim", style: "margin:0" }, `${s.seconds.toFixed(1)} s: as long as its lines and a breath`) : null,
+    motionNote(s, st),
     h("div", { class: "row" }, h("span", { class: "small dim" }, "Movement"),
       seg("Movement", [["still", "Glide"], ["subtle", "Subtle"], ["full", "Full"]], tier, setTier),
       glide ? seg("Camera", [["push", "In"], ["pull", "Out"], ["left", "Pan left"], ["right", "Pan right"]], camera, setCamera)

@@ -1068,3 +1068,28 @@ def test_each_scene_shows_its_versions_best_first(tmp_path):
     assert s["ranking"] == [{"seed": 9, "score": 9, "faults": []}, {"seed": shot.seed, "score": 6, "faults": ["blurred hands"]},
                             {"seed": 7, "score": 3, "faults": ["no sunset"]}]
     assert st.film_state(folder)["shots"][1]["ranking"] == []
+
+
+def test_the_page_shows_the_motion_checks_mistakes_for_the_current_clip(tmp_path):
+    folder = write_story(tmp_path / "bolt", STORY).parent
+    story = sa.load_story(folder / "story.toml")
+    shot = story.shots[1]
+    clip = sa.shot_path(story, shot)
+    clip.parent.mkdir(parents=True, exist_ok=True)
+    clip.write_bytes(b"a clip")
+    assert st.film_state(folder)["shots"][1]["motion_faults"] is None       # not checked yet
+    out = sa.motion_path(story, shot)
+    out.write_text(json.dumps({"faults": ["his arm passes through the table"]}))
+    sa.Keys(folder).record(out, sa.motion_key(story, shot))
+    assert st.film_state(folder)["shots"][1]["motion_faults"] == ["his arm passes through the table"]
+    clip.write_bytes(b"a new take")                                          # the old check no longer applies
+    assert st.film_state(folder)["shots"][1]["motion_faults"] is None
+
+
+def test_a_scenes_motion_can_be_checked_again_from_the_page(tmp_path):
+    folder = write_story(tmp_path / "bolt", STORY).parent
+    assert st.step_argv(folder, "motioncheck", {"shot": "02-claim"}) == \
+        ["check", str(folder / "story.toml"), "--shot", "02-claim", "--motion"]
+    assert st.STEP_PART["motioncheck"] == "video"
+    with pytest.raises(ValueError):
+        st.step_argv(folder, "motioncheck", {"shot": "nope"})
