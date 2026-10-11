@@ -74,7 +74,7 @@ spike-animate check story.toml --shot 03-reveal   # does the picture match the f
 
 Finishing: the film is put together at 1280×720 (the 832×448 clips scaled up), with captions burned in
 (each shot's `caption`, or its narration; `captions = false` turns them off), an optional `[end_card]`
-(`text`, `sub`, `hold` seconds the last frame holds) and one `[grade]` (`warmth`, `saturation`,
+(`text`, `sub`, `hold` seconds the last frame holds, `place` = "middle", "top" or "bottom" to keep it off a face) and one `[grade]` (`warmth`, `saturation`,
 `contrast`) over every shot. The words are drawn by `engines/titles.py` (Pillow), since this ffmpeg has no
 text filters. None of this redoes a scene; the studio sets it on the Film tab (Finish).
 A shot can also show a real picture on a screen in it: `screen = { picture = "reference/page.png",
@@ -100,8 +100,9 @@ still shot's screen is laid on its picture first, so it moves with the glide. Th
 still or subtle and at most 2 full. In the studio: the scene's Motion step, **Movement**.
 
 Rules it enforces: with `pace = "voice"` (what `new` writes) each shot lasts its own lines plus a 0.5 s
-breath, 49–121 frames at 24 fps (about 2–5 s; a silent shot 3 s, or `seconds = N` on the shot), so a
-scene's lines are recorded before its motion and the cuts land on the voice-over; films without a pace
+breath (0.3 s), 49–121 frames at 24 fps (about 2–5 s; a silent shot 3 s, or `seconds = N` on the shot), so a
+scene's lines are recorded before its motion and the cuts land on the voice-over; every recorded line is cut to its words (the voice model's lead-in silence
+dropped, pauses inside it cut to 0.2 s), and `new` writes a 0.2 s narrator `lead`, so the voice-over runs on like an ad's; films without a pace
 keep 121-frame (5.04 s) shots, where the score runs at 95 BPM so each shot is two bars; stills whose stored prompt doesn't match the story are rejected; only outputs whose
 inputs changed are re-rendered (`.spike-animate/keys.json`).
 

@@ -11,6 +11,11 @@ if sys.version_info < (3, 11):
             os.execv(py, [py, *sys.argv])
     sys.exit("spike-studio needs Python 3.11 or newer")
 
+# launchd's PATH has no Homebrew: the studio and its jobs need its ffmpeg/ffprobe.
+for d in ("/usr/local/bin", "/opt/homebrew/bin"):
+    if os.path.isdir(d) and d not in os.environ.get("PATH", "").split(os.pathsep):
+        os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import spike_studio  # noqa: E402

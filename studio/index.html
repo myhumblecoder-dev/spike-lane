@@ -1292,6 +1292,10 @@ function finishCard() {
   const text = h("input", { type: "text", value: doc.end_card?.text || "", placeholder: "e.g. Put your agent to work." });
   const sub = h("input", { type: "text", value: doc.end_card?.sub || "", placeholder: "e.g. BotGuild.ai" });
   const g = { warmth: 0, saturation: 1, contrast: 1, ...(doc.grade || {}) };
+  let place = doc.end_card?.place || "middle";
+  const placeSeg = h("div", { class: "seg", role: "group", "aria-label": "End card height" },
+    [["top", "High"], ["middle", "Middle"], ["bottom", "Low"]].map(([v, label]) => h("button", { type: "button", "aria-pressed": place === v,
+      onclick: (e) => { place = v; for (const b of e.target.parentNode.children) b.setAttribute("aria-pressed", String(b === e.target)); } }, label)));
   const slider = (k, name, min, max, step) => {
     const out = h("span", { class: "mono small", style: "min-width:3.5em;text-align:right" }, String(g[k]));
     const r = h("input", { type: "range", min, max, step, value: g[k], "aria-label": name,
@@ -1302,7 +1306,7 @@ function finishCard() {
     try {
       await saveDoc((d) => {
         if (cap.checked) delete d.captions; else d.captions = false;
-        if (text.value.trim()) d.end_card = { ...(d.end_card || {}), text: text.value.trim(), sub: sub.value.trim() }; else delete d.end_card;
+        if (text.value.trim()) { d.end_card = { ...(d.end_card || {}), text: text.value.trim(), sub: sub.value.trim() }; if (place === "middle") delete d.end_card.place; else d.end_card.place = place; } else delete d.end_card;
         const grade = Object.fromEntries(Object.entries(g).filter(([k, v]) => v !== { warmth: 0, saturation: 1, contrast: 1 }[k]));
         if (Object.keys(grade).length) d.grade = grade; else delete d.grade;
       }, mixNow ? "Saved; putting the film together again" : "Saved; it applies when the film is put together");
@@ -1314,6 +1318,7 @@ function finishCard() {
     h("label", { class: "row", style: "gap:10px" }, cap, h("span", {}, "Captions: each scene's narration, or its own caption (set in its Lines)")),
     h("label", { class: "f" }, h("span", {}, "End card", h("span", { class: "faint" }, "over the last scene, which then holds")), text),
     h("label", { class: "f" }, h("span", {}, "Second line", h("span", { class: "faint" }, "smaller, e.g. the website")), sub),
+    h("div", { class: "row", style: "gap:10px" }, h("span", { class: "small dim" }, "End card sits"), placeSeg, h("span", { class: "small faint" }, "keep it clear of a face")),
     slider("warmth", "Warmth", -0.5, 0.5, 0.05), slider("saturation", "Colour", 0.5, 1.6, 0.05), slider("contrast", "Contrast", 0.8, 1.3, 0.01),
     h("div", { class: "row" }, h("span", { class: "spacer" }), save));
 }

@@ -104,14 +104,19 @@ elif me == "mlx_audio.tts.generate" and "MOSS-TTSD" in flag("--model"):
                 w.writeframes(b"\x00\x00" * int(24000 * 0.6))
 elif me == "mlx_audio.tts.generate":
     out = Path(flag("--output_path")); out.mkdir(parents=True, exist_ok=True)
-    wav = out / f"{flag('--file_prefix')}_000.wav"
-    ff("-f", "lavfi", "-i", f"sine=frequency={200 + len(flag('--text'))}:duration=2", "-ac", "1", "-ar", "24000", str(wav))
+    wav = out / f"{flag('--file_prefix')}_000.wav"   # like the real model: half a second of silence before the words
+    ff("-f", "lavfi", "-i", f"sine=frequency={200 + len(flag('--text'))}:duration=2", "-af", "adelay=500:all=1,apad=pad_dur=0.3",
+       "-ac", "1", "-ar", "24000", str(wav))
+    by_name = Path(os.environ["FAKE_LOG"]).with_name("said-by-name"); by_name.mkdir(exist_ok=True)
+    (by_name / flag("--file_prefix")).write_text(flag("--text"))   # lines are trimmed after, so their bytes change
     said = Path(os.environ["FAKE_LOG"]).with_name("said"); said.mkdir(exist_ok=True)
     import hashlib  # remember what this audio says, by content, for the stand-in speech-to-text
     (said / hashlib.sha256(wav.read_bytes()).hexdigest()).write_text(flag("--text"))
 elif me == "mlx_audio.stt.generate":
     import hashlib
     said = Path(os.environ["FAKE_LOG"]).with_name("said") / hashlib.sha256(Path(flag("--audio")).read_bytes()).hexdigest()
+    if not said.exists():
+        said = Path(os.environ["FAKE_LOG"]).with_name("said-by-name") / Path(flag("--audio")).stem
     Path(flag("--output-path") + ".txt").write_text(said.read_text() if said.exists() else "")
 '''
 
@@ -836,7 +841,9 @@ def test_a_voice_paced_shot_waits_for_its_line_then_lasts_as_long_as_it(env):
     assert run(env, "voices", "story.toml", "--shot", "01-walk").returncode == 0
     r = run(env, "video", "story.toml", "--shot", "01-walk")
     assert r.returncode == 0, r.stdout + r.stderr
-    want = sa.wan_frames(0.5 + 2.0 + sa.TAIL)                                  # lead, the 2 s line, a breath
+    line = sa.media_seconds(film / "voice" / "01-walk.wav")
+    assert line < 2.4                                                          # 2 s of words, cut to them
+    want = sa.wan_frames(0.5 + line + sa.TAIL)                                 # lead, the line, a breath
     assert flag(wan(log)[-1]["args"], "--num-frames") == str(want)
     assert frames(film / "shots" / "01-walk.mp4") == want
 
@@ -849,7 +856,8 @@ def test_a_voice_paced_film_is_as_long_as_its_shots(env):
     assert run(env, "voices", "story.toml").returncode == 0
     r = run(env, "film", "story.toml")
     assert r.returncode == 0, r.stdout + r.stderr
-    lens = [sa.wan_frames(0.5 + 2.0 + sa.TAIL) / 24, sa.wan_frames(4.2) / 24, sa.wan_frames(sa.SILENT_SECONDS) / 24]
+    line = sa.media_seconds(film / "voice" / "01-walk.wav")
+    lens = [sa.wan_frames(0.5 + line + sa.TAIL) / 24, sa.wan_frames(4.2) / 24, sa.wan_frames(sa.SILENT_SECONDS) / 24]
     assert duration(film / "film" / "picture.mp4") == pytest.approx(sum(lens), abs=0.08)
     assert duration(film / "film" / "sfx.wav") == pytest.approx(sum(lens), abs=0.08)
     sfx = [float(flag(c["args"], "--duration")) for c in calls(log, "python") if c["args"][0] == "demo.py"]
@@ -866,7 +874,7 @@ def test_a_voice_paced_scene_preview_is_its_shot_long(env):
     for step in ("voices", "video", "sound"):
         assert run(env, step, "story.toml", "--shot", "01-walk").returncode == 0, step
     assert run(env, "scene", "story.toml", "01-walk").returncode == 0
-    assert duration(film / "scenes" / "01-walk.mp4") == pytest.approx(sa.wan_frames(3.0) / 24, abs=0.06)
+    assert duration(film / "scenes" / "01-walk.mp4") == pytest.approx(sa.wan_frames(0.5 + sa.media_seconds(film / "voice" / "01-walk.wav") + sa.TAIL) / 24, abs=0.06)
 
 
 # --- titles: captions, the end card, and the finished size ------------------------------------
@@ -1103,3 +1111,56 @@ def test_the_glide_engine_moves_the_camera_smoothly_over_the_picture(tmp_path, c
     else:
         assert wa == pytest.approx(wb, abs=2) and b[0] > a[0] + 20     # camera pans left: the scene slides right
     assert abs((a[2] + a[3]) - (b[2] + b[3])) <= 4 if camera == "left" else True
+
+
+def test_the_end_card_is_drawn_where_the_story_places_it(env):
+    film, _, log = env
+    (film / "story.toml").write_text(STORY.replace("\n[[shot]]", END_CARD + 'place = "top"\n' + "\n[[shot]]", 1))
+    assert run(env, "board", "story.toml").returncode == 0
+    r = run(env, "film", "story.toml")
+    assert r.returncode == 0, r.stdout + r.stderr
+    spec = json.loads((film / "film" / "titles" / "spec.json").read_text())
+    assert [(i["kind"], i["place"]) for i in spec["items"]] == [("caption", "middle"), ("end", "top")]
+
+
+def test_the_title_engine_puts_a_high_end_card_in_the_top_third(tmp_path):
+    spec = {"size": [1280, 720], "font": sa.TITLE_FONT, "items": [
+        {"text": "Put your agent to work.\nBotGuild.ai", "kind": "end", "place": "top", "out": str(tmp_path / "e.png")}]}
+    (tmp_path / "spec.json").write_text(json.dumps(spec))
+    subprocess.run([str(Path.home() / "MMAudio" / ".venv" / "bin" / "python"), str(ROOT / "engines" / "titles.py"),
+                    str(tmp_path / "spec.json")], check=True)
+    alpha = subprocess.run([FFMPEG, "-v", "error", "-i", str(tmp_path / "e.png"), "-vf", "alphaextract,format=gray",
+                            "-f", "rawvideo", "-"], capture_output=True, check=True).stdout
+    ink = [i // 1280 / 720 for i, a in enumerate(alpha) if a > 128]
+    assert ink and 0.05 <= min(ink) and max(ink) <= 0.36
+
+
+
+# --- pace: lines trimmed to their words ------------------------------------------------------------
+
+def silence_at_start(path):
+    r = subprocess.run([FFMPEG, "-i", str(path), "-af", "silencedetect=n=-40dB:d=0.05", "-f", "null", "-"],
+                       capture_output=True, text=True).stderr
+    import re
+    starts = [float(x) for x in re.findall(r"silence_start: (-?[\d.]+)", r)]
+    ends = [float(x) for x in re.findall(r"silence_end: ([\d.]+)", r)]
+    return ends[0] if starts and starts[0] < 0.01 else 0.0
+
+
+def test_a_recorded_line_is_trimmed_to_its_words_and_long_pauses_shortened(tmp_path):
+    wav = tmp_path / "line.wav"
+    subprocess.run([FFMPEG, "-v", "error", "-f", "lavfi", "-i", "sine=frequency=300:duration=1", "-f", "lavfi", "-i",
+                    "sine=frequency=500:duration=1", "-filter_complex",
+                    "[0]adelay=500:all=1,apad=pad_dur=0.6[a];[1]apad=pad_dur=0.5[b];[a][b]concat=n=2:v=0:a=1",
+                    "-ar", "24000", "-ac", "1", str(wav)], check=True)
+    assert sa.media_seconds(wav) == pytest.approx(3.6, abs=0.05)
+    sa.trim_speech(wav)
+    assert silence_at_start(wav) < 0.1                                # the words start at once
+    assert 2.2 <= sa.media_seconds(wav) <= 2.6                        # 1 s + a short pause + 1 s, little after
+
+
+def test_narration_is_recorded_without_the_voice_models_lead_in_silence(env):
+    film, _, log = env
+    assert run(env, "voices", "story.toml").returncode == 0
+    wav = film / "voice" / "01-walk.wav"
+    assert silence_at_start(wav) < 0.1 and sa.media_seconds(wav) < 2.4

@@ -27,10 +27,11 @@ from pathlib import Path
 SHOT_FRAMES = 121
 MIN_FRAMES = 49                 # the shortest clip a voice-paced shot gets (about 2 s)
 FPS = 24
-TAIL = 0.5                      # voice pace: a breath after a shot's last line before the cut
+TAIL = 0.3                      # voice pace: a breath after a shot's last line before the cut
 SILENT_SECONDS = 3.0            # voice pace: a shot with nothing said
 PACES = ("fixed", "voice")
 VIDEO_DIMS = {"sd": (832, 448), "hd": (1280, 704)}   # the video model's size: hd is Wan 2.2 5B's own 720p
+END_PLACES = ("middle", "top", "bottom")
 TIERS = ("still", "subtle", "full")   # how a shot moves: a camera glide over its picture, small movement, or full motion
 CAMERAS = ("push", "pull", "left", "right")   # a still shot's glide: in, out, or across
 GLIDE = 0.08                    # a still shot's camera move (engines/kenburns.py has its own copy)
@@ -151,6 +152,7 @@ class EndCard:
     text: str
     sub: str = ""
     hold: float = 1.5
+    place: str = "middle"   # or "top" / "bottom": where it sits, clear of a face
 
 
 @dataclass
@@ -167,6 +169,7 @@ class Title:
     kind: str        # "caption" (lower third) or "end" (the end card, centred)
     start: float
     end: float
+    place: str = "middle"   # the end card's height; captions always sit in the lower third
 
 
 @dataclass
@@ -337,7 +340,10 @@ def load_story(path: Path) -> Story:
     end_card = None
     if "end_card" in d:
         e = d["end_card"]
-        end_card = EndCard(text=_need(e, "text", "[end_card]"), sub=str(e.get("sub", "")), hold=float(e.get("hold", 1.5)))
+        end_card = EndCard(text=_need(e, "text", "[end_card]"), sub=str(e.get("sub", "")), hold=float(e.get("hold", 1.5)),
+                           place=str(e.get("place", "middle")))
+        if end_card.place not in END_PLACES:
+            raise StoryError(f"[end_card] place must be one of {', '.join(END_PLACES)}, not '{end_card.place}'")
         if not 0 <= end_card.hold <= 5:
             raise StoryError("[end_card] hold must be between 0 and 5 seconds")
     gd = d.get("grade", {})
@@ -471,7 +477,8 @@ def title_plan(story: Story) -> list[Title]:
             out.append(Title(text, "caption", at, at + shot_len(story, s)))
     if story.end_card:
         e, lead = story.end_card, story.narrator.lead if story.narrator else 0.5
-        out.append(Title(e.text + (f"\n{e.sub}" if e.sub else ""), "end", starts[last] + lead, film_length(story)))
+        out.append(Title(e.text + (f"\n{e.sub}" if e.sub else ""), "end", starts[last] + lead, film_length(story),
+                         e.place))
     return out
 
 
@@ -1371,7 +1378,8 @@ def render_titles(story: Story, keys: Keys, plan: list[Title]) -> list[Path]:
     tdir = story.root / "film" / "titles"
     outs = [tdir / f"{i:02d}-{t.kind}.png" for i, t in enumerate(plan, 1)]
     spec = {"size": list(FINISH_SIZE), "font": TITLE_FONT,
-            "items": [{"text": t.text, "kind": t.kind, "out": str(o)} for t, o in zip(plan, outs)]}
+            "items": [{"text": t.text, "kind": t.kind, "place": t.place, "out": str(o)}
+                      for t, o in zip(plan, outs)]}
     k = key_for("titles", spec)
     if any(keys.stale(o, k) for o in outs):
         _say(f"titles ({len(plan)}) …")
@@ -1499,6 +1507,48 @@ def tts(model: str, text: str, out: Path, extra: list) -> None:
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+def speech_cuts(silences: list[tuple[float, float]], total: float, pause: float = 0.2, before: float = 0.05,
+                after: float = 0.2) -> list[tuple[float, float]]:
+    """The parts of a line to keep: its words, `before` ahead of the first, `after` past the last, and every
+    pause inside it cut to at most `pause` (half kept on each side)."""
+    words, at = [], 0.0
+    for a, b in sorted(silences):
+        if a > at:
+            words.append((at, a))
+        at = max(at, b)
+    if at < total:
+        words.append((at, total))
+    if not words:
+        return [(0.0, total)]
+    keep = [[max(0.0, words[0][0] - before), words[0][1]]]
+    for a, b in words[1:]:
+        gap = a - keep[-1][1]
+        if gap <= pause:
+            keep[-1][1] = b
+        else:
+            keep[-1][1] += pause / 2
+            keep.append([a - pause / 2, b])
+    keep[-1][1] = min(total, keep[-1][1] + after)
+    return [(round(a, 6), round(b, 6)) for a, b in keep]
+
+
+def trim_speech(wav: Path) -> None:
+    """A line cut to its words: the voice model's lead-in silence gone, long pauses (and the end) cut to 0.2 s.
+    Voice-paced shots last as long as their lines, so dead air there is dead air in the film."""
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-i", str(wav), "-af", "silencedetect=n=-40dB:d=0.15", "-f", "null", "-"],
+                       capture_output=True, text=True)
+    starts = [float(x) for x in re.findall(r"silence_start: (-?[\d.]+)", r.stderr)]
+    ends = [float(x) for x in re.findall(r"silence_end: ([\d.]+)", r.stderr)]
+    total = media_seconds(wav)
+    keep = speech_cuts(list(zip(starts, ends + [total] * (len(starts) - len(ends)))), total)
+    if keep == [(0.0, total)]:
+        return
+    pick = "+".join(f"between(t,{a:.4f},{b:.4f})" for a, b in keep)
+    tmp = wav.with_name(f".{wav.stem}-trim.wav")
+    ffmpeg("-i", wav, "-af", f"aselect='{pick}',asetpts=N/SR/TB", tmp)
+    tmp.replace(wav)
+
+
 def heard(audio: Path, keys: Keys) -> str:
     """What speech-to-text hears in `audio` (cached by the audio's content)."""
     txt = audio.with_suffix(".heard.txt")
@@ -1555,6 +1605,7 @@ def narrate(story: Story, keys: Keys, checks: dict, only: set[str] | None = None
         if keys.stale(out, k):
             _say(f"narration {sid} …")
             tts(TTS_CLONE, shot.narration, out, ["--ref_audio", card, "--ref_text", n.sample])
+            trim_speech(out)
             keys.record(out, k)
         checks["narration"][sid] = round(words_match(shot.narration, heard(out, keys)), 2)
         lines.append((out, at))
@@ -1623,6 +1674,7 @@ def speak_dialogue(story: Story, keys: Keys, checks: dict, only: set[str] | None
             if keys.stale(o, k):
                 _say(f"dialogue {o.stem} …")
                 tts(TTS_CLONE, l.line, o, ["--ref_audio", cards[l.speaker], "--ref_text", story.voices[l.speaker].sample])
+                trim_speech(o)
                 keys.record(o, k)
     checks["dialogue"], checks["dialogue_overflow"] = {}, {}
     placed = []
@@ -2017,6 +2069,7 @@ def draft_schema(parts: Parts = Parts()) -> dict:
 MAX_NARRATION_WORDS = 10   # ~3 s of narration: a voice-paced shot is its line plus a breath, at most 5 s
 MAX_DIALOGUE_WORDS = 12    # all the dialogue in one shot, for the same reason
 MAX_CAPTION_WORDS = 6      # on-screen words: read at a glance
+DRAFT_LEAD = 0.2           # the narrator comes in right after a cut: an ad's voice-over runs on
 MAX_FULL_SHOTS = 2         # full motion is slow to make and busy to watch: keep it for the action
 
 WRITER_EXAMPLE = {
@@ -2275,7 +2328,7 @@ def draft_to_toml(d: dict, idea: str, notes: str = "", style_image: str = "", st
         out += ["", f"[angles.{a['name']}]", f"frame = {q(a['frame'])}", f"seed = {1024 + 1000 * (i + 1)}"]
     if d.get("narrator") and any(s.get("narration") for s in d["shots"]):
         n = d["narrator"]
-        out += ["", "[narrator]", f"voice = {q(n['voice'])}", f"sample = {q(n['sample'])}", "lead = 0.5"]
+        out += ["", "[narrator]", f"voice = {q(n['voice'])}", f"sample = {q(n['sample'])}", f"lead = {DRAFT_LEAD:g}"]
     if d.get("music"):
         m = d["music"]
         out += ["", "[music]", f"caption = {q(m['caption'])}", f"key = {q(m['key'])}", "takes = 8", "db = -10",

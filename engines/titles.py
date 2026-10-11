@@ -1,7 +1,8 @@
 """Draw the film's words as transparent pictures to lay over the video (this ffmpeg has no text filters).
 usage: titles.py SPEC.json
-SPEC: {"size": [W, H], "font": path to a .ttf, "items": [{"text", "kind": "caption" | "end", "out": PNG}]}
-A caption sits in the lower third, bold white with a dark outline; the end card is larger and centred,
+SPEC: {"size": [W, H], "font": path to a .ttf, "items": [{"text", "kind": "caption" | "end", "place", "out": PNG}]}
+A caption sits in the lower third, bold white with a dark outline; the end card is larger and centred
+(or high, or low: "place" is "middle", "top" or "bottom", to keep clear of a face),
 its second line (if any) smaller; both carry a soft shadow. Long lines wrap to 80% of the width. Needs Pillow."""
 import json
 import sys
@@ -49,7 +50,8 @@ for item in spec["items"]:
         first, *rest = item["text"].split("\n")
         head = wrap(draw, first, big, W * 0.8)
         tail = wrap(draw, " ".join(rest), small, W * 0.8) if rest else []
-        draw_block(draw, head + tail, [big] * len(head) + [small] * len(tail), H * 0.5, round(H * 0.006))
+        y = H * {"top": 0.2, "bottom": 0.72}.get(item.get("place"), 0.5)
+        draw_block(draw, head + tail, [big] * len(head) + [small] * len(tail), y, round(H * 0.006))
     else:
         font = ImageFont.truetype(spec["font"], round(H * 0.052))
         lines = wrap(draw, item["text"], font, W * 0.8)

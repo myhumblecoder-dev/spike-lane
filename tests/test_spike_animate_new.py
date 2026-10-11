@@ -56,7 +56,7 @@ def test_a_draft_becomes_a_loadable_story(tmp_path):
     assert story.characters["GULL"] == "a small grey seagull with a bent wing"
     assert [s.id for s in story.shots] == ["01-light", "02-storm", "03-friends"]
     assert story.shots[1].anchor == 0 and story.shots[0].anchor == 1        # action shots move freely
-    assert story.shots[1].narration == "" and story.narrator.lead == 0.5
+    assert story.shots[1].narration == "" and story.narrator.lead == sa.DRAFT_LEAD
     assert story.music.key == "A minor" and story.music.structure.startswith("[Intro")
     assert "a lonely lighthouse keeper befriends a seagull" in p.read_text()  # the idea is kept as a comment
 
@@ -562,3 +562,9 @@ def test_lint_keeps_full_motion_for_a_few_shots():
     assert any("full" in x for x in sa.lint_draft(d, 3))
     d["shots"][0]["tier"] = "still"
     assert not any("full" in x for x in sa.lint_draft(d, 3))
+
+
+def test_a_drafted_narrator_comes_in_quickly_after_each_cut(tmp_path):
+    p = tmp_path / "story.toml"
+    p.write_text(sa.draft_to_toml(draft(), idea="a keeper and a gull"))
+    assert sa.load_story(p).narrator.lead == sa.DRAFT_LEAD and sa.DRAFT_LEAD <= 0.25

@@ -496,3 +496,23 @@ def test_a_still_shots_glide_has_its_own_key_and_ignores_the_motion_words(tmp_pa
     assert sa.shot_key(reworded, reworded.shots[1]) == k
     assert sa.shot_key(tiered(tmp_path, 'tier = "still"\ncamera = "pull"\n'),
                        tiered(tmp_path, 'tier = "still"\ncamera = "pull"\n').shots[1]) != k
+
+
+def test_the_end_card_can_sit_high_or_low_to_keep_clear_of_faces(tmp_path):
+    middle = sa.load_story(write_story(tmp_path, STORY.replace("\n[[shot]]", END + "\n[[shot]]", 1)))
+    assert middle.end_card.place == "middle" and sa.title_plan(middle)[-1].place == "middle"
+    top = sa.load_story(write_story(tmp_path, STORY.replace("\n[[shot]]", END + 'place = "top"\n' + "\n[[shot]]", 1)))
+    assert top.end_card.place == "top" and sa.title_plan(top)[-1].place == "top"
+    assert sa.title_plan(top)[0].place == "middle"                  # captions keep their lower third
+    with pytest.raises(sa.StoryError, match="place"):
+        sa.load_story(write_story(tmp_path, STORY.replace("\n[[shot]]", END + 'place = "left"\n' + "\n[[shot]]", 1)))
+
+
+# --- pace: a line cut to its words --------------------------------------------------------------
+
+def test_a_line_keeps_its_words_and_short_pauses_only():
+    # 0.5 s silence, words, a 0.6 s pause, words, 0.5 s of silence (3.6 s in all)
+    keep = sa.speech_cuts([(0.0, 0.5), (1.5, 2.1), (3.1, 3.6)], 3.6, pause=0.2, before=0.05, after=0.2)
+    assert keep == [pytest.approx((0.45, 1.6)), pytest.approx((2.0, 3.3))]
+    assert sa.speech_cuts([], 2.0, pause=0.2, before=0.05, after=0.2) == [(0.0, 2.0)]   # no silence: as it is
+    assert sa.speech_cuts([(0.0, 2.0)], 2.0, pause=0.2, before=0.05, after=0.2) == [(0.0, 2.0)]   # all silence: as it is
