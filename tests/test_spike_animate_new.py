@@ -117,7 +117,7 @@ class FakeOllama(BaseHTTPRequestHandler):
         FakeOllama.requests.append(body)
         FakeOllama.holders.append((spike_lane.holder() or {}).get("name"))
         reply = FakeOllama.replies.pop(0)
-        out = json.dumps({"response": json.dumps(reply), "done": True}).encode()
+        out = reply if isinstance(reply, bytes) else json.dumps({"response": json.dumps(reply), "done": True}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(out)))
@@ -579,6 +579,15 @@ def clip(path: Path, seconds: float = 2.0) -> None:
                     f"testsrc=size=320x176:rate=24", "-t", str(seconds), "-pix_fmt", "yuv420p", str(path)], check=True)
 
 
+def fresh_clip(film: Path, seconds: float = 2.0) -> None:
+    """01-sit's picture and a clip animated from it, recorded as up to date."""
+    (film / "board").mkdir(parents=True, exist_ok=True)
+    (film / "board" / "01-sit.png").write_bytes(b"\x89PNG a picture")
+    clip(film / "shots" / "01-sit.mp4", seconds)
+    story = sa.load_story(film / "story.toml")
+    sa.Keys(film).record(sa.shot_path(story, story.shots[0]), sa.shot_key(story, story.shots[0]))
+
+
 def with_ffmpeg(e: dict) -> dict:
     return {**e, "PATH": f"{Path(shutil.which('ffmpeg') or '/opt/homebrew/bin/ffmpeg').parent}:{e['PATH']}"}
 
@@ -587,7 +596,7 @@ def test_the_motion_check_looks_across_a_clip_for_things_passing_through_each_ot
     film = tmp_path / "morning"
     film.mkdir()
     (film / "story.toml").write_text(BIBLE_STORY)
-    clip(film / "shots" / "01-sit.mp4")
+    fresh_clip(film)
     FakeOllama.replies = [{"faults": ["her right arm disappears as she lowers it"]}]
     e = with_ffmpeg(ollama)
     r = subprocess.run([str(ANIMATE), "check", "story.toml", "--shot", "01-sit", "--motion"], capture_output=True,
@@ -601,11 +610,65 @@ def test_the_motion_check_looks_across_a_clip_for_things_passing_through_each_ot
     r = subprocess.run([str(ANIMATE), "check", "story.toml", "--shot", "01-sit", "--motion"], capture_output=True,
                        text=True, env=e, cwd=film)
     assert r.returncode == 0 and len(FakeOllama.requests) == 1                       # a clip is judged once
-    clip(film / "shots" / "01-sit.mp4", 3.0)                                          # a new take is judged again
+    fresh_clip(film, 3.0)                                                             # a new take is judged again
     FakeOllama.replies = [{"faults": []}]
     r = subprocess.run([str(ANIMATE), "check", "story.toml", "--shot", "01-sit", "--motion"], capture_output=True,
                        text=True, env=e, cwd=film)
     assert len(FakeOllama.requests) == 2 and "✓" in r.stdout
+
+
+def motion_check(e: dict, film: Path) -> subprocess.CompletedProcess:
+    return subprocess.run([str(ANIMATE), "check", "story.toml", "--shot", "01-sit", "--motion"], capture_output=True,
+                          text=True, env=with_ffmpeg(e), cwd=film)
+
+
+def checked_film(tmp_path: Path) -> Path:
+    film = tmp_path / "morning"
+    film.mkdir()
+    (film / "story.toml").write_text(BIBLE_STORY)
+    fresh_clip(film)
+    return film
+
+
+def test_the_motion_check_waits_for_a_clip_animated_from_the_current_picture(ollama, tmp_path):
+    film = checked_film(tmp_path)
+    (film / "board" / "01-sit.png").write_bytes(b"\x89PNG a new picture")          # redrawn, not animated yet
+    r = motion_check(ollama, film)
+    assert r.returncode == 0, r.stderr
+    assert not FakeOllama.requests and "animate" in r.stdout and not (film / "shots" / "01-sit.motion.json").exists()
+
+
+def test_another_vision_model_checks_the_motion_again(ollama, tmp_path):
+    film = checked_film(tmp_path)
+    FakeOllama.replies = [{"faults": []}, {"faults": ["her cup turns into a glass"]}]
+    assert motion_check(ollama, film).returncode == 0
+    r = motion_check({**ollama, "SPIKE_WRITER_MODEL": "qwen3-vl:32b"}, film)
+    assert [q["model"] for q in FakeOllama.requests] == ["gemma4:26b", "qwen3-vl:32b"] and "glass" in r.stdout
+
+
+def test_a_damaged_motion_verdict_is_checked_again(ollama, tmp_path):
+    film = checked_film(tmp_path)
+    FakeOllama.replies = [{"faults": []}, {"faults": []}]
+    assert motion_check(ollama, film).returncode == 0
+    (film / "shots" / "01-sit.motion.json").write_text('{"fau')
+    r = motion_check(ollama, film)
+    assert r.returncode == 0, r.stderr
+    assert len(FakeOllama.requests) == 2 and "✓" in r.stdout
+
+
+def test_the_motion_check_keeps_no_frames_for_a_later_take_to_reuse(ollama, tmp_path):
+    film = checked_film(tmp_path)
+    FakeOllama.replies = [{"faults": []}]
+    assert motion_check(ollama, film).returncode == 0
+    assert len(FakeOllama.requests[0]["images"]) == sa.MOTION_FRAMES
+    assert not (film / "shots" / "01-sit.motion").exists()
+
+
+def test_a_reply_from_ollama_that_is_not_json_is_a_stage_error(ollama, monkeypatch):
+    monkeypatch.setenv("OLLAMA_HOST", ollama["OLLAMA_HOST"])
+    FakeOllama.replies = [b"<html>502 bad gateway</html>"]
+    with pytest.raises(sa.StageError):
+        sa.ollama_generate("hello", "gemma4:26b")
 
 
 def test_a_glide_has_no_motion_to_check(ollama, tmp_path):

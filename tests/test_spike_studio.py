@@ -1093,3 +1093,19 @@ def test_a_scenes_motion_can_be_checked_again_from_the_page(tmp_path):
     assert st.STEP_PART["motioncheck"] == "video"
     with pytest.raises(ValueError):
         st.step_argv(folder, "motioncheck", {"shot": "nope"})
+
+
+def test_the_page_and_the_server_agree_on_which_part_of_a_scene_each_step_needs():
+    import re
+    page = (Path(st.__file__).parent / "studio" / "index.html").read_text()
+    js = re.search(r"const STEP_PART = \{(.*?)\};", page).group(1)
+    assert dict(re.findall(r"(\w+): \"(\w+)\"", js)) == st.STEP_PART
+
+
+def test_a_job_is_named_by_its_studio_step(tmp_path, fake_bin):
+    folder = write_story(tmp_path / "bolt").parent
+    jobs = st.Jobs()
+    jobs.start(folder, st.step_argv(folder, "motioncheck", {"shot": "02-claim"}), step="motioncheck")
+    assert wait_done(jobs, folder)["step"] == "motioncheck"
+    page = (Path(st.__file__).parent / "studio" / "index.html").read_text()
+    assert "motioncheck:" in page.split("const STEP_NAMES")[1].split("};")[0]

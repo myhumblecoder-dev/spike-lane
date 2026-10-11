@@ -1069,38 +1069,58 @@ def motion_path(story: Story, shot: Shot) -> Path:
     return story.root / "shots" / f"{shot.id}.motion.json"
 
 
-def motion_key(story: Story, shot: Shot) -> str:
-    return key_for("motion-check", file_digest(shot_path(story, shot)), motion_check_prompt(story, shot))
+def motion_model(model: str | None = None) -> str:
+    return model or os.environ.get("SPIKE_WRITER_MODEL", "gemma4:26b")
+
+
+def motion_key(story: Story, shot: Shot, model: str | None = None) -> str:
+    return key_for("motion-check", file_digest(shot_path(story, shot)), motion_check_prompt(story, shot),
+                   motion_model(model))
+
+
+def _motion_verdict(out: Path) -> list[str] | None:
+    try:
+        return [str(f) for f in json.loads(out.read_text())["faults"]]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
 
 
 def check_motion(story: Story, shot: Shot, keys: Keys, model: str | None = None) -> list[str] | None:
     """Ask the local vision model whether this shot's clip has things passing through each other. None for a
-    glide (nothing in the picture moves) or before the clip is made; kept until the clip changes."""
+    glide (nothing in the picture moves), or while the clip is missing or older than the shot's picture and
+    motion; kept until the clip or the model changes."""
     import base64
+    import tempfile
     clip, out = shot_path(story, shot), motion_path(story, shot)
     if shot.tier == "still" or not clip.exists():
         return None
-    prompt, k = motion_check_prompt(story, shot), motion_key(story, shot)
-    if keys.stale(out, k):
+    if not clip_fresh(story, shot, keys):
+        _say(f"{shot.id}'s clip is older than its picture or motion: animate it again before checking its motion")
+        return None
+    prompt, k = motion_check_prompt(story, shot), motion_key(story, shot, model)
+    faults = None if keys.stale(out, k) else _motion_verdict(out)
+    if faults is None:
         import spike_lane
         _say(f"motion check {shot.id} …")
-        frames = out.with_suffix("")
-        frames.mkdir(parents=True, exist_ok=True)
         secs = media_seconds(clip)
         pics = []
-        for i in range(MOTION_FRAMES):
-            f = frames / f"{i}.jpg"
-            ffmpeg("-ss", f"{secs * (i + 0.5) / MOTION_FRAMES:.3f}", "-i", clip, "-frames:v", 1, "-vf", "scale=640:-2", f)
-            pics.append(base64.b64encode(f.read_bytes()).decode())
+        with tempfile.TemporaryDirectory() as frames:       # fresh every time: never a frame of an older take
+            for i in range(MOTION_FRAMES):
+                f = Path(frames) / f"{i}.jpg"
+                ffmpeg("-ss", f"{secs * (i + 0.5) / MOTION_FRAMES:.3f}", "-i", clip, "-frames:v", 1, "-update", 1,
+                       "-vf", "scale=640:-2", f)
+                if not f.exists():
+                    raise StageError(f"could not take frame {i + 1} of {clip}")
+                pics.append(base64.b64encode(f.read_bytes()).decode())
         fd = spike_lane.acquire("writer", ["spike-animate", "check", "--motion", shot.id], wait=None)
         try:
-            reply = ollama_generate(prompt, model or os.environ.get("SPIKE_WRITER_MODEL", "gemma4:26b"), MOTION_SCHEMA, pics)
+            reply = ollama_generate(prompt, motion_model(model), MOTION_SCHEMA, pics)
         finally:
             os.close(fd)
         faults = [" ".join(str(m).split()) for m in reply.get("faults", []) if str(m).strip()]
         out.write_text(json.dumps({"faults": faults}, indent=1))
         keys.record(out, k)
-    return json.loads(out.read_text())["faults"]
+    return faults
 
 
 def _report_motion(shot: Shot, faults: list[str] | None) -> None:
@@ -1115,7 +1135,7 @@ def check_motions(story: Story, shots: list[Shot], keys: Keys) -> None:
     for shot in shots:
         try:
             _report_motion(shot, check_motion(story, shot, keys))
-        except StageError as e:
+        except (StageError, OSError, ValueError) as e:
             _say(f"motion check skipped for {shot.id}: {e}")
 
 
@@ -2470,6 +2490,8 @@ def ollama_generate(prompt: str, model: str, schema: dict | None = None, images:
             reply = json.loads(r.read())
     except OSError as e:
         raise StageError(f"could not reach Ollama at {host} ({e}); is `ollama serve` running?") from None
+    except ValueError:
+        raise StageError(f"Ollama at {host} sent back something that is not JSON") from None
     try:
         return json.loads(reply["response"])
     except (KeyError, ValueError):

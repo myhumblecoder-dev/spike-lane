@@ -571,10 +571,7 @@ def _motion_faults(folder: Path, story, shot) -> list[str] | None:
     out = sa.motion_path(story, shot)
     if sa.Keys(folder).stale(out, sa.motion_key(story, shot)):
         return None
-    try:
-        return json.loads(out.read_text())["faults"]
-    except (OSError, ValueError, KeyError):
-        return None
+    return sa._motion_verdict(out)
 
 
 def _heard(wav: Path) -> str | None:
@@ -825,7 +822,9 @@ class Jobs:
     def _dir(folder: Path) -> Path:
         return Path(folder) / ".spike-animate"
 
-    def start(self, folder: Path, argv: list[str]) -> dict:
+    def start(self, folder: Path, argv: list[str], step: str | None = None) -> dict:
+        """Run spike-animate ARGV for a film; `step` is the studio's name for it (the command's, if not given)."""
+        step = step or argv[0]
         with self._lock:
             j = self.status(folder)
             if j and j["running"]:
@@ -840,9 +839,9 @@ class Jobs:
             proc = subprocess.Popen(["/bin/sh", "-c", '"$@" > "$JOB_LOG" 2>&1; echo $? > "$JOB_RC"', "sh",
                                      _animate_bin(), *argv], env={**env, "JOB_LOG": str(log), "JOB_RC": str(rc)},
                                     start_new_session=True, stdin=subprocess.DEVNULL)
-            (d / "job.json").write_text(json.dumps({"step": argv[0], "argv": argv, "pid": proc.pid, "started": time.time()}))
+            (d / "job.json").write_text(json.dumps({"step": step, "argv": argv, "pid": proc.pid, "started": time.time()}))
             threading.Thread(target=proc.wait, daemon=True).start()   # reap it
-            return {"step": argv[0], "running": True}
+            return {"step": step, "running": True}
 
     def status(self, folder: Path) -> dict | None:
         d = self._dir(folder)
@@ -1051,7 +1050,7 @@ class Handler(BaseHTTPRequestHandler):
                     errors = new_take(folder, str(p.get("shot", "")))
                     if errors:
                         raise ValueError("; ".join(errors))
-                jobs.start(folder, argv)
+                jobs.start(folder, argv, step=p.get("step"))
             except ValueError as e:
                 return self._json(400, {"errors": [str(e)]})
             except (Busy, OSError) as e:

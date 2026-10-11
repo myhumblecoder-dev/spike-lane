@@ -229,7 +229,7 @@ const media = (url) => url ? `/media/${S.name}/${url}` : null;
 const clone = (x) => JSON.parse(JSON.stringify(x));
 const fmtSecs = (s) => s >= 60 ? `${Math.floor(s / 60)} min ${String(s % 60).padStart(2, "0")} s` : `${s} s`;
 const STEP_NAMES = { new: "Writing the story", board: "Drawing the pictures", retake: "Drawing retakes", video: "Animating the shots",
-  sound: "Adding sound effects", voices: "Recording voices", scene: "Putting the scene together", check: "Checking the picture", look: "Drawing the look", voice: "Designing the voice", music: "Scoring the music",
+  sound: "Adding sound effects", voices: "Recording voices", scene: "Putting the scene together", check: "Checking the picture", motioncheck: "Checking the motion", look: "Drawing the look", voice: "Designing the voice", music: "Scoring the music",
   film: "Mixing the film", status: "Status" };
 
 // ---- state ----------------------------------------------------------------------------------------
@@ -405,7 +405,7 @@ async function run(step, extra) {
   catch (e) { toast(e.message, true); }
 }
 const busy = () => S.film?.job?.running;
-const STEP_PART = { board: "picture", retake: "picture", check: "picture", video: "video", sound: "sound", voices: "voices", scene: "preview" };
+const STEP_PART = { board: "picture", retake: "picture", check: "picture", video: "video", motioncheck: "video", sound: "sound", voices: "voices", scene: "preview" };
 const locked = (step, extra) => step === "look" || step === "voice" ? !stepOf(`${step}:${extra?.name}`).unlocked
   : extra?.shot && STEP_PART[step] ? !stepOf(`scene:${extra.shot}:${STEP_PART[step]}`).unlocked
   : (step === "music" || step === "film") && !stepOf(step).unlocked;
