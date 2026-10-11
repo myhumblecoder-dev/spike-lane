@@ -82,6 +82,11 @@ elif me == "python" and args and args[0].endswith("screen.py"):
         a = f"if(between(X\\,{min(xs)}\\,{max(xs)})*between(Y\\,{min(ys)}\\,{max(ys)})\\,255\\,0)"
         ff("-f", "lavfi", "-i", f"color=c=white:s={w}x{h},format=rgba", "-vf", f"geq=r=255:g=255:b=255:a='{a}'",
            "-frames:v", "1", it["out"])
+elif me == "python" and args and args[0].endswith("kenburns.py"):
+    still, out, w, h, n = args[1], args[2], args[3], args[4], args[5]   # the picture (and its screen), held
+    src = ["-f", "lavfi", "-i", f"color=c=gray:s={w}x{h}:rate=24"]
+    over = ["-i", args[7], "-filter_complex", f"[1]scale={w}:{h}[o];[0][o]overlay"] if len(args) > 7 else []
+    ff(*src, *over, "-frames:v", n, "-pix_fmt", "yuv420p", out)
 elif me == "python" and args and args[0].endswith("score_rank.py"):
     takes = args[3:]
     Path(args[2]).write_text(json.dumps([{"take": t, "score": 1.0 - i / 10} for i, t in enumerate(takes)]))
@@ -1010,3 +1015,91 @@ def test_a_small_film_has_each_clip_upscaled_once_before_it_is_finished(env):
     (film / "story.toml").write_text(STORY.replace("intensity = 0.2", "intensity = 0.3", 1))   # nothing visual
     assert run(env, "film", "story.toml").returncode == 0
     assert not upscales(log)
+
+
+# --- motion levels ----------------------------------------------------------------------------
+
+def glides(log):
+    return [c for c in calls(log, "python") if c["args"][0].endswith("kenburns.py")]
+
+
+def frames(path):
+    out = subprocess.run([str(Path(FFMPEG).with_name("ffprobe")), "-v", "error", "-count_frames", "-select_streams", "v",
+                          "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", str(path)],
+                         capture_output=True, text=True, check=True).stdout
+    return int(out.strip())
+
+
+def test_a_still_shot_glides_over_its_picture_without_the_video_model(env):
+    film, _, log = env
+    set_shot(film, "02-pounce", 'tier = "still"')
+    assert run(env, "board", "story.toml").returncode == 0
+    r = run(env, "film", "story.toml")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert len(wan(log)) == 2 and not any("pounce" in flag(c["args"], "--output-path") for c in wan(log))
+    [g] = glides(log)
+    assert g["args"][1] == str(film / "board" / "02-pounce.png") and g["args"][3:7] == ["1280", "720", "121", "push"]
+    clip = film / "shots" / "02-pounce.mp4"
+    assert size(clip) == (1280, 720) and frames(clip) == 121
+    assert sorted(Path(c["args"][2]).name for c in upscales(log)) == ["01-walk.mp4", "03-stalk.mp4"]   # already big
+
+
+def test_a_new_camera_move_glides_again_and_animates_nothing(env):
+    film, _, log = env
+    set_shot(film, "02-pounce", 'tier = "still"')
+    assert run(env, "board", "story.toml").returncode == 0
+    assert run(env, "film", "story.toml").returncode == 0
+    log.unlink()
+    set_shot(film, "02-pounce", 'camera = "pull"')
+    assert run(env, "film", "story.toml").returncode == 0
+    assert not wan(log) and [c["args"][6] for c in glides(log)] == ["pull"]
+
+
+def test_a_still_shots_screen_is_laid_on_its_picture_so_it_moves_with_the_glide(env):
+    film, _, log = env
+    subprocess.run([FFMPEG, "-v", "error", "-f", "lavfi", "-i", "color=c=gray:s=640x400", "-frames:v", "1",
+                    str(film / "reference" / "page.png")], check=True)
+    corners = [[0.3, 0.2], [0.7, 0.2], [0.7, 0.6], [0.3, 0.6]]
+    set_shot(film, "02-pounce", f'tier = "still"\nscreen = {{ picture = "reference/page.png", corners = {corners} }}')
+    assert run(env, "board", "story.toml").returncode == 0
+    r = run(env, "film", "story.toml")
+    assert r.returncode == 0, r.stdout + r.stderr
+    [g] = glides(log)
+    assert g["args"][7] == str(film / "shots" / "screens" / "02-pounce.png")
+    spec = json.loads((film / "shots" / "screens" / "02-pounce.json").read_text())
+    w, h = size(film / "board" / "02-pounce.png")
+    assert spec["size"] == [w, h] and spec["items"][0]["corners"] == [pytest.approx([x * w, y * h]) for x, y in corners]
+    assert not (film / "film" / "screens").exists()             # not laid on again when the film is finished
+
+
+def gray_frame(path, index, w, h):
+    raw = subprocess.run([FFMPEG, "-v", "error", "-i", str(path), "-vf", f"select=eq(n\\,{index}),format=gray",
+                          "-frames:v", "1", "-f", "rawvideo", "-"], capture_output=True, check=True).stdout
+    return [raw[r * w:(r + 1) * w] for r in range(h)]
+
+
+def lit(rows):
+    """The span of bright columns along the middle row, and of bright rows down the middle column."""
+    mid = rows[len(rows) // 2]
+    xs = [x for x, v in enumerate(mid) if v > 128]
+    ys = [y for y, r in enumerate(rows) if r[len(mid) // 2] > 128]
+    return xs[0], xs[-1], ys[0], ys[-1]
+
+
+@pytest.mark.parametrize("camera", ["push", "pull", "left"])
+def test_the_glide_engine_moves_the_camera_smoothly_over_the_picture(tmp_path, camera):
+    still, out = tmp_path / "still.png", tmp_path / "out.mp4"
+    subprocess.run([FFMPEG, "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=1248x720", "-vf",
+                    "drawbox=x=524:y=260:w=200:h=200:c=white:t=fill", "-frames:v", "1", str(still)], check=True)
+    subprocess.run([str(Path.home() / "FastVideo" / ".venv" / "bin" / "python"), str(ROOT / "engines" / "kenburns.py"),
+                    str(still), str(out), "1280", "720", "49", camera], check=True)
+    assert size(out) == (1280, 720) and frames(out) == 49
+    a, b = lit(gray_frame(out, 0, 1280, 720)), lit(gray_frame(out, 48, 1280, 720))
+    wa, wb = a[1] - a[0], b[1] - b[0]
+    if camera == "push":
+        assert wb / wa == pytest.approx(1 + sa.GLIDE, abs=0.02)      # closer in by the end
+    elif camera == "pull":
+        assert wa / wb == pytest.approx(1 + sa.GLIDE, abs=0.02)
+    else:
+        assert wa == pytest.approx(wb, abs=2) and b[0] > a[0] + 20     # camera pans left: the scene slides right
+    assert abs((a[2] + a[3]) - (b[2] + b[3])) <= 4 if camera == "left" else True

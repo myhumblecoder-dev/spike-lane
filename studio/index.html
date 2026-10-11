@@ -773,9 +773,6 @@ function lookTab() {
 function lookCard(lk) {
   const st = stepOf(`look:${lk.name}`), ex = { name: lk.name };
   const seeds = () => [0, 1, 2, 3, 4].map(() => Math.floor(Math.random() * 9000) + 100);
-  const rank = Object.fromEntries((s.ranking || []).map((r, i) => [r.seed, { ...r, best: i === 0 && s.ranking.length > 1 }]));
-  const order = (r) => (rank[r.seed] ? -rank[r.seed].score : 1);
-  const mine = rank[s.seed];
   const upload = h("input", { type: "file", accept: "image/png,image/jpeg", hidden: true, onchange: async () => {
     const file = upload.files[0]; if (!file) return;
     const ext = (file.name.match(/\.(png|jpe?g)$/i) || [".png"])[0].toLowerCase();
@@ -972,6 +969,9 @@ function partGate(s, part, st) {
 function picturePart(s, st) {
   const seeds = () => [0, 1, 2].map(() => Math.floor(Math.random() * 9000) + 100);
   const ex = { shot: s.id };
+  const rank = Object.fromEntries((s.ranking || []).map((r, i) => [r.seed, { ...r, best: i === 0 && s.ranking.length > 1 }]));
+  const order = (r) => (rank[r.seed] ? -rank[r.seed].score : 1);
+  const mine = rank[s.seed];
   return [
     s.still ? h("div", { class: s.still_fresh === false ? "stale" : "" }, h("img", { class: "thumb", src: media(s.still), alt: s.still_text }))
       : h("div", { class: "empty-media" }, "Not drawn yet"),
@@ -1098,25 +1098,35 @@ function continuityNote(s) {
 
 function motionPart(s, st) {
   const doc = S.film.doc.shot.find((x) => x.id === s.id) || {};
+  const tier = doc.tier || "full", camera = doc.camera || "push";
   const setAnchor = (a) => saveShot(s.id, (x) => { if (a === 0) x.anchor = 0; else delete x.anchor; }, a === 0 ? "Action: more movement" : "Calm: stays close to the picture").catch((e) => toast(e.message, true));
+  const TIER_MSG = { still: "Glide: the camera moves slowly over the picture; nothing in it moves", subtle: "Subtle: small movement only", full: "Full motion" };
+  const setTier = (v) => saveShot(s.id, (x) => { if (v === "full") delete x.tier; else x.tier = v; if (v !== "still") delete x.camera; }, `${TIER_MSG[v]}; make it again to see it`).catch((e) => toast(e.message, true));
+  const setCamera = (v) => saveShot(s.id, (x) => { if (v === "push") delete x.camera; else x.camera = v; }, "Camera move saved; make it again to see it").catch((e) => toast(e.message, true));
+  const seg = (label, opts, cur, set) => h("div", { class: "seg", role: "group", "aria-label": label },
+    opts.map(([v, text]) => h("button", { "aria-pressed": cur === v, onclick: () => set(v) }, text)));
   const fresh = s.clip && st.done;
+  const glide = tier === "still";
   return [
     s.clip ? h("div", { class: st.done ? "" : "stale" }, h("video", { src: media(s.clip), poster: s.still ? media(s.still) : null, controls: true, playsinline: true, muted: true, loop: true, preload: "metadata" }))
       : h("div", { class: "empty-media" }, "Not animated yet"),
     s.seconds && S.film.doc.pace === "voice" ? h("p", { class: "small dim", style: "margin:0" }, `${s.seconds.toFixed(1)} s: as long as its lines and a breath`) : null,
+    h("div", { class: "row" }, h("span", { class: "small dim" }, "Movement"),
+      seg("Movement", [["still", "Glide"], ["subtle", "Subtle"], ["full", "Full"]], tier, setTier),
+      glide ? seg("Camera", [["push", "In"], ["pull", "Out"], ["left", "Pan left"], ["right", "Pan right"]], camera, setCamera)
+        : tier === "full" ? seg("Full motion", [[1, "Calm"], [0, "Action"]], doc.anchor === 0 ? 0 : 1, setAnchor) : null),
     h("div", { class: "row" },
-      fresh ? runBtn("Animate again (new take)", "video", { shot: s.id, new_take: true }, false) : runBtn("Animate", "video", { shot: s.id }, true),
-      h("span", { class: "small faint" }, "About 1.5 minutes; every take is kept."), h("span", { class: "spacer" }),
-      h("span", { class: "small dim" }, "Movement"), h("div", { class: "seg", role: "group", "aria-label": "Movement" },
-        h("button", { "aria-pressed": (doc.anchor ?? 1) !== 0, onclick: () => setAnchor(1) }, "Calm"),
-        h("button", { "aria-pressed": doc.anchor === 0, onclick: () => setAnchor(0) }, "Action"))),
-    s.takes.length > 1 ? h("div", {}, h("h3", { style: "margin:4px 0 6px" }, `Takes (${s.takes.length})`), h("div", { class: "retakes" }, s.takes.slice().reverse().map((tk) =>
+      glide ? runBtn(fresh ? "Make the glide again" : "Make the glide", "video", { shot: s.id }, !fresh)
+        : fresh ? runBtn("Animate again (new take)", "video", { shot: s.id, new_take: true }, false) : runBtn("Animate", "video", { shot: s.id }, true),
+      h("span", { class: "small faint" }, glide ? "A few seconds; the video model doesn't run." : "About 1.5 to 5 minutes; every take is kept.")),
+    !glide && s.takes.length > 1 ? h("div", {}, h("h3", { style: "margin:4px 0 6px" }, `Takes (${s.takes.length})`), h("div", { class: "retakes" }, s.takes.slice().reverse().map((tk) =>
       h("figure", {}, h("video", { src: media(tk.url), poster: s.still ? media(s.still) : null, controls: true, playsinline: true, muted: true, preload: "none" }),
         h("figcaption", {}, tk.seed, tk.seed === s.video_seed ? h("span", { class: "chip acc" }, "in use")
           : h("button", { class: "btn small ghost", disabled: busy(), onclick: () => useTake(s.id, tk.seed) }, "Use")))))) : null,
-    s.clip ? trimEditor(s, doc) : null,
-    inlineEdit("Motion: what moves in the 5 seconds", s.motion, (v) => saveShot(s.id, (x) => { x.motion = v; }, "Saved; animate again to see it")),
-    h("p", { class: "small faint" }, "Only describe what's in the picture. Words like “reads” or “talks” make the model draw a book or move lips; add “mouth closed” when no one speaks."),
+    s.clip && !glide ? trimEditor(s, doc) : null,
+    glide ? h("p", { class: "small faint" }, "Glide suits places, products, screens and the closing shot: the picture stays as drawn, sharp, and any screen moves with it.")
+      : inlineEdit("Motion: what moves in the shot", s.motion, (v) => saveShot(s.id, (x) => { x.motion = v; }, "Saved; animate again to see it")),
+    glide ? null : h("p", { class: "small faint" }, "Only describe what's in the picture. Words like “reads” or “talks” make the model draw a book or move lips; add “mouth closed” when no one speaks."),
   ];
 }
 

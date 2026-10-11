@@ -31,6 +31,10 @@ TAIL = 0.5                      # voice pace: a breath after a shot's last line 
 SILENT_SECONDS = 3.0            # voice pace: a shot with nothing said
 PACES = ("fixed", "voice")
 VIDEO_DIMS = {"sd": (832, 448), "hd": (1280, 704)}   # the video model's size: hd is Wan 2.2 5B's own 720p
+TIERS = ("still", "subtle", "full")   # how a shot moves: a camera glide over its picture, small movement, or full motion
+CAMERAS = ("push", "pull", "left", "right")   # a still shot's glide: in, out, or across
+GLIDE = 0.08                    # a still shot's camera move (engines/kenburns.py has its own copy)
+SUBTLE_MOTION = "almost still, only small gentle movement, steady camera"
 UPSCALER = "realesr-general-x4v3.pth"                # sd clips are upscaled to the finished size with it
 STILL_SIZE = (1248, 720)        # storyboard stills (Z-Image)
 FIRST_FRAME_SIZE = (1248, 672)
@@ -83,6 +87,8 @@ class Shot:
     seconds: float | None = None     # voice pace: this shot's own length instead of its lines'
     caption: str | None = None       # on-screen words; None shows the narration, "" shows nothing
     screen: Screen | None = None
+    tier: str = "full"               # "still": glide over the picture, no video model; "subtle": small movement
+    camera: str = "push"             # a still shot's glide
 
     @property
     def video_seed(self) -> int:
@@ -290,6 +296,11 @@ def load_story(path: Path) -> Story:
             raise StoryError(f"shot {sid}: end must be between 1 and {shot_seconds():.2f} seconds")
         if s.get("fill", "slow") not in ("slow", "hold"):
             raise StoryError(f"shot {sid}: fill must be \"slow\" or \"hold\"")
+        tier, camera = s.get("tier", "full"), s.get("camera", "push")
+        if tier not in TIERS:
+            raise StoryError(f"shot {sid}: tier must be one of {', '.join(TIERS)}, not '{tier}'")
+        if camera not in CAMERAS:
+            raise StoryError(f"shot {sid}: camera must be one of {', '.join(CAMERAS)}, not '{camera}'")
         shots.append(Shot(id=sid, still=_need(s, "still", f"shot {sid}"), motion=_need(s, "motion", f"shot {sid}"),
                           seed=shot_seed, anchor=int(s.get("anchor", 1)), sfx=s.get("sfx", ""),
                           narration=s.get("narration", ""), intensity=float(s.get("intensity", 0.5)),
@@ -297,7 +308,8 @@ def load_story(path: Path) -> Story:
                           still_style=s.get("still_style", ""), dialogue=_lines(s, sid, characters, voices),
                           motion_seed=int(s["motion_seed"]) if "motion_seed" in s else None, end=end,
                           fill=s.get("fill", "slow"), angle=angle, pictures=pictures, seconds=secs,
-                          caption=str(s["caption"]).strip() if "caption" in s else None, screen=screen))
+                          caption=str(s["caption"]).strip() if "caption" in s else None, screen=screen,
+                          tier=tier, camera=camera))
     narrator = None
     if "narrator" in d:
         n = d["narrator"]
@@ -375,7 +387,8 @@ def still_prompt(story: Story, shot: Shot) -> str:
 
 def motion_prompt(story: Story, shot: Shot) -> str:
     light = f"{story.lighting}, " if story.lighting else ""
-    return f"{story.look}, {light}{expand(shot.motion, story.names)}"
+    calm = f"{SUBTLE_MOTION}, " if shot.tier == "subtle" else ""
+    return f"{story.look}, {light}{calm}{expand(shot.motion, story.names)}"
 
 
 # --- timing -----------------------------------------------------------------
@@ -1150,6 +1163,10 @@ def shot_key(story: Story, shot: Shot, seed: int | None = None) -> str | None:
     n = shot_frames(story, shot)
     if n is None:
         return None
+    if shot.tier == "still":
+        sc = shot.screen
+        return key_for("glide", file_digest(still), shot.camera, n, FINISH_SIZE,
+                       [file_digest(sc.picture), sc.corners, sc.top] if sc else None)
     parts = ["shot", file_digest(still), motion_prompt(story, shot), shot.anchor,
              shot.video_seed if seed is None else seed, shot.colormatch]
     if story.pace == "voice":
@@ -1217,6 +1234,9 @@ def animate_shot(story: Story, shot: Shot, keys: Keys) -> bool:
         trim_clip(story, shot, keys)
         return False
     n = shot_frames(story, shot) or SHOT_FRAMES
+    if shot.tier == "still":
+        glide_shot(story, shot, keys, k, n)
+        return False
     _say(f"shot {shot.id} ({n / FPS:.2f} s) …")
     model = _home("WAN5B_MODEL", "wan-models/FastMetal-5B-QAD")
     cmd = [_venv("FASTVIDEO_HOME", "FastVideo"), ENGINES / "wan22_i2v.py", "--mlx-checkpoint", model,
@@ -1258,6 +1278,40 @@ def animate_shot(story: Story, shot: Shot, keys: Keys) -> bool:
     keys.record(take, k)
     trim_clip(story, shot, keys)
     return True
+
+
+def screen_on_still(story: Story, shot: Shot) -> Path:
+    """A still shot's screen picture warped onto its picture, so the glide moves it with the scene."""
+    still, sc = still_path(story, shot), shot.screen
+    out = story.root / "shots" / "screens" / f"{shot.id}.png"
+    w, h = video_size(still)
+    spec = {"size": [w, h], "items": [{"picture": str(sc.picture), "out": str(out), "top": sc.top,
+                                       "corners": [[x * w, y * h] for x, y in sc.corners]}]}
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.with_suffix(".json").write_text(json.dumps(spec, indent=1))
+    r = subprocess.run([_venv("FASTVIDEO_HOME", "FastVideo"), str(ENGINES / "screen.py"), str(out.with_suffix(".json"))],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise StageError(f"laying the screen picture on {shot.id} failed: {r.stderr.strip()[-300:]}")
+    return out
+
+
+def glide_shot(story: Story, shot: Shot, keys: Keys, k: str, n: int) -> None:
+    """A still shot: a slow camera move over its picture at the finished size; the video model doesn't run."""
+    still, out = still_path(story, shot), full_path(story, shot)
+    _say(f"shot {shot.id} ({n / FPS:.2f} s, a {shot.camera} over the picture) …")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [_venv("FASTVIDEO_HOME", "FastVideo"), ENGINES / "kenburns.py", still, out, *FINISH_SIZE, n, shot.camera]
+    if shot.screen:
+        cmd.append(screen_on_still(story, shot))
+    r = subprocess.run([str(c) for c in cmd], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise StageError(f"the glide over {shot.id} failed: {r.stderr.strip()[-300:]}")
+    secs = media_seconds(out)
+    if abs(secs - n / FPS) > 0.06:
+        raise StageError(f"shot {shot.id} is {secs:.2f} s, expected {n / FPS:.2f} s")
+    keys.record(out, k)
+    trim_clip(story, shot, keys)
 
 
 def finish_clip(story: Story, shot: Shot, keys: Keys) -> Path:
@@ -1333,8 +1387,9 @@ def render_titles(story: Story, keys: Keys, plan: list[Title]) -> list[Path]:
 
 
 def render_screens(story: Story, keys: Keys) -> list[tuple[Path, float, float]]:
-    """Each shot's screen picture warped onto its corners at the finished size, with the shot's time span."""
-    shots = [(s, at) for s, at in zip(story.shots, shot_starts(story)) if s.screen]
+    """Each shot's screen picture warped onto its corners at the finished size, with the shot's time span.
+    A still shot's screen is already on its picture (it moves with the glide)."""
+    shots = [(s, at) for s, at in zip(story.shots, shot_starts(story)) if s.screen and s.tier != "still"]
     if not shots:
         return []
     sdir = story.root / "film" / "screens"
@@ -1924,11 +1979,14 @@ DRAFT_SCHEMA = {
         "music": {"type": "object", "required": ["caption", "structure", "key"],
                   "properties": {"caption": {"type": "string"}, "structure": {"type": "string"}, "key": {"type": "string"}}},
         "shots": {"type": "array", "items": {"type": "object",
-                  "required": ["id", "angle", "still", "motion", "sfx", "narration", "caption", "intensity", "action"],
+                  "required": ["id", "angle", "still", "motion", "sfx", "narration", "caption", "intensity", "action",
+                               "tier", "camera"],
                   "properties": {"id": {"type": "string"}, "angle": {"type": "string"}, "caption": {"type": "string"},
                                  "still": {"type": "string"}, "motion": {"type": "string"},
                                  "sfx": {"type": "string"}, "narration": {"type": "string"},
                                  "intensity": {"type": "number"}, "action": {"type": "boolean"},
+                                 "tier": {"type": "string", "enum": list(TIERS)},
+                                 "camera": {"type": "string", "enum": list(CAMERAS)},
                                  "dialogue": {"type": "array", "items": {"type": "object",
                                               "required": ["speaker", "line", "emotion"],
                                               "properties": {"speaker": {"type": "string"}, "line": {"type": "string"},
@@ -1959,6 +2017,7 @@ def draft_schema(parts: Parts = Parts()) -> dict:
 MAX_NARRATION_WORDS = 10   # ~3 s of narration: a voice-paced shot is its line plus a breath, at most 5 s
 MAX_DIALOGUE_WORDS = 12    # all the dialogue in one shot, for the same reason
 MAX_CAPTION_WORDS = 6      # on-screen words: read at a glance
+MAX_FULL_SHOTS = 2         # full motion is slow to make and busy to watch: keep it for the action
 
 WRITER_EXAMPLE = {
     "title": "Fox Hunt",
@@ -1988,23 +2047,24 @@ WRITER_EXAMPLE = {
               "key": "D minor"},
     "end_card": {"text": "", "sub": ""},
     "shots": [
-        {"id": "01-establish", "angle": "WIDE", "still": "FOX walking into the CLEARING",
-         "motion": "static camera, a slender red fox walks steadily through the snowy pine forest at dawn, mouth closed",
+        {"id": "01-establish", "angle": "WIDE", "still": "FOX standing at the edge of the CLEARING, looking out",
+         "motion": "static camera, a slender red fox stands still at the edge of the snowy pine forest at dawn, mouth closed",
+         "tier": "still", "camera": "push",
          "sfx": "soft paw footsteps crunching in snow, quiet winter wind", "narration":
          "Deep in the winter woods, the fox was hungry.", "caption": "The fox was hungry.", "intensity": 0.15, "action": False, "dialogue": []},
         {"id": "02-reveal", "angle": "LOG", "still": "RAB nibbling grass in the CLEARING, unaware",
          "motion": "static camera, a brown rabbit nibbles grass, chewing, ears twitching",
          "sfx": "rabbit nibbling, soft rustling, quiet birdsong", "narration": "Breakfast. And it had no idea.",
-         "caption": "Breakfast.", "intensity": 0.3, "action": False, "dialogue": []},
+         "caption": "Breakfast.", "intensity": 0.3, "action": False, "tier": "subtle", "camera": "push", "dialogue": []},
         {"id": "03-taunt", "angle": "LOG", "still": "FOX crouched behind the log in the CLEARING, grinning",
          "motion": "static camera, a red fox grins and talks quietly, eyes fixed ahead",
          "sfx": "soft wind, a twig creaking", "narration": "", "caption": "",
          "dialogue": [{"speaker": "FOX", "line": "Good morning, little breakfast.", "emotion": "sly, purring"}],
-         "intensity": 0.6, "action": False},
+         "intensity": 0.6, "action": False, "tier": "subtle", "camera": "push"},
         {"id": "03-pounce", "angle": "WIDE", "still": "FOX leaping through the air to pounce on RAB in the CLEARING, snow spraying",
          "motion": "a red fox leaps through the air and pounces on a brown rabbit, snow spraying, fast dynamic action",
          "sfx": "fast whoosh of a leap, paws thudding into snow, rabbit squeal", "narration": "", "caption": "",
-         "intensity": 1.0, "action": True, "dialogue": []},
+         "intensity": 1.0, "action": True, "tier": "full", "camera": "push", "dialogue": []},
     ],
 }
 
@@ -2090,6 +2150,11 @@ How the film is made, so write for it:
   not the framing again.
 - "motion" says what moves during the shot, in plain words without the UPPERCASE names; start calm shots
   with "static camera,". Set "action": true only for fast, violent or acrobatic shots.
+- "tier" is how much the shot moves. "still": nothing needs to move (a place, a product, a screen, a pose,
+  the closing shot); the camera glides slowly over the finished picture, and "camera" says how: "push" in,
+  "pull" out, or a pan "left" or "right". "subtle": people are there but barely move (look, smile, breathe,
+  sip, talk). "full": real action. Make most shots "still" or "subtle"; at most {MAX_FULL_SHOTS} shots "full".
+  Give every shot a "camera" ("push" when it isn't still).
   The motion moves only what the still shows: never bring in a prop, person or action the still doesn't
   contain (the video model draws whatever the words suggest, so "as she reads" grows a book; write "her eyes
   follow the laptop screen"). A character who doesn't speak in the shot keeps their mouth closed: add
@@ -2130,6 +2195,10 @@ def lint_draft(d: dict, shots: int, parts: Parts = Parts()) -> list[str]:
     got = d.get("shots", [])
     if len(got) != shots:
         problems.append(f"the story needs exactly {shots} shots, it has {len(got)}")
+    full = [s.get("id", "?") for s in got if s.get("tier") == "full"]
+    if len(full) > MAX_FULL_SHOTS:
+        problems.append(f"shots {', '.join(full)} are all \"full\" motion; keep it to the {MAX_FULL_SHOTS} with real "
+                        "action and make the others \"subtle\" or \"still\"")
     names = {c["name"]: c["description"] for c in d.get("characters", [])}
     angles = {a.get("name") for a in d.get("angles", [])}
     for pl in d.get("places", []):
@@ -2221,6 +2290,10 @@ def draft_to_toml(d: dict, idea: str, notes: str = "", style_image: str = "", st
         out += [f"still = {q(s['still'])}", f"motion = {q(s['motion'])}"]
         if s.get("action"):
             out.append("anchor = 0   # action shot: pin only the first frame, let it move")
+        if s.get("tier", "full") != "full":
+            out.append(f"tier = {q(s['tier'])}")
+        if s.get("tier") == "still":
+            out.append(f"camera = {q(s.get('camera', 'push'))}")
         if s.get("sfx"):
             out.append(f"sfx = {q(s['sfx'])}")
         if s.get("narration"):

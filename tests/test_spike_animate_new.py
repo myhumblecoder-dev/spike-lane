@@ -530,3 +530,35 @@ def test_the_ranking_counts_the_people_and_scores_by_a_rubric(tmp_path):
     (tmp_path / "story.toml").write_text(empty)
     story = sa.load_story(tmp_path / "story.toml")
     assert "no people" in sa.rank_prompt(story, story.shots[0])
+
+
+# --- motion levels --------------------------------------------------------------------------------
+
+def test_a_draft_keeps_how_each_shot_moves(tmp_path):
+    d = draft()
+    d["shots"][0].update(tier="still", camera="left")
+    d["shots"][1].update(tier="full", camera="push")
+    d["shots"][2].update(tier="subtle", camera="push")
+    p = tmp_path / "story.toml"
+    p.write_text(sa.draft_to_toml(d, idea="a keeper and a gull"))
+    story = sa.load_story(p)
+    assert [(s.tier, s.camera) for s in story.shots] == [("still", "left"), ("full", "push"), ("subtle", "push")]
+
+
+def test_the_writer_chooses_how_each_shot_moves():
+    p = sa.writer_prompt("an ad for a bakery", shots=6)
+    assert '"tier"' in p and '"camera"' in p and f"at most {sa.MAX_FULL_SHOTS}" in p
+    shot = sa.draft_schema()["properties"]["shots"]["items"]
+    assert {"tier", "camera"} <= set(shot["required"])
+    assert shot["properties"]["tier"]["enum"] == list(sa.TIERS)
+    assert shot["properties"]["camera"]["enum"] == list(sa.CAMERAS)
+    assert all(s["tier"] in sa.TIERS and s["camera"] in sa.CAMERAS for s in sa._example(sa.Parts())["shots"])
+
+
+def test_lint_keeps_full_motion_for_a_few_shots():
+    d = draft()
+    for s in d["shots"]:
+        s.update(tier="full", camera="push")
+    assert any("full" in x for x in sa.lint_draft(d, 3))
+    d["shots"][0]["tier"] = "still"
+    assert not any("full" in x for x in sa.lint_draft(d, 3))

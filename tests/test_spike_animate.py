@@ -459,3 +459,40 @@ def test_films_render_video_small_unless_they_ask_for_hd(story, tmp_path):
     assert hd.quality == "hd" and sa.video_dims(hd) == (1280, 704)
     with pytest.raises(sa.StoryError, match="quality"):
         sa.load_story(write_story(tmp_path, STORY.replace("seed = 1024\n", 'seed = 1024\nquality = "4k"\n', 1)))
+
+
+# --- motion levels: a glide over the picture, small movement, or the full motion -----------------
+
+def tiered(tmp_path, extra):
+    return sa.load_story(write_story(tmp_path, STORY.replace('id = "02-pounce"\n', 'id = "02-pounce"\n' + extra, 1)))
+
+
+def test_shots_move_fully_unless_they_ask_for_less(story, tmp_path):
+    assert {s.tier for s in story.shots} == {"full"}
+    still = tiered(tmp_path, 'tier = "still"\ncamera = "left"\n').shots[1]
+    assert still.tier == "still" and still.camera == "left"
+    assert tiered(tmp_path, 'tier = "still"\n').shots[1].camera == "push"     # a slow push in, by default
+    with pytest.raises(sa.StoryError, match="tier"):
+        tiered(tmp_path, 'tier = "wild"\n')
+    with pytest.raises(sa.StoryError, match="camera"):
+        tiered(tmp_path, 'tier = "still"\ncamera = "spin"\n')
+
+
+def test_a_subtle_shot_asks_the_video_model_for_small_movement(tmp_path):
+    subtle = tiered(tmp_path, 'tier = "subtle"\n')
+    assert sa.motion_prompt(subtle, subtle.shots[1]) == \
+        f"2D cartoon animation, storybook colors, {sa.SUBTLE_MOTION}, the fox leaps and pounces"
+    assert "small" in sa.SUBTLE_MOTION and "steady camera" in sa.SUBTLE_MOTION
+
+
+def test_a_still_shots_glide_has_its_own_key_and_ignores_the_motion_words(tmp_path):
+    a = tiered(tmp_path, 'tier = "still"\n')
+    sa.still_path(a, a.shots[1]).parent.mkdir(parents=True, exist_ok=True)
+    sa.still_path(a, a.shots[1]).write_bytes(b"png")
+    k = sa.shot_key(a, a.shots[1])
+    assert k and k != sa.shot_key(tiered(tmp_path, ''), tiered(tmp_path, '').shots[1])
+    reworded = tiered(tmp_path, 'tier = "still"\n')
+    reworded.shots[1].motion = "something else entirely"
+    assert sa.shot_key(reworded, reworded.shots[1]) == k
+    assert sa.shot_key(tiered(tmp_path, 'tier = "still"\ncamera = "pull"\n'),
+                       tiered(tmp_path, 'tier = "still"\ncamera = "pull"\n').shots[1]) != k

@@ -92,6 +92,13 @@ anime key art (`--look flat` for the old flat cartoon) and dresses every place w
 scene's picture by a rubric (the right people, each once; the bible; clean anatomy and lettering), best
 first; `rank STORY SHOT` scores the versions already drawn.
 
+Motion levels: each shot's `tier` says how much it moves. `"full"` (the default) is the video model as
+above. `"subtle"` asks it for small movement only (a look, a smile, a sip). `"still"` skips the video
+model: `engines/kenburns.py` (OpenCV, sub-pixel, under a second a shot) glides the camera slowly over the
+finished picture at 1280×720, `camera = "push"` (in, the default), `"pull"`, `"left"` or `"right"`; a
+still shot's screen is laid on its picture first, so it moves with the glide. The writer makes most shots
+still or subtle and at most 2 full. In the studio: the scene's Motion step, **Movement**.
+
 Rules it enforces: with `pace = "voice"` (what `new` writes) each shot lasts its own lines plus a 0.5 s
 breath, 49–121 frames at 24 fps (about 2–5 s; a silent shot 3 s, or `seconds = N` on the shot), so a
 scene's lines are recorded before its motion and the cuts land on the voice-over; films without a pace
