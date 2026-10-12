@@ -1035,6 +1035,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"errors": errors}) if errors else self._json(200, {"added": sid, "film": self._state(folder)})
             errors = remove_scene(folder, rest[2] if len(rest) > 2 else "")
             return self._json(400, {"errors": errors}) if errors else self._json(200, self._state(folder))
+        if method == "POST" and action == "findscreen":
+            sid = json.loads(self._body() or b"{}").get("shot", "")
+            still = folder / "board" / f"{sid}.png"
+            if not sid or "/" in sid or not still.is_file():
+                return self._json(400, {"errors": ["draw this scene's picture first"]})
+            try:
+                corners = sa.find_screen(still)
+            except sa.StageError as e:
+                return self._json(500, {"errors": [str(e)]})
+            if corners is None:
+                return self._json(400, {"errors": ["no bright blank screen in this picture; tap its corners instead"]})
+            return self._json(200, {"corners": corners})
         if method == "POST" and action == "run":
             p = json.loads(self._body() or b"{}")
             try:

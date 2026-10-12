@@ -605,7 +605,7 @@ def test_the_motion_check_looks_across_a_clip_for_things_passing_through_each_ot
                        text=True, env=e, cwd=film)
     assert r.returncode == 0, r.stderr
     [req] = FakeOllama.requests
-    assert len(req["images"]) == sa.MOTION_FRAMES and FakeOllama.holders == ["writer"]   # frames across the clip, in order
+    assert len(req["images"]) == 1 + sa.MOTION_FRAMES and FakeOllama.holders == ["writer"]   # the picture, then frames in order
     assert "she sips her coffee" in req["prompt"] and "through" in req["prompt"] and "disappear" in req["prompt"]
     assert json.loads((film / "shots" / "01-sit.motion.json").read_text()) == {"faults": ["her right arm disappears as she lowers it"]}
     assert "her right arm disappears" in r.stdout
@@ -662,7 +662,7 @@ def test_the_motion_check_keeps_no_frames_for_a_later_take_to_reuse(ollama, tmp_
     film = checked_film(tmp_path)
     FakeOllama.replies = [{"faults": []}]
     assert motion_check(ollama, film).returncode == 0
-    assert len(FakeOllama.requests[0]["images"]) == sa.MOTION_FRAMES
+    assert len(FakeOllama.requests[0]["images"]) == 1 + sa.MOTION_FRAMES          # the picture and every frame, made fresh
     assert not (film / "shots" / "01-sit.motion").exists()
 
 
@@ -819,3 +819,16 @@ def test_lint_keeps_birds_out_of_the_sound():
     bad = [x for x in sa.lint_draft(d, 3) if "bird" in x]
     assert len(bad) == 2 and "01-light" in bad[0] and "03-" in bad[1]
     assert "bird" not in json.dumps(sa.WRITER_EXAMPLE).lower()     # the worked example never teaches birds
+
+
+def test_the_motion_check_compares_the_clip_with_the_picture_it_was_animated_from(ollama, tmp_path):
+    import base64
+    film = checked_film(tmp_path)
+    FakeOllama.replies = [{"faults": ["the dark laptop lid turns silver with a logo"]}]
+    r = motion_check(ollama, film)
+    assert r.returncode == 0, r.stderr
+    [req] = FakeOllama.requests
+    assert base64.b64decode(req["images"][0]) == (film / "board" / "01-sit.png").read_bytes()   # the scene as drawn, first
+    assert "first picture is the scene as drawn" in req["prompt"]
+    assert "colour" in req["prompt"] and "logo" in req["prompt"]          # things that change from the picture
+    assert "turns silver" in r.stdout

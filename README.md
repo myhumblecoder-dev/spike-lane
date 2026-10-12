@@ -81,7 +81,8 @@ A shot can also show a real picture on a screen in it: `screen = { picture = "re
 corners = [[x, y] ×4] }` (top-left, top-right, bottom-right, bottom-left, 0–1 on the shot's still; `top`
 skips part of the picture first). `engines/screen.py` (OpenCV) crops the picture to the screen's shape from
 its top, like a browser, and warps it onto the corners at the finished size, so its words stay sharp. In the
-studio: the scene's Picture step, **Real screen**, then tap the 4 corners.
+studio: the scene's Picture step, **Real screen**, then **Find the screen** (it finds the drawn blank screen,
+`engines/findscreen.py`) or tap the 4 corners, and check the outline in the close-up before saving.
 
 Quality: `quality = "hd"` (what `new` writes) animates at Wan 2.2 5B's own 1280×704 (about 2–5 min a clip,
 peak ~11.5 GB for a full 5 s): far more detail than 832×448, where faces and tattoos wash out. Films
@@ -99,8 +100,9 @@ finished picture at 1280×720, `camera = "push"` (in, the default), `"pull"`, `"
 still shot's screen is laid on its picture first, so it moves with the glide. The writer makes most shots
 still or subtle and at most 2 full. In the studio: the scene's Motion step, **Movement**.
 
-Clipping: after every animation the local vision model looks at 6 frames across the clip for things passing
-through each other, limbs that vanish or double, and objects that change shape (`check --motion`; kept per
+Clipping: after every animation the local vision model looks at the scene's picture and 6 frames across the
+clip for things passing through each other, limbs that vanish or double, objects that change shape, and
+objects that change colour or gain a logo the picture didn't have, like a dark laptop lid flashing silver (`check --motion`; kept per
 clip in `shots/ID.motion.json`, shown in the studio's Motion step, advice only). The ranking rubric marks
 down pictures that make no physical sense (someone sitting on nothing, legs through a table), and the
 writer frames anyone seated at a table from the waist up, which is where the image model tangled legs with
@@ -147,7 +149,7 @@ and each step must be approved before the next one unlocks:
 1. **Story:** edit it as a form or as raw TOML. A new film can leave out the narrator, dialogue or music. The
    **film bible** is shared by every shot: `lighting`, `[places]` (a NAME in a still is replaced by its description,
    like characters) and `[angles.X] frame/seed` (camera setups shots pick with `angle = "X"`). A shot at another
-   time of day sets its own `lighting`. The writer gives every cut a new angle, every person a clear gesture, and
+   time of day sets its own `lighting` (in the studio, the scene's **Lighting** field). The writer gives every cut a new angle, every person a clear gesture, and
    every screen a blank white page for a real one (`screen = {...}`) to be laid onto.
 2. **Look:** a character sheet for every character and a picture of every place, each approved. A character can
    be drawn from an uploaded picture (`reference/NAME.jpg`). Scene pictures are then drawn by FLUX.2 klein 4B from

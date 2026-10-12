@@ -1060,13 +1060,16 @@ MOTION_SCHEMA = {"type": "object", "required": ["faults"],
 
 
 def motion_check_prompt(story: Story, shot: Shot) -> str:
-    return f"""These {MOTION_FRAMES} pictures are frames from one shot of an animated film, in order from start to
-end. The shot shows: {expand(shot.still, story.names)}; what moves: {expand(shot.motion, story.names)}.
+    return f"""The first picture is the scene as drawn. The next {MOTION_FRAMES} pictures are frames from its shot in an
+animated film, in order from start to end. The shot shows: {expand(shot.still, story.names)}; what moves:
+{expand(shot.motion, story.names)}.
 Look for mistakes the animation made, the kind a viewer notices:
 - a body part passing through furniture, a person or an object (legs through a table, a hand through a laptop);
 - someone sitting on nothing, or an object floating or sinking into another;
 - a limb, a hand or an object that disappears, appears from nowhere or doubles;
-- an object or a face that changes shape or turns into something else (a mug becoming a paper cup).
+- an object or a face that changes shape or turns into something else (a mug becoming a paper cup);
+- an object whose colour or surface changes from the drawn scene, or that gains a logo, picture or glow it
+  didn't have (a dark laptop lid turning silver with a logo).
 List each mistake as one short sentence saying what happens and when ("her right arm disappears as she
 lowers it"). Ignore the drawing style, the camera moving, and small wobbles. If there are none, return an
 empty list.
@@ -1112,7 +1115,7 @@ def check_motion(story: Story, shot: Shot, keys: Keys, model: str | None = None)
         import spike_lane
         _say(f"motion check {shot.id} …")
         secs = media_seconds(clip)
-        pics = []
+        pics = [base64.b64encode(still_path(story, shot).read_bytes()).decode()]   # what the frames should stay true to
         with tempfile.TemporaryDirectory() as frames:       # fresh every time: never a frame of an older take
             for i in range(MOTION_FRAMES):
                 f = Path(frames) / f"{i}.jpg"
@@ -1395,6 +1398,15 @@ def animate_shot(story: Story, shot: Shot, keys: Keys) -> bool:
     keys.record(take, k)
     trim_clip(story, shot, keys)
     return True
+
+
+def find_screen(picture: Path) -> list[list[float]] | None:
+    """Where the blank screen drawn in `picture` is: its 4 corners as 0-1 of the picture, or None."""
+    r = subprocess.run([_venv("FASTVIDEO_HOME", "FastVideo"), str(ENGINES / "findscreen.py"), str(picture)],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise StageError(f"looking for the screen in {picture.name} failed: {r.stderr.strip()[-300:]}")
+    return json.loads(r.stdout)
 
 
 def screen_on_still(story: Story, shot: Shot) -> Path:

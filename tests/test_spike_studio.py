@@ -1109,3 +1109,79 @@ def test_a_job_is_named_by_its_studio_step(tmp_path, fake_bin):
     assert wait_done(jobs, folder)["step"] == "motioncheck"
     page = (Path(st.__file__).parent / "studio" / "index.html").read_text()
     assert "motioncheck:" in page.split("const STEP_NAMES")[1].split("};")[0]
+
+
+# --- the page itself, run in Node against a stand-in document ----------------------------------
+
+NODE = __import__("shutil").which("node")
+
+
+def on_page(js: str):
+    """Run `js` with the studio page loaded (its functions in scope) and return what it prints as JSON."""
+    harness = Path(__file__).with_name("studio_page.cjs")
+    prog = (f"const {{ load, fieldOf }} = require({json.dumps(str(harness))}); const page = load();"
+            f"page.fieldOf = fieldOf; const vm = require('vm');"
+            f"Promise.resolve(vm.runInContext({json.dumps('(async () => {' + js + '})()')}, page))"
+            f".then((v) => console.log(JSON.stringify(v)));")
+    r = subprocess.run([NODE, "-e", prog], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    return json.loads(r.stdout.strip().splitlines()[-1])
+
+
+@pytest.mark.skipif(not NODE, reason="needs node")
+def test_a_scene_card_shows_and_edits_its_own_lighting():
+    got = on_page("""
+      __S.film = { shots: [{ id: "05-dawn" }], references: [] };
+      const d = { lighting: "late night, purple neon", angles: {}, shot: [{ id: "05-dawn", still: "x", motion: "y", lighting: "dawn, golden light" }] };
+      const s = d.shot[0], f = fieldOf(shotCard(d, s, 0, () => [], () => {}), "Lighting");
+      const shown = { value: f.value, placeholder: f.placeholder };
+      f.value = "dusk, orange light"; f.dispatch("input"); const typed = s.lighting;
+      f.value = ""; f.dispatch("input");
+      return { ...shown, typed, cleared: "lighting" in s };
+    """)
+    assert got["value"] == "dawn, golden light"
+    assert "late night, purple neon" in got["placeholder"]       # empty means the film's own light
+    assert got["typed"] == "dusk, orange light" and got["cleared"] is False
+
+
+FASTVIDEO_PY = Path.home() / "FastVideo" / ".venv" / "bin" / "python"
+
+
+@pytest.mark.skipif(not FASTVIDEO_PY.exists(), reason="needs FastVideo's venv (OpenCV)")
+def test_the_studio_finds_a_scenes_drawn_screen(server):
+    srv, films = server
+    draw = ("import sys, cv2, numpy as np; img = np.full((720, 1248, 3), 30, np.uint8);"
+            "cv2.fillConvexPoly(img, np.int32([[300, 200], [900, 220], [880, 560], [320, 540]]), (252, 252, 252));"
+            "cv2.imwrite(sys.argv[1], img)")
+    (films / "bolt" / "board").mkdir(exist_ok=True)
+    subprocess.run([str(FASTVIDEO_PY), "-c", draw, str(films / "bolt" / "board" / "02-claim.png")], check=True)
+    status, _, body = call(srv, "POST", "/api/films/bolt/findscreen", {"shot": "02-claim"})
+    assert status == 200, body
+    got = json.loads(body)["corners"]
+    for (x, y), (wx, wy) in zip(got, [[300, 200], [900, 220], [880, 560], [320, 540]]):
+        assert abs(x - wx / 1248) < 0.005 and abs(y - wy / 720) < 0.005
+    status, _, body = call(srv, "POST", "/api/films/bolt/findscreen", {"shot": "01-heap"})   # never drawn
+    assert status == 400 and "picture" in json.loads(body)["errors"][0]
+
+
+@pytest.mark.skipif(not NODE, reason="needs node")
+def test_the_screen_editor_finds_the_screen_and_shows_it_up_close():
+    got = on_page("""
+      __S.name = "night"; __S.film = { doc: { shot: [{ id: "02-page" }] }, references: ["reference/gigs.png"], shots: [] };
+      const asked = [];
+      globalThis.fetch = async (url, o) => { asked.push([url, o.method]);
+        return { ok: true, json: async () => ({ corners: [[0.6, 0.42], [0.87, 0.46], [0.82, 0.81], [0.55, 0.7]] }) }; };
+      const el = screenEditor({ id: "02-page", still: "/media/x/board/02-page.png" });
+      const btn = (t) => el.all().find((n) => n.tagName === "BUTTON" && n.textContent === t);
+      const zoom = el.all().find((n) => n.className === "zoom");
+      const before = { saveable: !btn("Save screen").getAttribute("disabled") && !btn("Save screen").disabled, zoomHidden: zoom.hidden };
+      const pick = el.all().find((n) => n.tagName === "SELECT"); pick.value = "reference/gigs.png"; pick.dispatch("change");
+      btn("Find the screen").dispatch("click");
+      await new Promise((r) => setTimeout(r, 0));
+      const polys = zoom.all().filter((n) => n.tagName === "POLYGON").map((n) => n.getAttribute("points"));
+      return { before, asked, polys, zoomHidden: zoom.hidden, saveable: !btn("Save screen").disabled };
+    """)
+    assert got["before"]["zoomHidden"] is True and got["before"]["saveable"] is False
+    assert got["asked"] == [["/api/films/night/findscreen", "POST"]]
+    assert got["polys"] == ["0.6,0.42 0.87,0.46 0.82,0.81 0.55,0.7"]     # the found outline, up close
+    assert got["zoomHidden"] is False and got["saveable"] is True
