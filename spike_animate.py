@@ -90,6 +90,7 @@ class Shot:
     screen: Screen | None = None
     tier: str = "full"               # "still": glide over the picture, no video model; "subtle": small movement
     camera: str = "push"             # a still shot's glide
+    lighting: str = ""               # this shot's own light (another time of day); "" uses the film's
 
     @property
     def video_seed(self) -> int:
@@ -312,7 +313,7 @@ def load_story(path: Path) -> Story:
                           motion_seed=int(s["motion_seed"]) if "motion_seed" in s else None, end=end,
                           fill=s.get("fill", "slow"), angle=angle, pictures=pictures, seconds=secs,
                           caption=str(s["caption"]).strip() if "caption" in s else None, screen=screen,
-                          tier=tier, camera=camera))
+                          tier=tier, camera=camera, lighting=str(s.get("lighting", "")).strip()))
     narrator = None
     if "narrator" in d:
         n = d["narrator"]
@@ -385,14 +386,18 @@ def expand(text: str, characters: dict[str, str]) -> str:
     return pat.sub(sub, text)
 
 
+def shot_light(story: Story, shot: Shot) -> str:
+    return shot.lighting or story.lighting
+
+
 def still_prompt(story: Story, shot: Shot) -> str:
     frame = f"{expand(story.angles[shot.angle].frame, story.names)}, " if shot.angle else ""
-    light = f"{story.lighting}, " if story.lighting else ""
+    light = f"{shot_light(story, shot)}, " if shot_light(story, shot) else ""
     return f"{frame}{expand(shot.still, story.names)}, {light}{shot.still_style or story.still_style}"
 
 
 def motion_prompt(story: Story, shot: Shot) -> str:
-    light = f"{story.lighting}, " if story.lighting else ""
+    light = f"{shot_light(story, shot)}, " if shot_light(story, shot) else ""
     calm = f"{SUBTLE_MOTION}, " if shot.tier == "subtle" else ""
     return f"{story.look}, {light}{calm}{expand(shot.motion, story.names)}"
 
@@ -905,13 +910,17 @@ def render_prompt(story: Story, shot: Shot) -> tuple[str, list[Path]]:
     refs = scene_refs(story, shot) + [(note, f) for f, note in shot.pictures]
     prompt = still_prompt(story, shot)
     if not refs:
+        if any(look_path(story, n).is_file() for n in [*story.characters, *story.places]):
+            # the other scenes copy their style from the looks; lead with it here, or a prop alone comes out a photo
+            return f"an illustration in this style: {story.look}: {prompt}", []
         return prompt, []
 
     def say(i, n):
         if n in story.characters:
             return f"image {i} is {n}, keep their face, hair, clothes and markings exactly"
         if n in story.places:
-            return f"image {i} is the place {n}, keep its layout, colours and light"
+            return (f"image {i} is the place {n}, keep its colours, light and furnishings, seen from this shot's own "
+                    f"camera angle and distance")
         return f"image {i} is {n}, copy it as shown"
     said = "; ".join(say(i, n) for i, (n, _) in enumerate(refs, 1))
     return f"{prompt}. Reference pictures: {said}. Match the drawing style of the references.", [p for _, p in refs]
@@ -974,8 +983,8 @@ def continuity_facts(story: Story, shot: Shot) -> list[str]:
     """The bible facts this picture should show: its characters, its places, the light and the framing."""
     facts = [f"{n}: {story.characters[n]}" for n in _named(shot.still, story.characters)]
     facts += [f"Place {n}: {story.places[n]}" for n in _named(shot.still, story.places)]
-    if story.lighting:
-        facts.append(f"Lighting: {story.lighting}")
+    if shot_light(story, shot):
+        facts.append(f"Lighting: {shot_light(story, shot)}")
     if shot.angle:
         facts.append(f"Framing: {story.angles[shot.angle].frame}")
     return facts
@@ -2136,13 +2145,14 @@ DRAFT_SCHEMA = {
                   "properties": {"caption": {"type": "string"}, "structure": {"type": "string"}, "key": {"type": "string"}}},
         "shots": {"type": "array", "items": {"type": "object",
                   "required": ["id", "angle", "still", "motion", "sfx", "narration", "caption", "intensity", "action",
-                               "tier", "camera"],
+                               "tier", "camera", "lighting"],
                   "properties": {"id": {"type": "string"}, "angle": {"type": "string"}, "caption": {"type": "string"},
                                  "still": {"type": "string"}, "motion": {"type": "string"},
                                  "sfx": {"type": "string"}, "narration": {"type": "string"},
                                  "intensity": {"type": "number"}, "action": {"type": "boolean"},
                                  "tier": {"type": "string", "enum": list(TIERS)},
                                  "camera": {"type": "string", "enum": list(CAMERAS)},
+                                 "lighting": {"type": "string"},
                                  "dialogue": {"type": "array", "items": {"type": "object",
                                               "required": ["speaker", "line", "emotion"],
                                               "properties": {"speaker": {"type": "string"}, "line": {"type": "string"},
@@ -2174,7 +2184,7 @@ MAX_NARRATION_WORDS = 10   # ~3 s of narration: a voice-paced shot is its line p
 MAX_DIALOGUE_WORDS = 12    # all the dialogue in one shot, for the same reason
 MAX_CAPTION_WORDS = 6      # on-screen words: read at a glance
 DRAFT_LEAD = 0.2           # the narrator comes in right after a cut: an ad's voice-over runs on
-MAX_FULL_SHOTS = 2         # full motion is slow to make and busy to watch: keep it for the action
+MAX_FULL_SHOTS = 3         # full motion is busy to watch: keep it for the gestures and the action
 
 WRITER_EXAMPLE = {
     "title": "Fox Hunt",
@@ -2185,7 +2195,8 @@ WRITER_EXAMPLE = {
     "places": [{"name": "CLEARING", "description": "a small snowy clearing ringed by dark teal pine trees, a fallen "
                                                   "log half buried in snow on one side"}],
     "angles": [{"name": "WIDE", "frame": "wide shot of the clearing from its edge, pines framing both sides"},
-               {"name": "LOG", "frame": "medium shot from low behind the fallen log, looking across the clearing"}],
+               {"name": "LOG", "frame": "medium shot from low behind the fallen log, looking across the clearing"},
+               {"name": "CLOSE", "frame": "close-up at eye level, the snowy pines blurred behind"}],
     "characters": [{"name": "FOX", "description": "a slender red fox with bright orange fur, white chest and muzzle, "
                                                   "black legs, bushy tail with a white tip, amber eyes, a frayed "
                                                   "green scarf around its neck",
@@ -2206,22 +2217,22 @@ WRITER_EXAMPLE = {
     "shots": [
         {"id": "01-establish", "angle": "WIDE", "still": "FOX standing at the edge of the CLEARING, looking out",
          "motion": "static camera, a slender red fox stands still at the edge of the snowy pine forest at dawn, mouth closed",
-         "tier": "still", "camera": "push",
+         "tier": "still", "camera": "push", "lighting": "",
          "sfx": "soft paw footsteps crunching in snow, quiet winter wind", "narration":
          "Deep in the winter woods, the fox was hungry.", "caption": "The fox was hungry.", "intensity": 0.15, "action": False, "dialogue": []},
         {"id": "02-reveal", "angle": "LOG", "still": "RAB nibbling grass in the CLEARING, unaware",
          "motion": "static camera, a brown rabbit nibbles grass, chewing, ears twitching",
          "sfx": "rabbit nibbling, soft rustling, quiet birdsong", "narration": "Breakfast. And it had no idea.",
-         "caption": "Breakfast.", "intensity": 0.3, "action": False, "tier": "subtle", "camera": "push", "dialogue": []},
-        {"id": "03-taunt", "angle": "LOG", "still": "FOX crouched behind the log in the CLEARING, grinning",
-         "motion": "static camera, a red fox grins and talks quietly, eyes fixed ahead",
+         "caption": "Breakfast.", "intensity": 0.3, "action": False, "tier": "subtle", "camera": "push", "lighting": "", "dialogue": []},
+        {"id": "03-taunt", "angle": "CLOSE", "still": "FOX crouched behind the log in the CLEARING, grinning",
+         "motion": "static camera, a red fox grins, licks its lips and talks quietly, eyes fixed ahead",
          "sfx": "soft wind, a twig creaking", "narration": "", "caption": "",
          "dialogue": [{"speaker": "FOX", "line": "Good morning, little breakfast.", "emotion": "sly, purring"}],
-         "intensity": 0.6, "action": False, "tier": "subtle", "camera": "push"},
+         "intensity": 0.6, "action": False, "tier": "subtle", "camera": "push", "lighting": ""},
         {"id": "03-pounce", "angle": "WIDE", "still": "FOX leaping through the air to pounce on RAB in the CLEARING, snow spraying",
          "motion": "a red fox leaps through the air and pounces on a brown rabbit, snow spraying, fast dynamic action",
          "sfx": "fast whoosh of a leap, paws thudding into snow, rabbit squeal", "narration": "", "caption": "",
-         "intensity": 1.0, "action": True, "tier": "full", "camera": "push", "dialogue": []},
+         "intensity": 1.0, "action": True, "tier": "full", "camera": "push", "lighting": "", "dialogue": []},
     ],
 }
 
@@ -2296,21 +2307,30 @@ How the film is made, so write for it:
   In every still, write the UPPERCASE name, never re-describe the character. The description includes the
   exact clothes and accessories (colours, fabrics, fit), so the outfit stays the same in every shot.
 - "lighting" is one line used in every picture and every motion: time of day, where the light comes from,
-  its colour, the shadows. Keep it the same for the whole film.
+  its colour, the shadows. A shot at another time of day (the night turns to dawn) gives its own "lighting"
+  line the same way; every other shot leaves its "lighting" "" and keeps the film's.
 - "places" names each location once, one UPPERCASE word (TERRACE, CLEARING), with a full visual description
   and its set dressing: 4 to 6 concrete details that fill the frame (string lights, palm trees, thatched
   umbrellas, potted flowers), so every shot there looks rich and the same.
   Write the place's NAME in every still set there, never re-describe it.
-- "angles" are 2 to 4 camera setups, each one UPPERCASE word with a "frame" (shot size and where the camera
-  stands, e.g. "medium shot across the cafe table, the sea behind"). Every shot picks one "angle"; shots at
-  the same spot reuse the same angle, which keeps the cuts in one place. The still then says who and what,
-  not the framing again.
+- "angles" are 3 or 4 camera setups, each one UPPERCASE word with a "frame" (shot size and where the camera
+  stands, e.g. "medium shot across the cafe table, the sea behind"). Make them really different: a wide
+  shot, a medium shot, a close-up, a low or high angle, from different sides of the place. Every shot picks
+  one "angle", and never two shots in a row from the same angle: each cut shows a new view. The still then
+  says who and what, not the framing again.
 - "motion" says what moves during the shot, in plain words without the UPPERCASE names; start calm shots
   with "static camera,". Set "action": true only for fast, violent or acrobatic shots.
 - "tier" is how much the shot moves. "still": nothing needs to move (a place, a product, a screen, a pose,
   the closing shot); the camera glides slowly over the finished picture, and "camera" says how: "push" in,
   "pull" out, or a pan "left" or "right". "subtle": people are there but barely move (look, smile, breathe,
-  sip, talk). "full": real action. Make most shots "still" or "subtle"; at most {MAX_FULL_SHOTS} shots "full".
+  sip, talk). "full": real action. Use "full", with "static camera," for a shot whose gesture is the point;
+  at most {MAX_FULL_SHOTS} shots "full".
+  Give every shot with a person one clear gesture or use of a prop that a viewer sees at once: she throws
+  both fists in the air, sips her coffee, leans back and stretches, spins her chair, points at the screen.
+  Never just "looks" or "thinks"; vary the gesture from shot to shot.
+  A shot of a screen (a laptop, a phone, a monitor) showing a web page or an app is "still", and its still
+  shows "its bright blank white screen": the real page is laid onto the screen afterwards, so the words
+  stay readable. Never ask the image model to draw words on a screen.
   Give every shot a "camera" ("push" when it isn't still).
   The motion moves only what the still shows: never bring in a prop, person or action the still doesn't
   contain (the video model draws whatever the words suggest, so "as she reads" grows a book; write "her eyes
@@ -2366,6 +2386,10 @@ def lint_draft(d: dict, shots: int, parts: Parts = Parts()) -> list[str]:
             problems.append(f"place name {pl.get('name')} must be one UPPERCASE word, letters only (like TERRACE)")
         elif pl["name"] in names:
             problems.append(f"{pl['name']} is both a character and a place; rename the place")
+    for a, b in zip(got, got[1:]):
+        if a.get("angle") and a.get("angle") == b.get("angle"):
+            problems.append(f"shots {a.get('id', '?')} and {b.get('id', '?')} are in a row from the same angle "
+                            f"{a['angle']}; give one of them another angle so the cut shows a new view")
     for s in got:
         if s.get("angle") and s["angle"] not in angles:
             problems.append(f"shot {s.get('id', '?')} uses angle {s['angle']}, which isn't one of the angles "
@@ -2398,6 +2422,14 @@ def lint_draft(d: dict, shots: int, parts: Parts = Parts()) -> list[str]:
             problems.append(f"shot {sid} has {both} words of narration and dialogue together; keep it to "
                             f"{MAX_DIALOGUE_WORDS} or fewer so it fits a 5 second shot")
         still = s.get("still", "")
+        if re.search(r"\b(screen|monitor|display)s?\b[^.;]*?\b(show|shows|showing|display|displays|displaying)\b", still, re.I) \
+                and "blank white screen" not in still.lower():
+            problems.append(f"shot {sid} asks the image model to draw what a screen shows, which comes out as garbled "
+                            "words; describe \"its bright blank white screen\" instead (the real page goes on afterwards)")
+        if names and re.search(r"\b(shoulders?|hands?|arms?|fingers?)\b", still, re.I) \
+                and not any(re.search(rf"\b{re.escape(n)}\b", still) for n in names):
+            problems.append(f"shot {sid} shows someone's hands or shoulder without saying whose; write the character's "
+                            f"NAME ({', '.join(names)}) so it is drawn as them, not a stranger")
         still_words = re.findall(r"[a-z']+", still.lower())
         for name, desc in names.items():
             if re.search(rf"\b{re.escape(name)}\b", still):
@@ -2454,6 +2486,8 @@ def draft_to_toml(d: dict, idea: str, notes: str = "", style_image: str = "", st
             out.append(f"tier = {q(s['tier'])}")
         if s.get("tier") == "still":
             out.append(f"camera = {q(s.get('camera', 'push'))}")
+        if s.get("lighting", "").strip():
+            out.append(f"lighting = {q(s['lighting'].strip())}")
         if s.get("sfx"):
             out.append(f"sfx = {q(s['sfx'])}")
         if s.get("narration"):

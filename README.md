@@ -146,7 +146,9 @@ dialogue kept word for word), optional reference notes and an optional style pic
 and each step must be approved before the next one unlocks:
 1. **Story:** edit it as a form or as raw TOML. A new film can leave out the narrator, dialogue or music. The
    **film bible** is shared by every shot: `lighting`, `[places]` (a NAME in a still is replaced by its description,
-   like characters) and `[angles.X] frame/seed` (camera setups shots pick with `angle = "X"`).
+   like characters) and `[angles.X] frame/seed` (camera setups shots pick with `angle = "X"`). A shot at another
+   time of day sets its own `lighting`. The writer gives every cut a new angle, every person a clear gesture, and
+   every screen a blank white page for a real one (`screen = {...}`) to be laid onto.
 2. **Look:** a character sheet for every character and a picture of every place, each approved. A character can
    be drawn from an uploaded picture (`reference/NAME.jpg`). Scene pictures are then drawn by FLUX.2 klein 4B from
    the looks they show (`mflux-generate-flux2-edit`, ~10 GB, ~30-50 s), so faces, clothes and places carry over;

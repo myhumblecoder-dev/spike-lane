@@ -558,11 +558,13 @@ def test_the_writer_chooses_how_each_shot_moves():
 
 def test_lint_keeps_full_motion_for_a_few_shots():
     d = draft()
+    d["shots"].append(dict(d["shots"][2], id="04-dawn"))
     for s in d["shots"]:
         s.update(tier="full", camera="push")
-    assert any("full" in x for x in sa.lint_draft(d, 3))
+    assert len(d["shots"]) == sa.MAX_FULL_SHOTS + 1
+    assert any("full" in x for x in sa.lint_draft(d, 4))
     d["shots"][0]["tier"] = "still"
-    assert not any("full" in x for x in sa.lint_draft(d, 3))
+    assert not any("full" in x for x in sa.lint_draft(d, 4))
 
 
 def test_a_drafted_narrator_comes_in_quickly_after_each_cut(tmp_path):
@@ -690,3 +692,121 @@ def test_the_ranking_marks_down_things_passing_through_each_other(tmp_path):
 def test_the_writer_frames_people_at_tables_from_the_waist_up():
     p = sa.writer_prompt("an ad for a bakery", shots=6)
     assert "waist up" in p and "sitting on a chair" in p
+
+
+# --- variety: light, framing and gestures ------------------------------------------------------------
+
+NIGHT_STORY = '''title = "Night Shift"
+look = "cel-shaded anime"
+still_style = "cel-shaded anime still"
+lighting = "late night, candlelight from the left"
+
+[characters]
+LYRA = "a young woman with long black hair"
+
+[places]
+ROOM = "a dark bedroom with candles"
+
+[angles.WIDE]
+frame = "wide shot of the whole room"
+
+[[shot]]
+id = "01-code"
+angle = "WIDE"
+still = "LYRA typing in the ROOM"
+motion = "static camera, she types"
+
+[[shot]]
+id = "02-dawn"
+still = "LYRA stretching in the ROOM"
+motion = "static camera, she stretches"
+lighting = "dawn, pale blue light through the window"
+
+[[shot]]
+id = "03-laptop"
+still = "close-up of an open laptop on a desk, its bright blank white screen"
+motion = "static camera"
+'''
+
+
+def night(tmp_path):
+    (tmp_path / "story.toml").write_text(NIGHT_STORY)
+    return sa.load_story(tmp_path / "story.toml")
+
+
+def test_a_shot_can_have_its_own_light(tmp_path):
+    story = night(tmp_path)
+    code, dawn = story.shots[0], story.shots[1]
+    assert "late night" in sa.still_prompt(story, code) and "late night" in sa.motion_prompt(story, code)
+    for text in (sa.still_prompt(story, dawn), sa.motion_prompt(story, dawn), "\n".join(sa.continuity_facts(story, dawn))):
+        assert "dawn, pale blue light" in text and "late night" not in text
+
+
+def test_the_writer_gives_a_shot_its_own_light_when_the_time_of_day_changes(tmp_path):
+    shot = sa.draft_schema()["properties"]["shots"]["items"]
+    assert "lighting" in shot["required"] and shot["properties"]["lighting"]["type"] == "string"
+    p = sa.writer_prompt("an ad for a bakery", shots=6)
+    assert "time of day" in p and 'own "lighting"' in p
+    d = draft()
+    d["shots"][2]["lighting"] = "dawn, pale gold light"
+    d["shots"][0]["lighting"] = ""
+    f = tmp_path / "story.toml"
+    f.write_text(sa.draft_to_toml(d, idea="a keeper and a gull"))
+    story = sa.load_story(f)
+    assert [s.lighting for s in story.shots] == ["", "", "dawn, pale gold light"]
+
+
+def test_a_place_is_seen_from_each_shots_own_camera(tmp_path):
+    story = night(tmp_path)
+    look = sa.look_path(story, "ROOM")
+    look.parent.mkdir(parents=True, exist_ok=True)
+    look.write_bytes(b"\x89PNG a room")
+    prompt, refs = sa.render_prompt(story, story.shots[0])
+    assert refs == [look]
+    assert "layout" not in prompt and "this shot's own camera angle" in prompt
+
+
+def test_a_picture_with_no_one_and_nowhere_named_still_gets_the_films_style(tmp_path):
+    story = night(tmp_path)
+    assert sa.render_prompt(story, story.shots[2])[0] == sa.still_prompt(story, story.shots[2])   # no looks yet
+    look = sa.look_path(story, "LYRA")
+    look.parent.mkdir(parents=True, exist_ok=True)
+    look.write_bytes(b"\x89PNG LYRA")             # the other scenes copy her drawn look's style
+    prompt, refs = sa.render_prompt(story, story.shots[2])
+    assert not refs and prompt.startswith(f"an illustration in this style: {story.look}:")
+
+
+def test_lint_never_cuts_between_two_shots_from_the_same_angle():
+    d = draft(angles=[{"name": "WIDE", "frame": "wide"}, {"name": "CLOSE", "frame": "close-up"}])
+    for s, a in zip(d["shots"], ("WIDE", "WIDE", "CLOSE")):
+        s["angle"] = a
+    assert any("01-light and 02-storm" in x and "angle" in x for x in sa.lint_draft(d, 3))
+    d["shots"][1]["angle"] = "CLOSE"
+    d["shots"][2]["angle"] = "WIDE"
+    assert not any("same angle" in x for x in sa.lint_draft(d, 3))
+
+
+def test_the_writer_gives_people_a_gesture_and_screens_a_blank_page():
+    p = sa.writer_prompt("an ad for a bakery", shots=6)
+    assert "gesture" in p and "never two shots in a row from the same angle" in p
+    assert "blank white screen" in p
+    assert sa.MAX_FULL_SHOTS == 3
+
+
+def test_lint_keeps_words_off_drawn_screens():
+    d = draft()
+    d["shots"][0]["still"] = "a laptop screen showing the BotGuild.ai website with job posts"
+    d["shots"][1]["still"] = "over the shoulder of KEEPER, his monitor displays a 'Gig Won' notice"
+    d["shots"][2]["still"] = "KEEPER staring at a glowing monitor"
+    bad = [x for x in sa.lint_draft(d, 3) if "blank white screen" in x]
+    assert len(bad) == 2 and "01-light" in bad[0] and "02-storm" in bad[1]
+    d["shots"][0]["still"] = "close-up of a laptop, its bright blank white screen showing a web page"
+    assert not any("01-light" in x and "blank white screen" in x for x in sa.lint_draft(d, 3))
+
+
+def test_lint_names_whose_hands_and_shoulders_a_shot_shows():
+    d = draft()
+    d["shots"][1]["still"] = "over the shoulder at a laptop, hands on the keys"
+    assert any("02-storm" in x and "whose" in x for x in sa.lint_draft(d, 3))
+    d["shots"][1]["still"] = "over KEEPER's shoulder at a laptop, his hands on the keys"
+    assert not any("whose" in x for x in sa.lint_draft(d, 3))
