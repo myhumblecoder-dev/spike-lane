@@ -184,7 +184,7 @@ class Story:
     shots: list[Shot]
     narrator: Narrator | None = None
     music: Music | None = None
-    sfx_negative: str = "music, speech, human voice, talking, singing"
+    sfx_negative: str = "music, speech, human voice, talking, singing, birds, birdsong, chirping"
     sfx_db: float = -4.0
     voices: dict[str, CharVoice] = field(default_factory=dict)
     dialogue_mode: str = "clone"
@@ -2222,7 +2222,7 @@ WRITER_EXAMPLE = {
          "Deep in the winter woods, the fox was hungry.", "caption": "The fox was hungry.", "intensity": 0.15, "action": False, "dialogue": []},
         {"id": "02-reveal", "angle": "LOG", "still": "RAB nibbling grass in the CLEARING, unaware",
          "motion": "static camera, a brown rabbit nibbles grass, chewing, ears twitching",
-         "sfx": "rabbit nibbling, soft rustling, quiet birdsong", "narration": "Breakfast. And it had no idea.",
+         "sfx": "rabbit nibbling, soft rustling, a light breeze", "narration": "Breakfast. And it had no idea.",
          "caption": "Breakfast.", "intensity": 0.3, "action": False, "tier": "subtle", "camera": "push", "lighting": "", "dialogue": []},
         {"id": "03-taunt", "angle": "CLOSE", "still": "FOX crouched behind the log in the CLEARING, grinning",
          "motion": "static camera, a red fox grins, licks its lips and talks quietly, eyes fixed ahead",
@@ -2339,7 +2339,7 @@ How the film is made, so write for it:
 - Anyone sitting at a table is framed from the waist up, the table's edge in the foreground; never show
   their legs with the table's or chairs' legs, which the image model tangles. Say what they sit on and where
   the table is: "ELENA sitting on a chair behind the table, seen from the waist up".
-- "sfx" lists the sounds of that shot (no music, no speech).
+- "sfx" lists the sounds of that shot (no music, no speech, never birds or birdsong, even at dawn).
 - "caption" is the words burned in on screen over the shot: at most {MAX_CAPTION_WORDS} words, a shorter, punchier echo of
   its line ("Built the agent.", "Now make it earn."), or "" for none.
 - "end_card" is the closing words over the last shot, e.g. for an ad the tagline and the website:
@@ -2404,6 +2404,8 @@ def lint_draft(d: dict, shots: int, parts: Parts = Parts()) -> list[str]:
         words = len(s.get("narration", "").split())
         if words > MAX_NARRATION_WORDS:
             problems.append(f"shot {sid} narration has {words} words; keep it to {MAX_NARRATION_WORDS} or fewer so it fits a 5 second shot")
+        if re.search(r"\bbird", s.get("sfx", ""), re.I):
+            problems.append(f"shot {sid} sound has birds in it; films never have birdsong, so give it another sound")
         if not 0 <= s.get("intensity", 0) <= 1:
             problems.append(f"shot {sid} intensity {s.get('intensity')} must be between 0 and 1")
         said = s.get("dialogue", [])

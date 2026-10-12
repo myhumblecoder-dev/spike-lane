@@ -810,3 +810,12 @@ def test_lint_names_whose_hands_and_shoulders_a_shot_shows():
     assert any("02-storm" in x and "whose" in x for x in sa.lint_draft(d, 3))
     d["shots"][1]["still"] = "over KEEPER's shoulder at a laptop, his hands on the keys"
     assert not any("whose" in x for x in sa.lint_draft(d, 3))
+
+
+def test_lint_keeps_birds_out_of_the_sound():
+    d = draft()
+    d["shots"][0]["sfx"] = "morning birds chirping, a satisfied exhale"
+    d["shots"][2]["sfx"] = "quiet birdsong outside"
+    bad = [x for x in sa.lint_draft(d, 3) if "bird" in x]
+    assert len(bad) == 2 and "01-light" in bad[0] and "03-" in bad[1]
+    assert "bird" not in json.dumps(sa.WRITER_EXAMPLE).lower()     # the worked example never teaches birds

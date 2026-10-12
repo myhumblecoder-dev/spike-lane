@@ -516,3 +516,9 @@ def test_a_line_keeps_its_words_and_short_pauses_only():
     assert keep == [pytest.approx((0.45, 1.6)), pytest.approx((2.0, 3.3))]
     assert sa.speech_cuts([], 2.0, pause=0.2, before=0.05, after=0.2) == [(0.0, 2.0)]   # no silence: as it is
     assert sa.speech_cuts([(0.0, 2.0)], 2.0, pause=0.2, before=0.05, after=0.2) == [(0.0, 2.0)]   # all silence: as it is
+
+
+def test_sound_effects_keep_birds_out_unless_the_story_says_otherwise(story, tmp_path):
+    assert "birds" in story.sfx_negative and "speech" in story.sfx_negative
+    own = sa.load_story(write_story(tmp_path, STORY + '\n[sound]\nnegative = "speech"\n'))
+    assert own.sfx_negative == "speech"
