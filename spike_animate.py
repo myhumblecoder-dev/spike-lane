@@ -1707,8 +1707,8 @@ def narrate(story: Story, keys: Keys, checks: dict, only: set[str] | None = None
         _say("narrator voice …")
         tts(TTS_DESIGN, n.sample, card, ["--instruct", n.voice])
         keys.record(card, k)
-    lines, checks["narration"] = [], {}
-    for sid, at in offsets:
+    checks["narration"] = {}
+    for sid, _ in offsets:
         shot = next(s for s in story.shots if s.id == sid)
         out = vdir / f"{sid}.wav"
         k = narration_key(story, shot)
@@ -1718,8 +1718,8 @@ def narrate(story: Story, keys: Keys, checks: dict, only: set[str] | None = None
             trim_speech(out)
             keys.record(out, k)
         checks["narration"][sid] = round(words_match(shot.narration, heard(out, keys)), 2)
-        lines.append((out, at))
-    return lines
+    # placed only now: in a voice-paced film the recordings set the shot lengths, and so where each line starts
+    return [(vdir / f"{sid}.wav", at) for sid, at in narration_offsets(story) if only is None or sid in only]
 
 
 def voice_cards(story: Story, keys: Keys, only: set[str] | None = None) -> dict[str, Path]:

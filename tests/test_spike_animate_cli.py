@@ -1176,3 +1176,15 @@ def test_every_animated_scene_gets_a_motion_check_that_never_stops_the_film(env)
     assert r.returncode == 0, r.stdout + r.stderr
     checked = {l.split("motion check skipped for ")[1].split(":")[0] for l in r.stdout.splitlines() if "motion check skipped" in l}
     assert checked == {"01-walk", "03-stalk"}                                    # a glide has no motion to check
+
+
+def test_lines_recorded_by_the_film_step_start_where_their_voice_paced_shots_start(env, monkeypatch):
+    film, e, _ = env
+    voice_paced(env)
+    set_shot(film, "03-stalk", 'narration = "And then it crept closer."')
+    for k, v in e.items():
+        monkeypatch.setenv(k, v)
+    story = sa.load_story(film / "story.toml")
+    lines = sa.narrate(story, sa.Keys(film), {})     # nothing recorded yet, as when `film` runs straight from the board
+    assert [round(at, 3) for _, at in lines] == [round(at, 3) for _, at in sa.narration_offsets(story)]
+    assert lines[-1][1] < sa.film_length(story)       # 5 s guesses put the last line past the end of a short film
