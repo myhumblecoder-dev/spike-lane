@@ -766,9 +766,10 @@ def test_a_place_is_seen_from_each_shots_own_camera(tmp_path):
     assert "layout" not in prompt and "this shot's own camera angle" in prompt
 
 
-def test_a_close_up_is_not_drawn_from_its_places_picture(tmp_path):
-    """Given the place's picture, the image model redrew its whole wide view with the prop laid across it
-    (the-patient-angler 03-strike); a close-up keeps its people's pictures and names the place in words."""
+def test_a_close_up_takes_only_the_colours_of_its_places_picture(tmp_path):
+    """Told to see the place "from this shot's own camera", the image model still redrew its whole wide view with
+    the prop laid across it (the-patient-angler 03-strike); with no place picture, words alone drew the planks
+    brown. A close-up keeps the place's picture for its colours and materials only, and is told not to copy its view."""
     story = night(tmp_path)
     for n in ("ROOM", "LYRA"):
         look = sa.look_path(story, n)
@@ -780,15 +781,13 @@ def test_a_close_up_is_not_drawn_from_its_places_picture(tmp_path):
         (tmp_path / "story.toml").write_text(text.replace('angle = "WIDE"', f'angle = "{angle}"', 1))
         story = sa.load_story(tmp_path / "story.toml")
         prompt, refs = sa.render_prompt(story, story.shots[0])
-        assert refs == [sa.look_path(story, "LYRA")], angle
-        assert "a dark bedroom with candles" in prompt and "the place ROOM" not in prompt
-    shot = story.shots[2]                                                   # close-up said in the picture itself
-    shot.still = "close-up of an open laptop in the ROOM"
-    prompt, refs = sa.render_prompt(story, shot)
-    assert refs == [] and prompt.startswith("an illustration in this style:")
-    (tmp_path / "story.toml").write_text(NIGHT_STORY)                       # a wide shot still uses it
+        assert refs == [sa.look_path(story, "LYRA"), sa.look_path(story, "ROOM")], angle
+        assert "image 2 is the place ROOM, use it only for its colours and materials" in prompt
+        assert "do not copy its view" in prompt and "own camera angle" not in prompt
+    (tmp_path / "story.toml").write_text(NIGHT_STORY)                       # a wide shot is seen from its own camera
     story = sa.load_story(tmp_path / "story.toml")
-    assert sa.look_path(story, "ROOM") in sa.render_prompt(story, story.shots[0])[1]
+    prompt = sa.render_prompt(story, story.shots[0])[0]
+    assert "this shot's own camera angle" in prompt and "only for its colours" not in prompt
 
 
 def test_a_picture_with_no_one_and_nowhere_named_still_gets_the_films_style(tmp_path):

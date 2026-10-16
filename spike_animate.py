@@ -920,11 +920,10 @@ CLOSE_FRAMING = re.compile(r"\b(close[- ]?ups?|extreme close|macro|point[- ]of[-
 
 
 def scene_refs(story: Story, shot: Shot) -> list[tuple[str, Path]]:
-    """The looks a scene's picture is drawn from: its characters, then its places (those drawn; not for a close-up)."""
+    """The looks a scene's picture is drawn from: its characters, then its places (those drawn)."""
     text = shot.still + (" " + story.angles[shot.angle].frame if shot.angle else "")
     names = [n for n in story.characters if re.search(rf"\b{re.escape(n)}\b", text)]
-    if not CLOSE_FRAMING.search(text):   # given a place's picture, a close-up comes out as that wide view again
-        names += [n for n in story.places if re.search(rf"\b{re.escape(n)}\b", text)]
+    names += [n for n in story.places if re.search(rf"\b{re.escape(n)}\b", text)]
     return [(n, look_path(story, n)) for n in names if look_path(story, n).is_file()]
 
 
@@ -942,10 +941,14 @@ def render_prompt(story: Story, shot: Shot) -> tuple[str, list[Path]]:
     def say(i, n):
         if n in story.characters:
             return f"image {i} is {n}, keep their face, hair, clothes and markings exactly"
+        if n in story.places and close:   # told its own camera, a close-up still came out as the place's wide view
+            return (f"image {i} is the place {n}, use it only for its colours and materials; do not copy its view "
+                    f"or layout, this is a tight close-up")
         if n in story.places:
             return (f"image {i} is the place {n}, keep its colours, light and furnishings, seen from this shot's own "
                     f"camera angle and distance")
         return f"image {i} is {n}, copy it as shown"
+    close = bool(CLOSE_FRAMING.search(shot.still + (" " + story.angles[shot.angle].frame if shot.angle else "")))
     said = "; ".join(say(i, n) for i, (n, _) in enumerate(refs, 1))
     return f"{prompt}. Reference pictures: {said}. Match the drawing style of the references.", [p for _, p in refs]
 
