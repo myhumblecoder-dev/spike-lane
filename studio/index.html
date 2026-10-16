@@ -803,7 +803,8 @@ function lookCard(lk) {
         h("span", { class: "small dim", style: "flex:1;min-width:0" }, lk.reference ? "Drawn from this picture." : "Optional: a picture of them to draw from."),
         h("button", { class: "btn small", onclick: () => upload.click() }, lk.reference ? "Replace picture" : "Upload picture"), upload) : null,
       inlineEdit(lk.kind === "place" ? "The place, in words (every scene set here uses them)" : "How they look, in words (clothes included)", lk.text, save, 3),
-      h("div", { class: "row" }, runBtn(lk.url ? "Draw again" : "Draw", "look", ex, !st.done),
+      h("div", { class: "row" }, (lk.url && lk.fresh ? runBtn("Draw again", "look", { ...ex, new_look: true }, !st.done)
+        : runBtn(lk.url ? "Draw again" : "Draw", "look", ex, !st.done)),
         h("button", { class: "btn small", disabled: busy() || locked("look", ex), onclick: () => run("look", { name: lk.name, seeds: seeds() }) }, "3 more versions"),
         h("span", { class: "spacer" }), h("span", { class: "chip" }, `seed ${lk.seed}`)),
       lk.takes.length > 1 ? h("div", {}, h("h3", { style: "margin:4px 0 6px" }, `Versions (${lk.takes.length})`), h("div", { class: "retakes" }, lk.takes.slice().reverse().map((tk) =>
@@ -983,7 +984,8 @@ function picturePart(s, st) {
     scenePictures(s),
     s.still ? screenEditor(s) : null,
     inlineEdit("Picture description", s.still_text, (v) => saveShot(s.id, (x) => { x.still = v; }, "Saved; draw it again to see it"), 3),
-    h("div", { class: "row" }, runBtn(s.still && s.still_fresh !== false ? "Draw again" : "Draw", "board", ex, !st.done),
+    h("div", { class: "row" }, (s.still && s.still_fresh !== false   // up to date: the same seed would draw the same picture, so ask for a new one
+      ? runBtn("Draw again", "board", { ...ex, new_picture: true }, !st.done) : runBtn("Draw", "board", ex, !st.done)),
       h("button", { class: "btn small", disabled: busy() || !!S.film.errors.length || locked("retake", ex), onclick: () => run("retake", { shot: s.id, seeds: seeds(), rank: true }) }, "5 more versions, ranked"),
       h("span", { class: "spacer" }), h("span", { class: "chip" }, `seed ${s.seed}`)),
     mine ? h("p", { class: "small dim", style: "margin:0" }, `This picture: ${mine.score}/10`, mine.faults.length ? ` · ${mine.faults.join("; ")}` : "",

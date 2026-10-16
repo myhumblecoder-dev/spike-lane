@@ -700,6 +700,41 @@ def test_the_api_starts_a_new_take(server):
     assert status == 202 and "motion_seed" in st._doc(folder)["shot"][0]
 
 
+def test_draw_again_asks_for_a_new_picture_and_keeps_the_old_one_as_a_version(tmp_path):
+    folder = write_story(tmp_path / "bolt").parent
+    render_board(folder)
+    old = (folder / "board" / "01-heap.png").read_bytes()
+    seeds = set()
+    for _ in range(3):
+        assert st.new_picture(folder, "01-heap") == []
+        seeds.add(st._doc(folder)["shot"][0]["seed"])
+    assert len(seeds) == 3 and 1024 not in seeds
+    assert (folder / "board" / "retakes" / "01-heap-s1024.png").read_bytes() == old
+    assert 1024 in [r["seed"] for r in st.film_state(folder)["shots"][0]["retakes"]]   # offered to go back to
+    assert st.new_picture(folder, "99-x") != []
+
+
+def test_the_api_draws_a_new_picture(server):
+    srv, films = server
+    folder = films / "bolt"
+    open_scenes(folder)
+    make(folder, "01-heap", "picture")
+    status, _, _ = call(srv, "POST", "/api/films/bolt/run", {"step": "board", "shot": "01-heap", "new_picture": True})
+    assert status == 202 and st._doc(folder)["shot"][0]["seed"] != 1024
+
+
+def test_draw_again_asks_for_a_new_look(tmp_path):
+    folder = write_story(tmp_path / "bolt").parent
+    st.approve(folder, "story")
+    draw_look(folder, "ZAP")
+    first = sa.look_seed(sa.load_story(folder / "story.toml"), "ZAP")
+    assert st.new_look(folder, "ZAP") == []
+    story = sa.load_story(folder / "story.toml")
+    assert sa.look_seed(story, "ZAP") != first
+    assert first in [t["seed"] for t in next(l for l in st.film_state(folder)["looks"] if l["name"] == "ZAP")["takes"]]
+    assert st.new_look(folder, "NOBODY") != []
+
+
 def test_a_shot_made_before_takes_existed_is_kept_when_animating_again(tmp_path):
     folder = write_story(tmp_path / "bolt").parent
     make(folder, "01-heap", "picture")
@@ -746,6 +781,14 @@ seed = 2024
     assert tomllib.loads((folder / "story.toml").read_text()) == doc
     story = sa.load_story(folder / "story.toml")
     assert story.shots[0].seed == 2024 and story.places["HEAP"].startswith("a mountain")
+
+
+def test_a_scene_shows_the_seed_its_picture_is_drawn_with(tmp_path):
+    text = STORY + '\n[angles.LOW]\nframe = "low wide shot from the ground"\nseed = 2024\n'
+    folder = write_story(tmp_path / "bolt", text.replace('id = "01-heap"\n', 'id = "01-heap"\nangle = "LOW"\n')).parent
+    assert [s["seed"] for s in st.film_state(folder)["shots"]] == [2024, 77, 1024]   # the angle's, its own, the film's
+    assert st.new_picture(folder, "01-heap") == []
+    assert st.film_state(folder)["shots"][0]["seed"] not in (2024, 1024)
 
 
 # --- deleting a film ------------------------------------------------------------------------
@@ -1200,3 +1243,25 @@ def test_the_film_checks_name_a_line_missing_from_the_final_mix():
     lost = [c for c in got["lost"] if "final mix" in c[1]]
     assert lost == [["chip bad", "missing from the final mix: 05-b, 06-c"]]   # 0.81 overall, yet two lines gone
     assert [c for c in got["fine"] if "final mix" in c[1]] == [["chip ok", "speech in final mix 0.95"]]
+
+
+@pytest.mark.skipif(not NODE, reason="needs node")
+def test_draw_again_on_an_up_to_date_picture_asks_for_a_new_one():
+    got = on_page("""
+      __S.name = "pond"; __S.film = { errors: [], steps: [], references: [], doc: { shot: [{ id: "03-strike" }] }, shots: [] };
+      globalThis.renderFilm = () => {}; globalThis.loadFilm = () => {};
+      const sent = [];
+      globalThis.fetch = async (url, o) => { sent.push(JSON.parse(o.body || "{}")); return { ok: true, json: async () => __S.film }; };
+      const click = async (root) => { root.all().find((n) => n.tagName === "BUTTON" && /^Draw( again)?$/.test(n.textContent)).dispatch("click");
+                                       await new Promise((r) => setTimeout(r, 0)); };
+      const scene = (fresh) => h("div", {}, picturePart({ id: "03-strike", still: "board/03-strike.png", still_fresh: fresh, retakes: [], seed: 4024 },
+                                                         { done: true, unlocked: true }));
+      await click(scene(true)); await click(scene(false));
+      const look = (fresh) => lookCard({ name: "PIER", kind: "place", url: "looks/PIER.png", fresh, text: "", seed: 1024, takes: [] });
+      await click(look(true)); await click(look(false));
+      return sent;
+    """)
+    assert got[0] == {"step": "board", "shot": "03-strike", "new_picture": True}   # nothing changed: a new picture
+    assert got[1] == {"step": "board", "shot": "03-strike"}                       # description changed: draw it
+    assert got[2] == {"step": "look", "name": "PIER", "new_look": True}
+    assert got[3] == {"step": "look", "name": "PIER"}

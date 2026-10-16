@@ -916,11 +916,15 @@ def cmd_voice(story: Story, name: str, takes: int | None = None) -> int:
     return 0
 
 
+CLOSE_FRAMING = re.compile(r"\b(close[- ]?ups?|extreme close|macro|point[- ]of[- ]view|pov)\b", re.I)
+
+
 def scene_refs(story: Story, shot: Shot) -> list[tuple[str, Path]]:
-    """The looks a scene's picture is drawn from: its characters, then its places (those drawn)."""
+    """The looks a scene's picture is drawn from: its characters, then its places (those drawn; not for a close-up)."""
     text = shot.still + (" " + story.angles[shot.angle].frame if shot.angle else "")
     names = [n for n in story.characters if re.search(rf"\b{re.escape(n)}\b", text)]
-    names += [n for n in story.places if re.search(rf"\b{re.escape(n)}\b", text)]
+    if not CLOSE_FRAMING.search(text):   # given a place's picture, a close-up comes out as that wide view again
+        names += [n for n in story.places if re.search(rf"\b{re.escape(n)}\b", text)]
     return [(n, look_path(story, n)) for n in names if look_path(story, n).is_file()]
 
 

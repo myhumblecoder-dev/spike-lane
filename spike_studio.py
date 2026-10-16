@@ -271,8 +271,43 @@ def new_take(folder: Path, shot_id: str) -> list[str]:
     used = {shot.get("seed", doc.get("seed", 1024)), shot.get("motion_seed")}
     used |= {int(m.group(1)) for p in (Path(folder) / "shots" / "takes").glob(f"{shot_id}-m*.mp4")
              if (m := re.search(r"-m(\d+)\.mp4$", p.name))}
-    seed = next(s for s in iter(lambda: secrets.randbelow(90000) + 100, None) if s not in used)
-    shot["motion_seed"] = seed
+    shot["motion_seed"] = _unused_seed(used)
+    return save_story(folder, doc=doc)
+
+
+def _unused_seed(used: set) -> int:
+    return next(s for s in iter(lambda: secrets.randbelow(90000) + 100, None) if s not in used)
+
+
+def new_picture(folder: Path, shot_id: str) -> list[str]:
+    """Give a scene's picture a seed it hasn't had, so drawing again makes a different one. The current
+    picture is kept among the scene's other versions, to go back to."""
+    folder = Path(folder)
+    doc = _doc(folder)
+    shot = next((s for s in doc.get("shot", []) if s.get("id") == shot_id), None)
+    if shot is None:
+        return [f"no shot '{shot_id}' in the story"]
+    story = sa.load_story(folder / "story.toml")
+    current = next(x for x in story.shots if x.id == shot_id)
+    still, retakes = sa.still_path(story, current), folder / "board" / "retakes"
+    if still.exists():
+        retakes.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(still, retakes / f"{shot_id}-s{current.seed}.png")
+    used = {current.seed} | {int(m.group(1)) for p in retakes.glob(f"{shot_id}-s*.png")
+                             if (m := re.search(r"-s(\d+)\.png$", p.name))}
+    shot["seed"] = _unused_seed(used)
+    return save_story(folder, doc=doc)
+
+
+def new_look(folder: Path, name: str) -> list[str]:
+    """Give a character sheet or place picture a seed it hasn't had; earlier versions stay in looks/takes."""
+    folder = Path(folder)
+    story = sa.load_story(folder / "story.toml")
+    if name not in sa.look_names(story):
+        return [f"no character or place called '{name}'"]
+    used = {sa.look_seed(story, name)} | {s for s, _ in _look_takes(folder, story, name)}
+    doc = _doc(folder)
+    doc.setdefault("looks", {})[name] = _unused_seed(used)
     return save_story(folder, doc=doc)
 
 
@@ -636,7 +671,7 @@ def film_state(folder: Path) -> dict:
         state["shots"].append({
             "id": sid, "still_text": s.get("still", ""), "motion": s.get("motion", ""),
             "narration": s.get("narration", ""), "dialogue": s.get("dialogue", []),
-            "seed": s.get("seed", doc.get("seed", 1024)), "still_fresh": still_fresh,
+            "seed": shot_obj.seed if shot_obj else s.get("seed", doc.get("seed", 1024)), "still_fresh": still_fresh,
             "still": _url(folder, f"board/{sid}.png"),
             "retakes": [{"seed": seed, "url": _url(folder, str(p.relative_to(folder)))} for seed, p in retakes],
             "clip": _url(folder, f"shots/{sid}.mp4"), "sfx": _url(folder, f"sfx/{sid}.flac"),
@@ -1060,6 +1095,13 @@ class Handler(BaseHTTPRequestHandler):
                     if (jobs.status(folder) or {}).get("running"):
                         raise Busy("a step is already running for this film")
                     errors = new_take(folder, str(p.get("shot", "")))
+                    if errors:
+                        raise ValueError("; ".join(errors))
+                if (p.get("step") == "board" and p.get("new_picture")) or (p.get("step") == "look" and p.get("new_look")):
+                    if (jobs.status(folder) or {}).get("running"):
+                        raise Busy("a step is already running for this film")
+                    errors = (new_picture(folder, str(p.get("shot", ""))) if p["step"] == "board"
+                              else new_look(folder, str(p.get("name", ""))))
                     if errors:
                         raise ValueError("; ".join(errors))
                 jobs.start(folder, argv, step=p.get("step"))
