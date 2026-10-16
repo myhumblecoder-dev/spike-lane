@@ -776,7 +776,7 @@ function lookTab() {
 
 function lookCard(lk) {
   const st = stepOf(`look:${lk.name}`), ex = { name: lk.name };
-  const seeds = () => [0, 1, 2, 3, 4].map(() => Math.floor(Math.random() * 9000) + 100);
+  const MORE = 3, seeds = () => Array.from({ length: MORE }, () => Math.floor(Math.random() * 9000) + 100);
   const upload = h("input", { type: "file", accept: "image/png,image/jpeg", hidden: true, onchange: async () => {
     const file = upload.files[0]; if (!file) return;
     const ext = (file.name.match(/\.(png|jpe?g)$/i) || [".png"])[0].toLowerCase();
@@ -805,7 +805,7 @@ function lookCard(lk) {
       inlineEdit(lk.kind === "place" ? "The place, in words (every scene set here uses them)" : "How they look, in words (clothes included)", lk.text, save, 3),
       h("div", { class: "row" }, (lk.url && lk.fresh ? runBtn("Draw again", "look", { ...ex, new_look: true }, !st.done)
         : runBtn(lk.url ? "Draw again" : "Draw", "look", ex, !st.done)),
-        h("button", { class: "btn small", disabled: busy() || locked("look", ex), onclick: () => run("look", { name: lk.name, seeds: seeds() }) }, "3 more versions"),
+        h("button", { class: "btn small", disabled: busy() || locked("look", ex), onclick: () => run("look", { name: lk.name, seeds: seeds() }) }, `${MORE} more versions`),
         h("span", { class: "spacer" }), h("span", { class: "chip" }, `seed ${lk.seed}`)),
       lk.takes.length > 1 ? h("div", {}, h("h3", { style: "margin:4px 0 6px" }, `Versions (${lk.takes.length})`), h("div", { class: "retakes" }, lk.takes.slice().reverse().map((tk) =>
         h("figure", {}, h("a", { href: media(tk.url), target: "_blank" }, h("img", { class: "thumb", src: media(tk.url), alt: `seed ${tk.seed}`, loading: "lazy" })),
@@ -972,7 +972,7 @@ function partGate(s, part, st) {
 }
 
 function picturePart(s, st) {
-  const seeds = () => [0, 1, 2].map(() => Math.floor(Math.random() * 9000) + 100);
+  const MORE = 5, seeds = () => Array.from({ length: MORE }, () => Math.floor(Math.random() * 9000) + 100);
   const ex = { shot: s.id };
   const rank = Object.fromEntries((s.ranking || []).map((r, i) => [r.seed, { ...r, best: i === 0 && s.ranking.length > 1 }]));
   const order = (r) => (rank[r.seed] ? -rank[r.seed].score : 1);
@@ -986,7 +986,7 @@ function picturePart(s, st) {
     inlineEdit("Picture description", s.still_text, (v) => saveShot(s.id, (x) => { x.still = v; }, "Saved; draw it again to see it"), 3),
     h("div", { class: "row" }, (s.still && s.still_fresh !== false   // up to date: the same seed would draw the same picture, so ask for a new one
       ? runBtn("Draw again", "board", { ...ex, new_picture: true }, !st.done) : runBtn("Draw", "board", ex, !st.done)),
-      h("button", { class: "btn small", disabled: busy() || !!S.film.errors.length || locked("retake", ex), onclick: () => run("retake", { shot: s.id, seeds: seeds(), rank: true }) }, "5 more versions, ranked"),
+      h("button", { class: "btn small", disabled: busy() || !!S.film.errors.length || locked("retake", ex), onclick: () => run("retake", { shot: s.id, seeds: seeds(), rank: true }) }, `${MORE} more versions, ranked`),
       h("span", { class: "spacer" }), h("span", { class: "chip" }, `seed ${s.seed}`)),
     mine ? h("p", { class: "small dim", style: "margin:0" }, `This picture: ${mine.score}/10`, mine.faults.length ? ` · ${mine.faults.join("; ")}` : "",
       rank[s.seed]?.best ? h("span", { class: "chip ok", style: "margin-left:6px" }, "best") : null) : null,

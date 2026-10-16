@@ -1265,3 +1265,21 @@ def test_draw_again_on_an_up_to_date_picture_asks_for_a_new_one():
     assert got[1] == {"step": "board", "shot": "03-strike"}                       # description changed: draw it
     assert got[2] == {"step": "look", "name": "PIER", "new_look": True}
     assert got[3] == {"step": "look", "name": "PIER"}
+
+
+def test_more_versions_draws_as_many_as_the_button_says():
+    got = on_page("""
+      __S.name = "pond"; __S.film = { errors: [], steps: [], references: [], doc: { shot: [{ id: "03-strike" }] }, shots: [] };
+      globalThis.renderFilm = () => {}; globalThis.loadFilm = () => {};
+      const sent = [];
+      globalThis.fetch = async (url, o) => { sent.push(JSON.parse(o.body || "{}")); return { ok: true, json: async () => __S.film }; };
+      const press = async (root) => { const b = root.all().find((n) => n.tagName === "BUTTON" && /more versions/.test(n.textContent));
+                                      b.dispatch("click"); await new Promise((r) => setTimeout(r, 0));
+                                      return [Number(b.textContent.match(/\\d+/)[0]), sent.at(-1).seeds.length]; };
+      const scene = h("div", {}, picturePart({ id: "03-strike", still: "board/03-strike.png", retakes: [], seed: 4024 }, { done: true, unlocked: true }));
+      const look = lookCard({ name: "PIER", kind: "place", url: "looks/PIER.png", fresh: true, text: "", seed: 1024, takes: [] });
+      return [await press(scene), await press(look)];
+    """)
+    for said, drawn in got:
+        assert drawn == said
+    assert got[0][0] == 5   # a scene: 5 ranked versions
