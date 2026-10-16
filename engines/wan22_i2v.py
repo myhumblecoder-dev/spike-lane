@@ -143,7 +143,79 @@ def _vae_encode(vae, x, flush=_mps_flush):
     return mu
 
 
+def _mlx_flush():
+    import mlx.core as mx
+    mx.clear_cache()
+
+
+def _decode_taehv(latents_np, *, chunk=1, flush=_mlx_flush):
+    """FastVideo's MLX TAEHV decode ([1, C, T, h, w] -> [1, T_out, H, W, 3] in [0, 1]), `chunk` latent frames
+    at a time. Upstream evaluates the whole clip as one graph: at 1280x704 the full-size 64-channel layers are
+    ~15 GB a tensor and the job spiked to ~30 GB. Every layer works frame by frame except the MemBlocks, which
+    also read the previous frame of their input, so each carries its last input frame into the next chunk."""
+    import mlx.core as mx
+    from fastvideo.mlx_runtime.wan_vae import (MLXTAEHVDecoder, _mlx_conv2d, _mlx_conv2d_1x1,
+                                               ensure_taehv_checkpoint)
+
+    b, c, t, _, _ = latents_np.shape
+    if b != 1:
+        raise ValueError(f"expected one clip, got a batch of {b}")
+    dec = MLXTAEHVDecoder(ensure_taehv_checkpoint(z_dim=c), z_dim=c)
+    w = dec.weights
+    conv = lambda x, k: _mlx_conv2d(x, w[f"decoder.{k}.weight"], w.get(f"decoder.{k}.bias"))
+    last = {}   # MemBlock index -> its input's last frame so far
+
+    def memblock(k, x):
+        past = mx.concatenate([last.get(k, mx.zeros_like(x[:1])), x[:-1]], axis=0)
+        last[k] = x[-1:]
+        h = mx.maximum(_mlx_conv2d(mx.concatenate([x, past], axis=1), w[f"decoder.{k}.conv.0.weight"],
+                                   w.get(f"decoder.{k}.conv.0.bias")), 0.0)
+        h = mx.maximum(_mlx_conv2d(h, w[f"decoder.{k}.conv.2.weight"], w.get(f"decoder.{k}.conv.2.bias")), 0.0)
+        h = _mlx_conv2d(h, w[f"decoder.{k}.conv.4.weight"], w.get(f"decoder.{k}.conv.4.bias"))
+        skip = _mlx_conv2d_1x1(x, w[f"decoder.{k}.skip.weight"]) if f"decoder.{k}.skip.weight" in w else x
+        return mx.maximum(h + skip, 0.0)
+
+    def up(x):
+        n, ch, hh, ww = x.shape
+        return mx.broadcast_to(x.reshape(n, ch, hh, 1, ww, 1), (n, ch, hh, 2, ww, 2)).reshape(n, ch, hh * 2, ww * 2)
+
+    def tgrow(k, x, stride):
+        wt = w[f"decoder.{k}.conv.weight"]
+        wt = wt[-x.shape[1] * stride:]
+        y = _mlx_conv2d_1x1(x, wt)
+        n, ch, hh, ww = y.shape
+        return y.reshape(n * stride, ch // stride, hh, ww)
+
+    p = dec.patch_size
+    frames = []
+    for s in range(0, t, chunk):
+        x = mx.array(latents_np[0, :, s:s + chunk].transpose(1, 0, 2, 3).astype(np.float32))
+        x = mx.maximum(conv(mx.tanh(x / 3.0) * 3.0, 1), 0.0)
+        for k in (3, 4, 5):
+            x = memblock(k, x)
+        x = conv(tgrow(7, up(x), 1), 8)
+        for k in (9, 10, 11):
+            x = memblock(k, x)
+        x = conv(tgrow(13, up(x), 2), 14)
+        for k in (15, 16, 17):
+            x = memblock(k, x)
+        x = conv(mx.maximum(conv(tgrow(19, up(x), 2), 20), 0.0), 22)
+        n, _, hh, ww = x.shape
+        if p > 1:   # pixel shuffle (n, 3*p*p, h, w) -> (n, 3, h*p, w*p)
+            x = x.reshape(n, 3, p, p, hh, ww).transpose(0, 1, 4, 2, 5, 3).reshape(n, 3, hh * p, ww * p)
+        x = mx.clip(x, 0.0, 1.0).transpose(0, 2, 3, 1)
+        mx.eval(x, *last.values())
+        frames.append(np.array(x))
+        del x
+        flush()
+    out = np.concatenate(frames)[None]
+    return out[:, dec.frames_to_trim:] if out.shape[1] > dec.frames_to_trim else out
+
+
 STILL_CACHE = Path.home() / ".cache" / "fastvideo" / "still_latents"
+# Half precision halves the encode (an HD still: ~25 -> 12 GB) for latents within 0.2% of fp32's
+# (max error 0.03 against a spread of 1.1, even across frames). bf16 was 4x further off.
+VAE_DTYPE = "float16"
 
 
 def _encode_first_frame(image_path, vae_dir, *, height, width, frames=1, cache=STILL_CACHE):
@@ -178,9 +250,9 @@ def _encode_still(image_path, vae_dir, *, height, width, frames):
     left, top = (img.width - width) // 2, (img.height - height) // 2
     img = img.crop((left, top, left + width, top + height))
     x = torch.from_numpy(np.asarray(img, dtype=np.float32) / 127.5 - 1.0).permute(2, 0, 1)[None, :, None].repeat(1, 1, frames, 1, 1)
-    vae = AutoencoderKLWan.from_pretrained(vae_dir, torch_dtype=torch.float32, local_files_only=True).to("mps")
+    vae = AutoencoderKLWan.from_pretrained(vae_dir, torch_dtype=getattr(torch, VAE_DTYPE), local_files_only=True).to("mps")
     with torch.no_grad():
-        z = _vae_encode(vae, x.to("mps"))
+        z = _vae_encode(vae, x.to("mps", getattr(torch, VAE_DTYPE))).float()
     mean = torch.tensor(vae.config.latents_mean, device="mps").view(1, -1, 1, 1, 1)
     std = torch.tensor(vae.config.latents_std, device="mps").view(1, -1, 1, 1, 1)
     z = ((z - mean) / std).float().cpu().numpy()
@@ -206,9 +278,9 @@ def _encode_video(video_path, vae_dir, *, height, width, frames, fps=24.0, start
     if len(clip) < frames:  # hold the last frame if the clip runs short
         clip = np.concatenate([clip, np.repeat(clip[-1:], frames - len(clip), axis=0)])
     x = torch.from_numpy(clip.astype(np.float32) / 127.5 - 1.0).permute(3, 0, 1, 2)[None]
-    vae = AutoencoderKLWan.from_pretrained(vae_dir, torch_dtype=torch.float32, local_files_only=True).to("mps")
+    vae = AutoencoderKLWan.from_pretrained(vae_dir, torch_dtype=getattr(torch, VAE_DTYPE), local_files_only=True).to("mps")
     with torch.no_grad():
-        z = _vae_encode(vae, x.to("mps"))
+        z = _vae_encode(vae, x.to("mps", getattr(torch, VAE_DTYPE))).float()
     mean = torch.tensor(vae.config.latents_mean, device="mps").view(1, -1, 1, 1, 1)
     std = torch.tensor(vae.config.latents_std, device="mps").view(1, -1, 1, 1, 1)
     z = ((z - mean) / std).float().cpu().numpy()
@@ -685,14 +757,23 @@ def main() -> None:
     del dit, latents, ehs, noise, freqs
     cleanup_mlx()
 
-    metrics = decode_latents_to_video(
-        latents_np,
-        args.output_path,
-        fps=args.fps,
-        backend=args.decode_backend,
-        vae_dir=args.vae_root if args.decode_backend == "wan-vae" else None,
-        z_dim=in_ch,
-    )
+    if args.decode_backend == "taehv":   # upstream's taehv decodes the whole clip at once (~30 GB at HD)
+        from diffusers.utils import export_to_video
+        t3 = time.perf_counter()
+        frames = _decode_taehv(latents_np)[0]
+        metrics = {"decode_s": time.perf_counter() - t3, "backend": "taehv"}
+        args.output_path.parent.mkdir(parents=True, exist_ok=True)
+        export_to_video(frames, str(args.output_path), fps=args.fps)
+        del frames
+    else:
+        metrics = decode_latents_to_video(
+            latents_np,
+            args.output_path,
+            fps=args.fps,
+            backend=args.decode_backend,
+            vae_dir=args.vae_root if args.decode_backend == "wan-vae" else None,
+            z_dim=in_ch,
+        )
     # One h264 round-trip for both post-decode passes (see _postprocess_video).
     rife_s = 0.0
     rife_request = ({
