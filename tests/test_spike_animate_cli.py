@@ -1188,3 +1188,17 @@ def test_lines_recorded_by_the_film_step_start_where_their_voice_paced_shots_sta
     lines = sa.narrate(story, sa.Keys(film), {})     # nothing recorded yet, as when `film` runs straight from the board
     assert [round(at, 3) for _, at in lines] == [round(at, 3) for _, at in sa.narration_offsets(story)]
     assert lines[-1][1] < sa.film_length(story)       # 5 s guesses put the last line past the end of a short film
+
+
+def test_the_film_names_a_line_missing_from_the_final_mix(env):
+    film, _, log = env
+    set_shot(film, "02-pounce", 'narration = "It leapt into the snow."')
+    assert run(env, "board", "story.toml").returncode == 0
+    heard = log.with_name("said-by-name"); heard.mkdir(exist_ok=True)
+    (heard / "fox-hunt").write_text("The fox was hungry.")   # the finished film: the second line got lost
+    r = run(env, "film", "story.toml")
+    assert r.returncode == 0, r.stdout + r.stderr
+    checks = json.loads((film / "film" / "checks.json").read_text())
+    assert checks["final_lines"]["01-walk"] >= 0.9 and checks["final_lines"]["02-pounce"] < 0.6
+    assert "02-pounce's line is missing or buried in the final mix" in r.stdout
+    assert "01-walk's line" not in r.stdout

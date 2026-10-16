@@ -1377,6 +1377,7 @@ function filmTab() {
   const allLines = [...Object.values(c.narration || {}), ...Object.values(c.dialogue || {})];
   const weak = allLines.filter((v) => v < 0.8).length;
   const over = Object.keys(c.dialogue_overflow || {}).length;
+  const lost = Object.entries(c.final_lines || {}).filter(([, v]) => v < 0.8).map(([k]) => k);
   return h("div", { class: "stack" },
     h("h1", {}, f.title),
     f.idea ? h("p", { class: "dim", style: "font-family:var(--display);font-style:italic" }, `“${f.idea}”`) : null,
@@ -1387,7 +1388,8 @@ function filmTab() {
       h("h3", { style: "margin:0" }, "Checks"),
       h("div", { class: "row" },
         allLines.length ? h("span", { class: "chip " + (weak ? "bad" : "ok") }, weak ? `${weak} line(s) hard to hear` : `all ${allLines.length} lines heard`) : null,
-        c.final_narration != null ? h("span", { class: "chip " + (c.final_narration >= 0.8 ? "ok" : "bad") }, `speech in final mix ${c.final_narration}`) : null,
+        lost.length ? h("span", { class: "chip bad" }, `missing from the final mix: ${lost.join(", ")}`)
+          : c.final_narration != null ? h("span", { class: "chip " + (c.final_narration >= 0.8 ? "ok" : "bad") }, `speech in final mix ${c.final_narration}`) : null,
         over ? h("span", { class: "chip bad" }, `${over} shot(s) with dialogue past the cut`) : allLines.length ? h("span", { class: "chip ok" }, "dialogue fits its shots") : null,
         c.length ? h("span", { class: "chip" }, `${c.length.film} s`) : null,
         f.score.chosen != null ? h("span", { class: "chip" }, `music take ${f.score.chosen}`) : null)) : null,

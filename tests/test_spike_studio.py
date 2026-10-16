@@ -1185,3 +1185,18 @@ def test_the_screen_editor_finds_the_screen_and_shows_it_up_close():
     assert got["asked"] == [["/api/films/night/findscreen", "POST"]]
     assert got["polys"] == ["0.6,0.42 0.87,0.46 0.82,0.81 0.55,0.7"]     # the found outline, up close
     assert got["zoomHidden"] is False and got["saveable"] is True
+
+
+@pytest.mark.skipif(not NODE, reason="needs node")
+def test_the_film_checks_name_a_line_missing_from_the_final_mix():
+    got = on_page("""
+      const chips = (checks) => {
+        __S.film = { title: "T", film: "film/t.mp4", shots: [], references: [], score: {}, errors: [], steps: [], checks };
+        return filmTab().all().filter((n) => n.className.startsWith("chip")).map((n) => [n.className, n.textContent]);
+      };
+      return { lost: chips({ narration: { "01-a": 1, "05-b": 1, "06-c": 1 }, final_narration: 0.81, final_lines: { "01-a": 1, "05-b": 0.3, "06-c": 0.2 } }),
+               fine: chips({ narration: { "01-a": 1 }, final_narration: 0.95, final_lines: { "01-a": 0.97 } }) };
+    """)
+    lost = [c for c in got["lost"] if "final mix" in c[1]]
+    assert lost == [["chip bad", "missing from the final mix: 05-b, 06-c"]]   # 0.81 overall, yet two lines gone
+    assert [c for c in got["fine"] if "final mix" in c[1]] == [["chip ok", "speech in final mix 0.95"]]

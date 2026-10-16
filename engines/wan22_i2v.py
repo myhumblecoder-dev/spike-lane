@@ -114,9 +114,60 @@ def _default_prompt_cache_path(fingerprint: dict[str, object]) -> Path:
     return Path.home() / ".cache" / "fastvideo" / "prompt_embeds" / f"wan22_{digest}.npy"
 
 
-def _encode_first_frame(image_path, vae_dir, *, height, width, frames=1):
-    """Encode a still held for `frames` frames to normalized Wan2.2 latents [1, C, T, h, w] (mlx fp16)."""
+def _mps_flush():
+    import torch
+    torch.mps.synchronize()
+    torch.mps.empty_cache()
+
+
+def _vae_encode(vae, x, flush=_mps_flush):
+    """vae.encode(x).latent_dist.mode(), by diffusers' own chunk loop (the first frame alone, then four at a
+    time), flushing after every chunk. Left to diffusers, each chunk's freed buffers stay cached on the GPU:
+    a 61-frame held still at 1280x704 peaked at 51 GB, past MPS's cap, and came back wrong from latent
+    frame 4 on. Flushed, it peaks near 25 GB and matches a CPU encode."""
+    import torch
+    from diffusers.models.autoencoders.autoencoder_kl_wan import patchify
+
+    vae.clear_cache()
+    if vae.config.patch_size is not None:
+        x = patchify(x, patch_size=vae.config.patch_size)
+    outs = []
+    for i in range(1 + (x.shape[2] - 1) // 4):
+        vae._enc_conv_idx = [0]
+        outs.append(vae.encoder(x[:, :, :1] if i == 0 else x[:, :, 1 + 4 * (i - 1):1 + 4 * i],
+                                feat_cache=vae._enc_feat_map, feat_idx=vae._enc_conv_idx))
+        flush()
+    h = vae.quant_conv(torch.cat(outs, 2))
+    vae.clear_cache()
+    mu, _ = torch.chunk(h, 2, dim=1)   # the distribution's mode is its mean
+    return mu
+
+
+STILL_CACHE = Path.home() / ".cache" / "fastvideo" / "still_latents"
+
+
+def _encode_first_frame(image_path, vae_dir, *, height, width, frames=1, cache=STILL_CACHE):
+    """Encode a still held for `frames` frames to normalized Wan2.2 latents [1, C, T, h, w] (mlx fp16).
+    Kept in `cache` by the picture, size, frames and VAE: a retake with another seed reuses them, skipping
+    the slowest and most memory-hungry step of an HD clip (~80 s, ~25 GB)."""
+    import hashlib
+
     import mlx.core as mx
+    key = hashlib.sha256(json.dumps([hashlib.sha256(Path(image_path).read_bytes()).hexdigest(), height, width, frames,
+                                     str(Path(vae_dir).resolve())]).encode()).hexdigest()[:32]
+    kept = Path(cache) / f"{key}.npy" if cache else None
+    if kept and kept.exists():
+        return mx.array(np.load(kept)).astype(mx.float16)
+    z = _encode_still(image_path, vae_dir, height=height, width=width, frames=frames)
+    if kept:
+        kept.parent.mkdir(parents=True, exist_ok=True)
+        tmp = kept.with_suffix(".tmp.npy")
+        np.save(tmp, z)
+        tmp.replace(kept)
+    return mx.array(z).astype(mx.float16)
+
+
+def _encode_still(image_path, vae_dir, *, height, width, frames):
     import torch
     from diffusers import AutoencoderKLWan
     from PIL import Image
@@ -129,13 +180,13 @@ def _encode_first_frame(image_path, vae_dir, *, height, width, frames=1):
     x = torch.from_numpy(np.asarray(img, dtype=np.float32) / 127.5 - 1.0).permute(2, 0, 1)[None, :, None].repeat(1, 1, frames, 1, 1)
     vae = AutoencoderKLWan.from_pretrained(vae_dir, torch_dtype=torch.float32, local_files_only=True).to("mps")
     with torch.no_grad():
-        z = vae.encode(x.to("mps")).latent_dist.mode()
+        z = _vae_encode(vae, x.to("mps"))
     mean = torch.tensor(vae.config.latents_mean, device="mps").view(1, -1, 1, 1, 1)
     std = torch.tensor(vae.config.latents_std, device="mps").view(1, -1, 1, 1, 1)
     z = ((z - mean) / std).float().cpu().numpy()
     del vae
     torch.mps.empty_cache()
-    return mx.array(z).astype(mx.float16)
+    return z
 
 
 def _encode_video(video_path, vae_dir, *, height, width, frames, fps=24.0, start=0.0):
@@ -157,7 +208,7 @@ def _encode_video(video_path, vae_dir, *, height, width, frames, fps=24.0, start
     x = torch.from_numpy(clip.astype(np.float32) / 127.5 - 1.0).permute(3, 0, 1, 2)[None]
     vae = AutoencoderKLWan.from_pretrained(vae_dir, torch_dtype=torch.float32, local_files_only=True).to("mps")
     with torch.no_grad():
-        z = vae.encode(x.to("mps")).latent_dist.mode()
+        z = _vae_encode(vae, x.to("mps"))
     mean = torch.tensor(vae.config.latents_mean, device="mps").view(1, -1, 1, 1, 1)
     std = torch.tensor(vae.config.latents_std, device="mps").view(1, -1, 1, 1, 1)
     z = ((z - mean) / std).float().cpu().numpy()
@@ -527,6 +578,9 @@ def main() -> None:
             device_arg=args.text_encoder_device,
             dtype_arg="fp16",
         )
+        import gc   # the text encoder (~11 GB) is garbage now, but its GPU buffers stay cached until handed back
+        gc.collect()
+        _mps_flush()
         save_prompt_cache(
             prompt_cache_path,
             embeds.cpu().numpy(),

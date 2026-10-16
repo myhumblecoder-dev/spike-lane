@@ -514,6 +514,12 @@ def spoken_text(story: Story) -> str:
     return " ".join(x for s in story.shots for x in ([s.narration] if s.narration else []) + [l.line for l in s.dialogue])
 
 
+def said_lines(story: Story) -> list[tuple[str, str]]:
+    """Every line said in the film, named by its shot (and speaker, for dialogue)."""
+    return [(k, t) for s in story.shots
+            for k, t in ([(s.id, s.narration)] if s.narration else []) + [(f"{s.id} {l.speaker}", l.line) for l in s.dialogue]]
+
+
 def place_lines(shot_start: float, durations: list[float], lead: float = 0.4, gap: float = 0.3,
                 length: float | None = None) -> tuple[list[float], float]:
     """Start times for a shot's lines, one after another; and how far the last runs past the cut (0 if not)."""
@@ -598,6 +604,20 @@ def words_match(expected: str, heard: str) -> float:
     """Similarity of what the narrator should say to what speech-to-text heard (0-1). Compared
     letter by letter with spaces removed, so 'a scent' and 'ascent' count as the same."""
     return difflib.SequenceMatcher(None, _letters(expected), _letters(heard)).ratio()
+
+
+def lines_heard(lines: list[tuple[str, str]], heard: str) -> dict[str, float]:
+    """How well each (shot id, line) is found anywhere in what speech-to-text heard (0-1): the line against
+    its best-matching stretch of the transcript. A line missing from the mix scores low on its own, where
+    one score for the whole film barely moves."""
+    h, found = _letters(heard), {}
+    for sid, text in lines:
+        t = _letters(text)
+        if not t:
+            continue
+        found[sid] = max(difflib.SequenceMatcher(None, t, h[i:i + len(t)]).ratio()
+                         for i in range(max(1, len(h) - len(t) + 1)))
+    return found
 
 
 # --- mixing -----------------------------------------------------------------
@@ -2099,7 +2119,9 @@ def cmd_film(story: Story) -> int:
     film = mix(story, keys, picture, soundtrack, music, lines, total)
     checks["length"] = {"picture": round(total, 3), "film": round(media_seconds(film), 3)}
     if lines:
-        checks["final_narration"] = round(words_match(spoken_text(story), heard(film, keys)), 2)
+        said = heard(film, keys)
+        checks["final_narration"] = round(words_match(spoken_text(story), said), 2)
+        checks["final_lines"] = {k: round(v, 2) for k, v in lines_heard(said_lines(story), said).items()}
     (story.root / "film" / "checks.json").write_text(json.dumps(checks, indent=1))
     page = review_page(story, film, checks)
     weak = [sid for part in ("narration", "dialogue") for sid, v in checks.get(part, {}).items() if v < 0.8]
@@ -2108,7 +2130,10 @@ def cmd_film(story: Story) -> int:
         _say(f"⚠ the line for {sid} is hard to make out; retry with a reworded line")
     for sid, over in checks.get("dialogue_overflow", {}).items():
         _say(f"⚠ dialogue in {sid} runs {over} s past the cut; shorten it or split it across shots")
-    if lines and checks["final_narration"] < 0.8:
+    lost = [k for k, v in checks.get("final_lines", {}).items() if v < 0.8]
+    for k in lost:
+        _say(f"⚠ {k}'s line is missing or buried in the final mix; check its timing, or lower music or effects")
+    if lines and not lost and checks["final_narration"] < 0.8:
         _say(f"⚠ speech is hard to hear in the final mix (match {checks['final_narration']}); lower music or effects")
     return 0
 

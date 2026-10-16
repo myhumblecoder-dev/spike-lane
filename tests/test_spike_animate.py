@@ -193,6 +193,18 @@ def test_heard_speech_matches_the_line_despite_punctuation_and_homophones():
     assert sa.words_match("Slowly. Silently. Closer.", "In the winter woods") < 0.5
 
 
+def test_the_final_mix_check_finds_each_line_so_a_dropped_one_shows():
+    lines = [("01-dawn", "Mist on the water. Silas waits."), ("02-wait", "He has waited here for forty years."),
+             ("03-bite", "Then the line goes tight."), ("04-fight", "The old rod bends almost to breaking."),
+             ("05-land", "Gold scales flash in the morning light."), ("06-end", "Patience pays.")]
+    heard = ("Mist on the water, Silas waits. He has waited here for forty years. Then the line goes tight. "
+             "The old rod bends almost to breaking.")   # the last two lines never made it into the mix
+    found = sa.lines_heard(lines, heard)
+    assert sa.words_match(" ".join(t for _, t in lines), heard) >= 0.8   # one score for the whole film hides it
+    assert all(found[sid] >= 0.9 for sid in ("01-dawn", "02-wait", "03-bite", "04-fight"))
+    assert found["05-land"] < 0.6 and found["06-end"] < 0.6
+
+
 # --- mixing -----------------------------------------------------------------
 
 def test_mix_graph_ducks_the_bed_under_the_narrator():
