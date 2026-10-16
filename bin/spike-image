@@ -30,4 +30,4 @@ echo "→ $out" >&2
 
 exec "$here/spike-lane" run --wait "${SPIKE_LANE_WAIT:-0}" --evict-ollama image -- \
   mflux-generate-z-image-turbo --model "$model" \
-  --prompt "$prompt" --output "$out" --steps 9 "$@"
+  --prompt "$prompt" --output "$out" --steps 9 --mlx-cache-limit-gb 2 "$@"   # uncapped, freed buffers stay cached (14 vs 10 GB)

@@ -1202,3 +1202,24 @@ def test_the_film_names_a_line_missing_from_the_final_mix(env):
     assert checks["final_lines"]["01-walk"] >= 0.9 and checks["final_lines"]["02-pounce"] < 0.6
     assert "02-pounce's line is missing or buried in the final mix" in r.stdout
     assert "01-walk's line" not in r.stdout
+
+
+def test_pictures_are_drawn_with_a_capped_cache_from_a_saved_klein(env, tmp_path):
+    """Left to itself mflux keeps every freed buffer cached: a scene drawn from two looks peaked at a 26.5 GB
+    footprint for 8.8 GB of model. A 2 GB cache cap gives the same pixels at 8.6 GB (Z-Image: 14.3 -> 10.0 GB),
+    in the same time; --low-ram went lower but changed Z-Image's pixels. Klein is also loaded already shrunk
+    (mflux-save) instead of shrinking the full weights on every draw."""
+    film, e, log = env
+    with_place(film)
+    saved = tmp_path / "flux2-klein-4b-mflux-q8"
+    saved.mkdir()
+    e["KLEIN_MODEL"] = str(saved)
+    assert run(env, "look", "story.toml", "FOX").returncode == 0
+    assert run(env, "look", "story.toml", "WOODS").returncode == 0
+    assert run(env, "board", "story.toml", "--shot", "01-walk").returncode == 0
+    drawn = [c for c in calls(log) if tool(c).startswith("mflux")]
+    assert {tool(c) for c in drawn} == {"mflux-generate-z-image-turbo", "mflux-generate-flux2-edit"}
+    assert all(flag(c["args"], "--mlx-cache-limit-gb") == "2" for c in drawn)
+    [edit] = [c for c in drawn if tool(c) == "mflux-generate-flux2-edit"]
+    assert flag(edit["args"], "--model") == str(saved) and flag(edit["args"], "--base-model") == "flux2-klein-4b"
+    assert "--quantize" not in edit["args"]

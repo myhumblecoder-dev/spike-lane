@@ -730,12 +730,18 @@ def render_still(prompt: str, seed: int, out: Path, size=STILL_SIZE, from_image:
     tmp = out.with_name(f".{out.stem}-new{out.suffix}")
     tmp.unlink(missing_ok=True)
     if refs:
-        cmd = ["mflux-generate-flux2-edit", "--model", os.environ.get("KLEIN_MODEL") or "flux2-klein-4b", "--quantize", "8",
-               "--image-paths", *refs, "--prompt", prompt, "--output", tmp, "--seed", seed,
-               "--width", size[0], "--height", size[1]]
+        # Klein saved already shrunk (mflux-save -q 8) loads as is; by name, mflux shrinks the full weights every draw.
+        klein = os.environ.get("KLEIN_MODEL") or str(Path.home() / "image-models" / "flux2-klein-4b-mflux-q8")
+        weights = ["--model", klein, "--base-model", "flux2-klein-4b"] if Path(klein).is_dir() else \
+            ["--model", "flux2-klein-4b", "--quantize", "8"]
+        cmd = ["mflux-generate-flux2-edit", *weights, "--image-paths", *refs, "--prompt", prompt, "--output", tmp,
+               "--seed", seed, "--width", size[0], "--height", size[1]]
     else:
         cmd = ["mflux-generate-z-image-turbo", "--model", model, "--prompt", prompt, "--output", tmp, "--steps", "9",
                "--seed", seed, "--width", size[0], "--height", size[1]]
+    # Left to itself mflux keeps freed buffers cached: a two-look scene peaked at 26.5 GB for 8.8 GB of model.
+    # Capped, the same pixels in the same time at 8.6 GB (Z-Image 14.3 -> 10.0); --low-ram changed Z-Image's pixels.
+    cmd += ["--mlx-cache-limit-gb", 2]
     if from_image is not None:
         cmd += ["--image-path", from_image, "--image-strength", strength]
     out.parent.mkdir(parents=True, exist_ok=True)
