@@ -856,3 +856,94 @@ def test_the_motion_check_compares_the_clip_with_the_picture_it_was_animated_fro
     assert "first picture is the scene as drawn" in req["prompt"]
     assert "colour" in req["prompt"] and "logo" in req["prompt"]          # things that change from the picture
     assert "turns silver" in r.stdout
+
+
+ANGLER = '''title = "The Patient Fisherman"
+look = "anime key art"
+still_style = "anime key visual"
+seed = 1024
+lighting = "dawn"
+
+[characters]
+SILAS = "a weathered man in his sixties, short white beard"
+CARP = "a huge carp, gold and bronze scales"
+
+[places]
+POND = "a small still pond"
+PIER = "a mossy wooden pier"
+
+[angles.MEDIUM]
+frame = "medium shot of SILAS sitting on the PIER, seen from the waist up"
+
+[angles.LOW]
+frame = "low angle looking up at SILAS's face"
+
+[[shot]]
+id = "06-fight"
+angle = "MEDIUM"
+still = "SILAS standing on the PIER leaning far back on a bent rod, the line running to the hook in the CARP's mouth, the CARP thrashing in the POND"
+motion = "SILAS pulls back"
+'''
+
+
+def angler(tmp_path, looks=("SILAS", "CARP", "POND", "PIER")):
+    (tmp_path / "story.toml").write_text(ANGLER)
+    story = sa.load_story(tmp_path / "story.toml")
+    for n in looks:
+        look = sa.look_path(story, n)
+        look.parent.mkdir(parents=True, exist_ok=True)
+        look.write_bytes(b"\x89PNG " + n.encode())
+    return story
+
+
+def test_a_scene_describes_each_name_in_full_only_once(tmp_path):
+    """the-patient-angler 06: the MEDIUM angle and the scene both named SILAS and PIER, the scene named CARP
+    twice, so each long description came twice and the action drowned in beards and planks."""
+    story = angler(tmp_path)
+    prompt = sa.render_prompt(story, story.shots[0])[0]
+    for n in ("SILAS", "CARP", "POND", "PIER"):
+        assert prompt.count(story.names[n]) == 1, n
+    assert "the hook in the CARP's mouth" in prompt and "scales's" not in prompt   # the description goes on a plain mention
+    (tmp_path / "story.toml").write_text(ANGLER.replace("the CARP thrashing", "the huge CARP thrashing"))
+    story = sa.load_story(tmp_path / "story.toml")
+    assert "the huge a huge" not in sa.render_prompt(story, story.shots[0])[0]
+
+
+def test_the_scene_poses_its_people_not_the_angle(tmp_path):
+    """The MEDIUM angle said SILAS was sitting; the scene said standing: every picture crouched in between."""
+    story = angler(tmp_path)
+    prompt = sa.render_prompt(story, story.shots[0])[0]
+    assert "sitting" not in prompt
+    assert prompt.startswith("medium shot, seen from the waist up, ") and "standing" in prompt
+    (tmp_path / "story.toml").write_text(ANGLER.replace('angle = "MEDIUM"', 'angle = "LOW"'))
+    story = sa.load_story(tmp_path / "story.toml")
+    assert sa.render_prompt(story, story.shots[0])[0].startswith("low angle looking up, ")
+
+
+def test_a_look_gives_its_appearance_not_its_pose(tmp_path):
+    """The CARP's picture is the whole fish side-on: told to keep it exactly, every version pasted that fish
+    on the pier, hooked by nothing. A look gives how someone looks; the scene says what they do."""
+    story = angler(tmp_path)
+    prompt = sa.render_prompt(story, story.shots[0])[0]
+    said = prompt.split("Reference pictures: ")[1]
+    for n in ("SILAS", "CARP"):
+        part = next(p for p in said.split("; ") if f" is {n}" in p)
+        assert "not the reference's pose or position" in part and "doing what this scene says" in part, n
+
+
+def test_pictures_drawn_before_the_prompt_changed_stay_current(tmp_path):
+    """A better prompt shouldn't reopen every approved scene: a picture drawn from the same description by the
+    older prompt stays current (and its versions stay listed) until it is drawn again."""
+    story = angler(tmp_path)
+    shot = story.shots[0]
+    old = sa.render_prompt(story, shot, legacy=True)[0]
+    assert old != sa.render_prompt(story, shot)[0]
+    keys = sa.Keys(story.root)
+    out = sa.still_path(story, shot)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(b"png")
+    keys.record(out, sa.still_key(story, shot, legacy=True))
+    assert sa.still_fresh(story, shot, keys)
+    assert sa.prompt_current(story, shot, old) and sa.prompt_current(story, shot, sa.render_prompt(story, shot)[0])
+    keys.record(out, "something else")
+    assert not sa.still_fresh(story, shot, keys)

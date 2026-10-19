@@ -168,11 +168,11 @@ def pick_take(folder: Path, take: int | None) -> list[str]:
 
 def _current_retakes(folder: Path, story, shot) -> list[tuple[int, Path]]:
     """This shot's retakes drawn from its current description (older ones would redraw differently)."""
-    want = sa.render_prompt(story, shot)[0] if story else None
+    current = (lambda prompt: sa.prompt_current(story, shot, prompt)) if story else (lambda prompt: True)
     found = []
     for p in (Path(folder) / "board" / "retakes").glob(f"{shot.id if story else shot}-s*.png"):
         m = re.fullmatch(rf"{re.escape(shot.id if story else shot)}-s(\d+)\.png", p.name)
-        if m and (want is None or sa.png_prompt(p) == want):
+        if m and current(sa.png_prompt(p)):
             found.append((int(m.group(1)), p))
     return sorted(found)
 
@@ -195,7 +195,8 @@ def use_retake(folder: Path, shot_id: str, seed: int) -> list[str]:
     out = sa.still_path(story, shot)
     out.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(pic, out)
-    sa.Keys(folder).record(out, sa.still_key(story, shot))
+    legacy = sa.png_prompt(out) != sa.render_prompt(story, shot)[0]   # a version drawn by the older prompt
+    sa.Keys(folder).record(out, sa.still_key(story, shot, legacy=legacy))
     return []
 
 
@@ -365,7 +366,7 @@ def _scene_outputs(folder: Path, story, shot, keys) -> dict[str, list[Path] | No
     fresh = lambda p, k: k is not None and not keys.stale(p, k)   # noqa: E731
     out: dict[str, list[Path] | None] = {}
     still = sa.still_path(story, shot)
-    out["picture"] = [still] if fresh(still, sa.still_key(story, shot)) else None
+    out["picture"] = [still] if sa.still_fresh(story, shot, keys) else None
     clip = sa.shot_path(story, shot)
     out["video"] = [clip] if out["picture"] and sa.clip_fresh(story, shot, keys) else None
     sfx = sa.sfx_path(story, shot)
@@ -667,7 +668,7 @@ def film_state(folder: Path) -> dict:
         still_fresh = None
         if story:
             shot = next(x for x in story.shots if x.id == sid)
-            still_fresh = not keys.stale(sa.still_path(story, shot), sa.still_key(story, shot))
+            still_fresh = sa.still_fresh(story, shot, keys)
         state["shots"].append({
             "id": sid, "still_text": s.get("still", ""), "motion": s.get("motion", ""),
             "narration": s.get("narration", ""), "dialogue": s.get("dialogue", []),

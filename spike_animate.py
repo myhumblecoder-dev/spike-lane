@@ -365,20 +365,29 @@ def load_story(path: Path) -> Story:
 
 # --- prompts ----------------------------------------------------------------
 
-def expand(text: str, characters: dict[str, str]) -> str:
+def expand(text: str, characters: dict[str, str], seen: set[str] | None = None) -> str:
     """Replace each character NAME (whole word) with its fixed description, so every shot
-    describes the character with exactly the same words; that is what keeps it consistent."""
+    describes the character with exactly the same words; that is what keeps it consistent.
+    With `seen`, a name already described there stays a name: each description comes once."""
     if not characters:
         return text
     # "on the TERRACE" with TERRACE = "a seaside terrace" reads "on a seaside terrace", not "on the a ..."
     pat = re.compile(r"\b(?:(?P<art>the|a|an) )?(?P<name>" + "|".join(map(re.escape, characters)) + r")\b", re.I)
+    # "the CARP's mouth" would read "a huge carp, gold scales's mouth": the description goes on a plain mention
+    plain = {n for n in characters if re.search(rf"\b{re.escape(n)}\b(?!'s)", text)}
 
     def sub(m):
         name = next((n for n in characters if n == m.group("name")), None)
         if name is None:   # matched case-insensitively only: not a NAME
             return m.group(0)
+        if seen is not None:
+            if name in seen or (text.startswith("'s", m.end()) and name in plain):
+                return m.group(0)
+            seen.add(name)
         desc = characters[name]
         art = m.group("art")
+        if seen is not None and not art and re.search(r"\b(the|a|an) [\w-]+ $", text[:m.start()], re.I):
+            desc = re.sub(r"^(the|a|an) ", "", desc, flags=re.I)   # "the huge CARP": not "the huge a huge carp"
         if art and not re.match(r"(the|a|an)\b", desc, re.I):
             return f"{art} {desc}"
         return desc
@@ -390,10 +399,32 @@ def shot_light(story: Story, shot: Shot) -> str:
     return shot.lighting or story.lighting
 
 
-def still_prompt(story: Story, shot: Shot) -> str:
-    frame = f"{expand(story.angles[shot.angle].frame, story.names)}, " if shot.angle else ""
+def camera_only(frame: str, still: str, characters) -> str:
+    """The angle's framing without the people the scene poses itself: "medium shot of SILAS sitting on the
+    PIER, seen from the waist up" in a scene of SILAS standing reads "medium shot, seen from the waist up"."""
+    posed = [n for n in characters if re.search(rf"\b{re.escape(n)}\b", frame) and re.search(rf"\b{re.escape(n)}\b", still)]
+    if not posed:
+        return frame
+    first = re.compile(r"\b(?:" + "|".join(map(re.escape, posed)) + r")\b")
+    kept = []
+    for part in frame.split(","):
+        m = first.search(part)
+        if m:
+            part = re.sub(r"(\s+\b(of|at|on|to|towards|over|the|a|an|and))+\s*$", "", part[:m.start()].rstrip())
+        if part.strip():
+            kept.append(part.strip())
+    return ", ".join(kept)
+
+
+def still_prompt(story: Story, shot: Shot, legacy: bool = False) -> str:
     light = f"{shot_light(story, shot)}, " if shot_light(story, shot) else ""
-    return f"{frame}{expand(shot.still, story.names)}, {light}{shot.still_style or story.still_style}"
+    if legacy:   # the prompt pictures were drawn from until 2026-10-19: they stay current until drawn again
+        frame = f"{expand(story.angles[shot.angle].frame, story.names)}, " if shot.angle else ""
+        return f"{frame}{expand(shot.still, story.names)}, {light}{shot.still_style or story.still_style}"
+    seen: set[str] = set()
+    frame = camera_only(story.angles[shot.angle].frame, shot.still, story.characters) if shot.angle else ""
+    frame = f"{expand(frame, story.names, seen)}, " if frame else ""
+    return f"{frame}{expand(shot.still, story.names, seen)}, {light}{shot.still_style or story.still_style}"
 
 
 def motion_prompt(story: Story, shot: Shot) -> str:
@@ -933,11 +964,11 @@ def scene_refs(story: Story, shot: Shot) -> list[tuple[str, Path]]:
     return [(n, look_path(story, n)) for n in names if look_path(story, n).is_file()]
 
 
-def render_prompt(story: Story, shot: Shot) -> tuple[str, list[Path]]:
+def render_prompt(story: Story, shot: Shot, legacy: bool = False) -> tuple[str, list[Path]]:
     """What a scene's picture is drawn from: the prompt, and the reference pictures (none: text only):
     the looks it shows, then the scene's own pictures."""
     refs = scene_refs(story, shot) + [(note, f) for f, note in shot.pictures]
-    prompt = still_prompt(story, shot)
+    prompt = still_prompt(story, shot, legacy)
     if not refs:
         if any(look_path(story, n).is_file() for n in [*story.characters, *story.places]):
             # the other scenes copy their style from the looks; lead with it here, or a prop alone comes out a photo
@@ -945,8 +976,11 @@ def render_prompt(story: Story, shot: Shot) -> tuple[str, list[Path]]:
         return prompt, []
 
     def say(i, n):
-        if n in story.characters:
+        if n in story.characters and legacy:
             return f"image {i} is {n}, keep their face, hair, clothes and markings exactly"
+        if n in story.characters:   # told to keep it exactly, a side-on fish was pasted in whole, hooked by nothing
+            return (f"image {i} is {n}, keep their face, hair, clothes, colours and markings exactly, but not the "
+                    f"reference's pose or position: draw them doing what this scene says")
         if n in story.places and close:   # told its own camera, a close-up still came out as the place's wide view
             return (f"image {i} is the place {n}, use it only for its colours and materials; do not copy its view "
                     f"or layout, this is a tight close-up")
@@ -959,17 +993,28 @@ def render_prompt(story: Story, shot: Shot) -> tuple[str, list[Path]]:
     return f"{prompt}. Reference pictures: {said}. Match the drawing style of the references.", [p for _, p in refs]
 
 
-def still_key(story: Story, shot: Shot) -> str:
-    prompt, refs = render_prompt(story, shot)
+def still_key(story: Story, shot: Shot, legacy: bool = False) -> str:
+    prompt, refs = render_prompt(story, shot, legacy)
     if not refs:   # the same key as before looks existed, so older pictures stay current
         return key_for("still", prompt, shot.seed, STILL_SIZE)
     return key_for("still", prompt, shot.seed, STILL_SIZE, [file_digest(r) for r in refs])
 
 
+def still_fresh(story: Story, shot: Shot, keys: "Keys") -> bool:
+    """The scene's picture matches its description, drawn by this prompt or the one before it."""
+    out = still_path(story, shot)
+    return not keys.stale(out, still_key(story, shot)) or not keys.stale(out, still_key(story, shot, legacy=True))
+
+
+def prompt_current(story: Story, shot: Shot, prompt: str | None) -> bool:
+    """A picture's stored prompt is the scene's current description (by this prompt or the one before it)."""
+    return prompt in (render_prompt(story, shot)[0], render_prompt(story, shot, legacy=True)[0])
+
+
 def check_stills(story: Story, paths: dict[str, Path]) -> list[str]:
     """Shots whose PNG doesn't carry the prompt it was asked for (a lost prompt renders an empty scene)."""
     return [sid for sid, p in paths.items()
-            if png_prompt(p) != render_prompt(story, next(s for s in story.shots if s.id == sid))[0]]
+            if not prompt_current(story, next(s for s in story.shots if s.id == sid), png_prompt(p))]
 
 
 def cmd_board(story: Story, shot_id: str | None = None) -> int:
@@ -979,7 +1024,7 @@ def cmd_board(story: Story, shot_id: str | None = None) -> int:
         return 2
     for shot in shots:
         out, k = still_path(story, shot), still_key(story, shot)
-        if keys.stale(out, k):
+        if not still_fresh(story, shot, keys):
             _say(f"still {shot.id} …")
             prompt, refs = render_prompt(story, shot)
             render_still(prompt, shot.seed, out, refs=refs)
@@ -1220,11 +1265,10 @@ Reply with JSON: {{"score": N, "faults": [...]}}"""
 
 def versions(story: Story, shot: Shot) -> list[tuple[int, Path]]:
     """The scene's picture and every other version drawn from the same description: (seed, file)."""
-    prompt = render_prompt(story, shot)[0]
     out = [(shot.seed, still_path(story, shot))] if still_path(story, shot).exists() else []
     for p in sorted((story.root / "board" / "retakes").glob(f"{shot.id}-s*.png")):
         m = re.fullmatch(rf"{re.escape(shot.id)}-s(\d+)\.png", p.name)
-        if m and int(m[1]) != shot.seed and png_prompt(p) == prompt:
+        if m and int(m[1]) != shot.seed and prompt_current(story, shot, png_prompt(p)):
             out.append((int(m[1]), p))
     return out
 
@@ -1958,7 +2002,7 @@ li b{{color:var(--dim);font-weight:600;margin-right:6px}}p{{color:var(--dim);mar
 
 
 def _stills_ready(story: Story, keys: Keys) -> bool:
-    missing = [s.id for s in story.shots if keys.stale(still_path(story, s), still_key(story, s))]
+    missing = [s.id for s in story.shots if not still_fresh(story, s, keys)]
     if missing:
         print(f"stills missing or out of date for {', '.join(missing)}: run `spike-animate board` first",
               file=sys.stderr)
@@ -2010,7 +2054,7 @@ def cmd_video(story: Story, shot_id: str | None = None) -> int:
     if shots is None:
         return 2
     if shot_id:
-        if keys.stale(still_path(story, shots[0]), still_key(story, shots[0])):
+        if not still_fresh(story, shots[0], keys):
             print(f"no still for {shot_id} yet: run `spike-animate board --shot {shot_id}` first", file=sys.stderr)
             return 2
         if shot_frames(story, shots[0]) is None:
@@ -2154,7 +2198,7 @@ def cmd_film(story: Story) -> int:
 def cmd_status(story: Story) -> int:
     keys = Keys(story.root)
     n = len(story.shots)
-    stills = sum(not keys.stale(still_path(story, s), still_key(story, s)) for s in story.shots)
+    stills = sum(still_fresh(story, s, keys) for s in story.shots)
     shots = sum(shot_path(story, s).exists() for s in story.shots)
     sfx = sum((story.root / "sfx" / f"{s.id}.flac").exists() for s in story.shots)
     lines = [s for s in story.shots if s.narration]
