@@ -809,7 +809,13 @@ def step_argv(folder: Path, step: str, params: dict) -> list[str]:
         seeds = [int(str(x).strip()) for x in params.get("seeds", [])]
         if not 1 <= len(seeds) <= 6 or any(s < 0 for s in seeds):
             raise ValueError("give 1 to 6 seeds")
-        return ["retake", story, params["shot"], "--seeds", ",".join(map(str, seeds))] + (["--rank"] if params.get("rank") else [])
+        argv = ["retake", story, params["shot"], "--seeds", ",".join(map(str, seeds))] + (["--rank"] if params.get("rank") else [])
+        if params.get("keep") is not None:
+            keep = int(params["keep"])
+            if not 1 <= keep <= 10:
+                raise ValueError("keep versions scoring 1 to 10")
+            argv += ["--keep", str(keep)]
+        return argv
     if step == "new":
         idea = str(params.get("idea", "")).strip().lstrip("-").strip()
         notes = str(params.get("notes", "")).strip().lstrip("-").strip()

@@ -947,3 +947,42 @@ def test_pictures_drawn_before_the_prompt_changed_stay_current(tmp_path):
     assert sa.prompt_current(story, shot, old) and sa.prompt_current(story, shot, sa.render_prompt(story, shot)[0])
     keys.record(out, "something else")
     assert not sa.still_fresh(story, shot, keys)
+
+
+def test_the_judges_go_by_the_scenes_pose_not_the_angles(tmp_path):
+    """The MEDIUM angle said SILAS sits; ranked against it, every standing fight picture scored 4/10."""
+    story = angler(tmp_path)
+    for q in (sa.rank_prompt(story, story.shots[0]), sa.continuity_prompt(story, story.shots[0])):
+        assert "SILAS sitting" not in q and "Framing: medium shot, seen from the waist up" in q
+
+
+def gated_retake(ollama, tmp_path, monkeypatch, scores):
+    for k in ("OLLAMA_HOST", "SPIKE_LANE_DIR"):
+        monkeypatch.setenv(k, ollama.get(k) or os.environ[k])
+    (tmp_path / "story.toml").write_text(BIBLE_STORY)
+    story = sa.load_story(tmp_path / "story.toml")
+    drawn = []
+
+    def draw(prompt, seed, out, refs=()):       # the image model: a picture carrying its prompt
+        drawn.append(seed)
+        picture(Path(out), prompt, str(seed))
+    monkeypatch.setattr(sa, "render_still", draw)
+    monkeypatch.setattr(sa, "contact_sheet", lambda *a, **k: None)
+    FakeOllama.replies = [{"score": s, "faults": [] if s >= 7 else ["the fish is on the pier"]} for s in scores]
+    assert sa.cmd_retake(story, "01-sit", [11, 12, 13], rank=True, keep=7) == 0
+    return story, drawn
+
+
+def test_versions_under_the_bar_are_thrown_away_and_drawn_again(ollama, tmp_path, monkeypatch):
+    story, drawn = gated_retake(ollama, tmp_path, monkeypatch, [9, 3, 8, 7])
+    assert len(drawn) == 4 and drawn[:3] == [11, 12, 13]                  # one more for the one under 7
+    kept = dict(sa.versions(story, story.shots[0]))
+    assert 12 not in kept and len(kept) == 3
+    assert (tmp_path / "board" / "retakes" / "rejected" / "01-sit-s12.png").exists()   # out of the way, not deleted
+    ranked = json.loads((tmp_path / "board" / "01-sit.rank.json").read_text())
+    assert sorted(r["score"] for r in ranked) == [7, 8, 9]
+
+
+def test_redrawing_under_the_bar_stops_at_twice_the_versions_asked(ollama, tmp_path, monkeypatch):
+    story, drawn = gated_retake(ollama, tmp_path, monkeypatch, [2] * 6)
+    assert len(drawn) == 6 and not sa.versions(story, story.shots[0])

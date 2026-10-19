@@ -1096,6 +1096,14 @@ def test_more_versions_can_be_ranked(tmp_path):
     assert "--rank" not in st.step_argv(folder, "retake", {"shot": "01-heap", "seeds": [1, 2, 3]})
 
 
+def test_more_versions_can_throw_away_the_ones_under_a_score(tmp_path):
+    folder = write_story(tmp_path / "bolt").parent
+    argv = st.step_argv(folder, "retake", {"shot": "01-heap", "seeds": [1, 2, 3, 4, 5], "rank": True, "keep": 7})
+    assert argv[-2:] == ["--keep", "7"] and "--rank" in argv
+    with pytest.raises(ValueError):
+        st.step_argv(folder, "retake", {"shot": "01-heap", "seeds": [1], "keep": 11})
+
+
 def test_each_scene_shows_its_versions_best_first(tmp_path):
     folder = write_story(tmp_path / "bolt").parent
     render_board(folder)
@@ -1278,8 +1286,9 @@ def test_more_versions_draws_as_many_as_the_button_says():
                                       return [Number(b.textContent.match(/\\d+/)[0]), sent.at(-1).seeds.length]; };
       const scene = h("div", {}, picturePart({ id: "03-strike", still: "board/03-strike.png", retakes: [], seed: 4024 }, { done: true, unlocked: true }));
       const look = lookCard({ name: "PIER", kind: "place", url: "looks/PIER.png", fresh: true, text: "", seed: 1024, takes: [] });
-      return [await press(scene), await press(look)];
+      return [await press(scene), await press(look), sent[0].keep];
     """)
-    for said, drawn in got:
+    for said, drawn in got[:2]:
         assert drawn == said
     assert got[0][0] == 5   # a scene: 5 ranked versions
+    assert got[2] == 7      # each 7/10 or better

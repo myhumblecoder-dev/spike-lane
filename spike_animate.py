@@ -18,6 +18,7 @@ import difflib
 import hashlib
 import json
 import math
+import random
 import re
 import tomllib
 import os
@@ -1064,7 +1065,7 @@ def continuity_facts(story: Story, shot: Shot) -> list[str]:
     if shot_light(story, shot):
         facts.append(f"Lighting: {shot_light(story, shot)}")
     if shot.angle:
-        facts.append(f"Framing: {story.angles[shot.angle].frame}")
+        facts.append(f"Framing: {camera_only(story.angles[shot.angle].frame, shot.still, story.characters)}")
     return facts
 
 
@@ -1313,23 +1314,53 @@ def cmd_rank(story: Story, shot_id: str) -> int:
     return 0
 
 
-def cmd_retake(story: Story, shot_id: str, seeds: list[int], rank: bool = False) -> int:
+def cmd_retake(story: Story, shot_id: str, seeds: list[int], rank: bool = False, keep: int | None = None) -> int:
+    """Draw more versions of a scene's picture. With `keep`, each is ranked and any scoring under it is put
+    aside in retakes/rejected/ and drawn again with a new seed, up to twice as many drawings as asked."""
     shot = next((s for s in story.shots if s.id == shot_id), None)
     if shot is None:
         print(f"no shot '{shot_id}' in the story", file=sys.stderr)
         return 2
-    outs = []
-    for seed in seeds:
-        out = story.root / "board" / "retakes" / f"{shot.id}-s{seed}.png"
-        _say(f"retake {shot.id} seed {seed} …")
-        prompt, refs = render_prompt(story, shot)
-        render_still(prompt, seed, out, refs=refs)
-        outs.append(out)
-    sheet = story.root / "board" / "retakes" / f"{shot.id}-sheet.jpg"
-    contact_sheet(outs, sheet, cols=len(outs))
-    _say(f"Retakes: {sheet} (left to right: seeds {', '.join(map(str, seeds))}).\n"
-         f"To keep one, set `seed = N` on shot {shot.id} in story.toml and run board again.")
-    if rank:
+    retakes = story.root / "board" / "retakes"
+    used = set(seeds) | {shot.seed} | {int(m[1]) for p in retakes.rglob(f"{shot.id}-s*.png")
+                                       if (m := re.fullmatch(rf"{re.escape(shot.id)}-s(\d+)\.png", p.name))}
+    outs, todo, budget = [], list(seeds), 2 * len(seeds)
+    while todo:
+        drawn = []
+        for seed in todo:
+            out = retakes / f"{shot.id}-s{seed}.png"
+            _say(f"retake {shot.id} seed {seed} …")
+            prompt, refs = render_prompt(story, shot)
+            render_still(prompt, seed, out, refs=refs)
+            drawn.append(seed)
+        budget -= len(drawn)
+        if keep is None:
+            outs += [retakes / f"{shot.id}-s{seed}.png" for seed in drawn]
+            break
+        scores = {r["seed"]: r["score"] for r in rank_versions(story, shot, Keys(story.root))}
+        low = [seed for seed in drawn if scores.get(seed, 0) < keep]
+        for seed in low:
+            (retakes / "rejected").mkdir(parents=True, exist_ok=True)
+            for ext in (".png", ".log"):
+                f = retakes / f"{shot.id}-s{seed}{ext}"
+                if f.exists():
+                    f.replace(retakes / "rejected" / f.name)
+        outs += [retakes / f"{shot.id}-s{seed}.png" for seed in drawn if seed not in low]
+        if low:
+            _say(f"{len(low)} version(s) under {keep}/10 put aside in board/retakes/rejected/")
+        todo = []
+        for _ in range(min(len(low), budget)):
+            seed = next(n for n in iter(lambda: random.randrange(100, 9100), None) if n not in used)
+            used.add(seed)
+            todo.append(seed)
+    if keep is not None:
+        rank_versions(story, shot, Keys(story.root))   # the ranking lists only the versions kept
+        _say(f"{len(outs)} of {len(seeds)} version(s) scored {keep}/10 or better")
+    sheet = retakes / f"{shot.id}-sheet.jpg"
+    if outs:
+        contact_sheet(outs, sheet, cols=len(outs))
+        _say(f"Retakes: {sheet}.\nTo keep one, set `seed = N` on shot {shot.id} in story.toml and run board again.")
+    if rank and keep is None:
         try:
             cmd_rank(story, shot_id)
         except StageError as e:   # the versions stand; the ranking is advice
@@ -2726,6 +2757,8 @@ def build_parser() -> argparse.ArgumentParser:
     rt.add_argument("shot")
     rt.add_argument("--seeds", required=True, help="comma-separated, e.g. 7,42,99")
     rt.add_argument("--rank", action="store_true", help="then score every version with the local vision model")
+    rt.add_argument("--keep", type=int, metavar="SCORE",
+                    help="rank each version and draw again any scoring under SCORE/10 (up to twice the seeds)")
     return ap
 
 
@@ -2750,7 +2783,7 @@ def main(argv: list[str]) -> int:
         if a.cmd == "look":
             return cmd_look(story, a.name, [int(s) for s in a.seeds.split(",") if s.strip()] if a.seeds else None)
         if a.cmd == "retake":
-            return cmd_retake(story, a.shot, [int(s) for s in a.seeds.split(",") if s.strip()], rank=a.rank)
+            return cmd_retake(story, a.shot, [int(s) for s in a.seeds.split(",") if s.strip()], rank=a.rank, keep=a.keep)
         if a.cmd in ("video", "sound", "voices"):
             return {"video": cmd_video, "sound": cmd_sound, "voices": cmd_voices}[a.cmd](story, a.shot)
         steps = {"film": cmd_film, "music": cmd_music}
