@@ -954,6 +954,7 @@ def cmd_voice(story: Story, name: str, takes: int | None = None) -> int:
     return 0
 
 
+POSE_ONLY = re.compile(r"\b(poses?|composition|framing|only)\b", re.I)
 CLOSE_FRAMING = re.compile(r"\b(close[- ]?ups?|extreme close|macro|point[- ]of[- ]view|pov)\b", re.I)
 
 
@@ -988,6 +989,8 @@ def render_prompt(story: Story, shot: Shot, legacy: bool = False) -> tuple[str, 
         if n in story.places:
             return (f"image {i} is the place {n}, keep its colours, light and furnishings, seen from this shot's own "
                     f"camera angle and distance")
+        if not legacy and POSE_ONLY.search(n):   # a real photo for its pose: copied as shown, the real man came too
+            return f"image {i} is {n}"
         return f"image {i} is {n}, copy it as shown"
     close = bool(CLOSE_FRAMING.search(shot.still + (" " + story.angles[shot.angle].frame if shot.angle else "")))
     said = "; ".join(say(i, n) for i, (n, _) in enumerate(refs, 1))

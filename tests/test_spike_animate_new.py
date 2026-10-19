@@ -986,3 +986,19 @@ def test_versions_under_the_bar_are_thrown_away_and_drawn_again(ollama, tmp_path
 def test_redrawing_under_the_bar_stops_at_twice_the_versions_asked(ollama, tmp_path, monkeypatch):
     story, drawn = gated_retake(ollama, tmp_path, monkeypatch, [2] * 6)
     assert len(drawn) == 6 and not sa.versions(story, story.shots[0])
+
+
+def test_a_pose_only_photo_is_not_copied_as_shown(tmp_path):
+    """A real photo of an angler gives the fight its physics; "copy it as shown" would copy the real man too."""
+    story = angler(tmp_path)
+    photo = tmp_path / "reference" / "fight.png"
+    photo.parent.mkdir(parents=True, exist_ok=True)
+    photo.write_bytes(b"\x89PNG fight")
+    for note, copied in [("a photo for the pose, composition and the sizes of things only", False),
+                         ("the laptop screen", True)]:
+        (tmp_path / "story.toml").write_text(ANGLER.replace('motion = "SILAS pulls back"',
+                                             f'motion = "SILAS pulls back"\npictures = [{{ file = "reference/fight.png", note = "{note}" }}]'))
+        story = sa.load_story(tmp_path / "story.toml")
+        prompt, refs = sa.render_prompt(story, story.shots[0])
+        assert refs[-1] == photo and f"image 5 is {note}" in prompt
+        assert ("copy it as shown" in prompt) is copied, note
